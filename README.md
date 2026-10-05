@@ -43,12 +43,12 @@ This fork adds a full multiplayer stack on top of the port:
 | Component | Path | What it is |
 |---|---|---|
 | Launcher (CEF GUI) | `net/launcher/` | Chromium/CEF launcher: server browser, settings, join flow, in-game UI host |
-| Dedicated server | `net/server/` | 20 Hz authoritative server: movement anticheat, vehicle sync, gamemodes, RCON |
+| Dedicated server | `net/server/` | 20 Hz authoritative server: movement anticheat, vehicle sync, gamemodes, RCON, SQLite player profiles |
 | Master server | `net/master/` | LAN/internet server listing |
 | Bot / test client | `net/bot/` | Scriptable scenario bot (drive/roam/combat) for E2E tests |
 | Agent | `net/agent/` | Tracing/telemetry harness |
 | Game hooks | `src/net/` | nethooks (HUD/chat/console/admin), netclient, CEF HUD glue |
-| Tests | `net/tests/` | 3143-check unit suite (protocol codecs, validator) |
+| Tests | `net/tests/` | 3177-check unit suite (protocol codecs, validator, profile store) |
 | E2E run book | `net/e2e.sh` | 21-check end-to-end script |
 
 ### Building the net stack
@@ -69,6 +69,11 @@ The GitHub Releases page ships ready-to-run zips (no build needed):
 - **`relcs-server-tools-win64.zip`** — `reLCS-server.exe`, `reLCS-master.exe`, `relcs-netbot.exe`, `reLCS-agentd.exe` for hosting.
 
 Server quick start: `reLCS-server.exe -rcon_password <pw> -lan_discover 1 -announce 1`
+
+Player profiles (money + weapon inventory) persist across reconnects in a SQLite
+database (`profiles.db` by default; set with `-profiles <path>`, empty disables).
+Profiles are keyed by player name and saved on disconnect + every 10 s when dirty.
+The bot can run admin commands with `-rcon <pw> -cmd "<command>"` (repeatable).
 Launcher CLI: `-join ip:port -nick X`, `-query "<raw UI query>"`, `-selftest`.
 Game CLI: `-connect ip:port -nick X -rcon <pw> -fps N`.
 
@@ -78,3 +83,9 @@ tough validator. See `patches/librw-geoplg-readmesh-guard.patch` for a required
 librw crash-guard fix (apply inside `vendor/librw`).
 
 Protocol, validator and EAC planning docs: `net/docs/`.
+
+### License
+
+This project is licensed under the GNU General Public License v3.0 — see `LICENSE`.
+Vendored dependencies keep their own terms: `vendor/enet` (BSD-3-Clause),
+`vendor/sqlite` (public domain).
