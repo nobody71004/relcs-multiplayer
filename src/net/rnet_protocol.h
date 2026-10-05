@@ -57,6 +57,32 @@ inline bool ReadPlayerState(BitReader& r, PlayerState& s)
 	return r.Ok();
 }
 
+inline void WriteInventory(BitWriter& w, const MsgInventory& m)
+{
+	w.WriteU16(m.playerId);
+	w.WriteI32(m.money);
+	w.WriteU8(m.currentWeapon);
+	w.WriteU8(m.count);
+	for(int i = 0; i < m.count && i < MAX_INV_ENTRIES; i++){
+		w.WriteU8(m.entries[i].weapon);
+		w.WriteU16(m.entries[i].ammo);
+	}
+}
+
+inline bool ReadInventory(BitReader& r, MsgInventory& m)
+{
+	m.playerId = r.ReadU16();
+	m.money = r.ReadI32();
+	m.currentWeapon = r.ReadU8();
+	m.count = r.ReadU8();
+	if(m.count > MAX_INV_ENTRIES) return false;
+	for(int i = 0; i < m.count; i++){
+		m.entries[i].weapon = r.ReadU8();
+		m.entries[i].ammo = r.ReadU16();
+	}
+	return r.Ok();
+}
+
 inline void WriteVehicleState(BitWriter& w, const VehicleState& s)
 {
 	w.WriteU16(s.vehicleId); w.WriteU16(s.modelId);

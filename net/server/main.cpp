@@ -54,6 +54,7 @@ static void ApplyKeyVal(ServerConfig& cfg, const std::string& key, const std::st
 	else if(key == "minute") cfg.minute = (uint8_t)atoi(val.c_str());
 	else if(key == "weather") cfg.weather = (uint8_t)atoi(val.c_str());
 	else if(key == "netstats_interval") cfg.netstatsInterval = atoi(val.c_str());
+	else if(key == "profiles") cfg.profilesDb = val;
 }
 
 static bool LoadConfigFile(ServerConfig& cfg, const std::string& path)

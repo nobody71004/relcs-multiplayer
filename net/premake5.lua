@@ -27,6 +27,13 @@ project "enet"
 		defines { "_WINSOCK_DEPRECATED_NO_WARNINGS" }
 	filter {}
 
+project "sqlite"
+	kind "StaticLib"
+	language "C"
+	targetname "sqlite"
+	files { "../vendor/sqlite/sqlite3.c", "../vendor/sqlite/sqlite3.h" }
+	includedirs { "../vendor/sqlite" }
+
 -- shared protocol is header-only; each consumer includes ../src/net
 function netCommon()
 	files { "../src/net/*.h" }
@@ -39,7 +46,9 @@ project "net-tests"
 	language "C++"
 	cppdialect "C++17"
 	targetname "net-tests"
-	files { "tests/main.cpp" }
+	files { "tests/main.cpp", "server/profiles.cpp", "server/profiles.h" }
+	includedirs { "server", "../vendor/sqlite" }
+	links { "sqlite" }
 	netCommon()
 
 project "net-server"
@@ -48,6 +57,8 @@ project "net-server"
 	cppdialect "C++17"
 	targetname "reLCS-server"
 	files { "server/*.cpp", "server/*.h" }
+	includedirs { "../vendor/sqlite" }
+	links { "sqlite" }
 	netCommon()
 
 project "net-bot"

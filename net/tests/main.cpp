@@ -1,6 +1,7 @@
 // net/tests/main.cpp — unit tests for the rnet protocol layer.
 #include "rnet_protocol.h"
 #include "rnet_validator.h"
+#include "profiles.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -462,6 +463,108 @@ static void TestVehicleMessages()
 	CHECK(ValidateMove(a, b, TICK_DT) == VAL_OK);      // in vehicle: fine
 }
 
+static void TestInventoryMessages()
+{
+	// full snapshot round trip
+	MsgInventory inv;
+	inv.playerId = 7;
+	inv.money = 123456;
+	inv.currentWeapon = 22;
+	inv.count = 3;
+	inv.entries[0].weapon = 22; inv.entries[0].ammo = 200;
+	inv.entries[1].weapon = 14; inv.entries[1].ammo = 50;
+	inv.entries[2].weapon = 4;  inv.entries[2].ammo = 0;
+	BitWriter w; BeginMsg(w, MSG_INVENTORY); WriteInventory(w, inv);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_INVENTORY);
+	MsgInventory out;
+	CHECK(ReadInventory(r, out));
+	CHECK(out.playerId == 7 && out.money == 123456);
+	CHECK(out.currentWeapon == 22 && out.count == 3);
+	CHECK(out.entries[0].weapon == 22 && out.entries[0].ammo == 200);
+	CHECK(out.entries[1].weapon == 14 && out.entries[1].ammo == 50);
+	CHECK(out.entries[2].weapon == 4 && out.entries[2].ammo == 0);
+	CHECK(r.Ok());
+
+	// empty table is legal (fresh spawn)
+	MsgInventory empty;
+	BitWriter w2; BeginMsg(w2, MSG_INVENTORY); WriteInventory(w2, empty);
+	BitReader r2(w2.Data(), w2.ByteSize());
+	CHECK((MsgType)r2.ReadU8() == MSG_INVENTORY);
+	MsgInventory e2;
+	CHECK(ReadInventory(r2, e2));
+	CHECK(e2.count == 0 && e2.money == 0);
+	CHECK(r2.Ok());
+
+	// forged oversized count must be rejected
+	BitWriter w3;
+	w3.WriteU8(MSG_INVENTORY);
+	w3.WriteU16(1); w3.WriteI32(0); w3.WriteU8(0); w3.WriteU8(MAX_INV_ENTRIES + 1);
+	BitReader r3(w3.Data(), w3.ByteSize());
+	CHECK((MsgType)r3.ReadU8() == MSG_INVENTORY);
+	MsgInventory bad;
+	CHECK(!ReadInventory(r3, bad));
+
+	// restored wallet becomes the ledger baseline: growth by grants only
+	int32_t seen = 55000, granted = 0; bool cheated = false;
+	CHECK(ValidateMoney(55000, seen, granted, cheated) == 55000 && !cheated);
+	granted = 1000;
+	CHECK(ValidateMoney(56000, seen, granted, cheated) == 56000 && !cheated);
+	granted = 0;
+	CHECK(ValidateMoney(57000, seen, granted, cheated) == 56000 && cheated);
+}
+
+static void TestProfileStore()
+{
+	ProfileStore db;
+	const char* path = "test-profiles.db";
+	std::remove(path);
+	CHECK(db.Open(path));
+
+	// missing name: no row
+	PlayerProfile p;
+	CHECK(!db.Load("ghost", p));
+
+	// save -> load round trip
+	PlayerProfile a;
+	a.money = 55000;
+	a.currentWeapon = 22;
+	a.weapons.push_back({ 22, 200 });
+	a.weapons.push_back({ 14, 50 });
+	CHECK(db.Save("mattb", a));
+	PlayerProfile b;
+	CHECK(db.Load("mattb", b));
+	CHECK(b.money == 55000 && b.currentWeapon == 22 && b.weapons.size() == 2);
+	CHECK(b.weapons[0].weapon == 14 && b.weapons[0].ammo == 50);   // ordered by weapon
+	CHECK(b.weapons[1].weapon == 22 && b.weapons[1].ammo == 200);
+
+	// name lookup is case-insensitive (COLLATE NOCASE)
+	PlayerProfile ci;
+	CHECK(db.Load("MATTB", ci));
+	CHECK(ci.money == 55000 && ci.weapons.size() == 2);
+
+	// update replaces the weapon table wholesale
+	PlayerProfile c;
+	c.money = 60000;
+	c.currentWeapon = 4;
+	c.weapons.push_back({ 4, 0 });
+	CHECK(db.Save("mattb", c));
+	PlayerProfile d;
+	CHECK(db.Load("mattb", d));
+	CHECK(d.money == 60000 && d.weapons.size() == 1);
+	CHECK(d.weapons[0].weapon == 4 && d.weapons[0].ammo == 0);
+
+	// survives close/reopen: it is really on disk
+	db.Close();
+	CHECK(!db.IsOpen());
+	CHECK(db.Open(path));
+	PlayerProfile e;
+	CHECK(db.Load("mattb", e));
+	CHECK(e.money == 60000 && e.currentWeapon == 4 && e.weapons.size() == 1);
+	db.Close();
+	std::remove(path);
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
@@ -472,6 +575,8 @@ int main()
 	TestValidation();
 	TestToughValidator();
 	TestVehicleMessages();
+	TestInventoryMessages();
+	TestProfileStore();
 	std::printf("%d checks, %d failures — %s\n", g_checks, g_fails, g_fails ? "FAIL" : "PASS");
 	return g_fails ? 1 : 0;
 }

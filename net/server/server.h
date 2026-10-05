@@ -1,6 +1,7 @@
 // net/server/server.h — reLCS dedicated multiplayer server.
 #pragma once
 
+#include "profiles.h"
 #include "rnet_protocol.h"
 #include "rnet_validator.h"
 
@@ -27,6 +28,7 @@ struct ServerConfig {
 	int tickRate = rnet::TICK_RATE;
 	uint8_t hour = 12, minute = 0, weather = 0;
 	int netstatsInterval = 0;		// >0: log bandwidth/rtt stats every N seconds
+	std::string profilesDb = "profiles.db";  // SQLite player profiles ("" disables)
 };
 
 struct ServerPlayer {
@@ -56,6 +58,16 @@ struct ServerPlayer {
 	rnet::RateLimiter damageRate;     // damage claims
 	int32_t moneySeen = 0;            // last server-accepted wallet
 	int32_t moneyGranted = 0;         // wallet growth the server has granted
+	// persistent profile (SQLite): canonical wallet + weapon inventory
+	rnet::MsgInventory inv;           // last known inventory (DB at join <- client reports)
+	bool invSet = false;
+	double invTime = 0;               // last accepted client inventory report
+	PlayerProfile savedProfile;       // loaded at join, kept for restore
+	bool hasProfile = false;          // a DB row existed for this name
+	bool profileSent = false;         // restore already sent this session
+	bool moneyInit = false;           // wallet baseline established
+	int32_t savedMoney = 0;           // last wallet value written to the DB
+	bool profileDirty = false;        // needs a save
 	int floodStrikes = 0;
 	uint64_t bytesInAtLastSample = 0, bytesOutAtLastSample = 0;
 };
@@ -100,6 +112,8 @@ public:
 	void BroadcastScores();
 	void KickPlayer(uint8_t playerId, const char* reason);
 	void RestartGameMode();
+	void SaveProfile(ServerPlayer* p);      // write wallet + inventory to the DB
+	void FlushProfiles();                   // save all dirty profiles
 
 	double Now() const;               // seconds since start
 	const ServerConfig& Config() const { return m_cfg; }
@@ -108,6 +122,8 @@ public:
 private:
 	void PumpNetwork();
 	void OnConnect(ENetPeer* peer);
+	void HandleInventory(ServerPlayer* p, rnet::BitReader& r);
+	void SendInventory(ServerPlayer* p);    // restore the persisted profile
 	void OnDisconnect(ENetPeer* peer);
 	void OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel);
 	void Tick();
@@ -146,6 +162,8 @@ private:
 	std::vector<uint32_t> m_bannedIps;
 
 	GameMode* m_gamemode = nullptr;
+	ProfileStore m_profiles;
+	double m_lastProfileFlush = -100.0;
 
 	std::mutex m_cmdMutex;
 	std::deque<std::string> m_cmdQueue;

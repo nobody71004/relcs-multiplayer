@@ -33,6 +33,7 @@ public:
 		EV_CORRECTION,     // own authoritative state
 		EV_DISCONNECTED,   // text = reason
 		EV_GIVE,           // admin effect: kind/amount/arg for own player
+		EV_INVENTORY,      // profile restore from server: inv = wallet + weapon table
 		EV_RCON_RESP,      // text = rcon response line
 		EV_PICKUP,         // synced prop: kind=type amount=qty arg=weapon, pos in state
 		// vehicle events: arg = vehicleId, model = modelId, id = playerId,
@@ -53,6 +54,7 @@ public:
 		std::string text;
 		rnet::PlayerState state;
 		rnet::VehicleState veh;
+		rnet::MsgInventory inv;
 	};
 
 	bool Connect(const char* host, uint16_t port, const char* nick);
@@ -66,6 +68,7 @@ public:
 	void SendVehEnter(uint16_t vehicleId, uint8_t seat, uint16_t modelId); // 0xFFFF = new
 	void SendVehExit(uint16_t vehicleId);
 	void SendVehState(const rnet::VehicleState& s); // unreliable, 20 Hz, driver only
+	void SendInventory(const rnet::MsgInventory& m); // reliable snapshot (profile sync)
 
 	bool Connected() const { return m_connected; }
 	bool Spawned() const { return m_spawned; }

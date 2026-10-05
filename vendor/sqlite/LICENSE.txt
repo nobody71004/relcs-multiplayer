@@ -1,0 +1,2 @@
+SQLite amalgamation (sqlite3.c / sqlite3.h), version 3.45.1.
+Blessed as public domain by the authors (https://sqlite.org/copyright.html).

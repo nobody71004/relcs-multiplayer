@@ -64,6 +64,13 @@ bool Server::Init(const ServerConfig& cfg)
 	m_lastTick = 0.0;   // relative clock! (was = m_startTime, which made t-m_lastTick always negative and Tick() never run)
 	m_masterLastAnnounce = -100.0;  // connect + announce immediately
 
+	if(!m_cfg.profilesDb.empty()){
+		if(m_profiles.Open(m_cfg.profilesDb.c_str()))
+			Log("profiles: SQLite store at %s", m_cfg.profilesDb.c_str());
+		else
+			Log("profiles: DISABLED (%s)", m_profiles.LastError());
+	}
+
 	Log("reLCS server '%s' listening on UDP %u | mode=%s | maxplayers=%d",
 	    m_cfg.hostname.c_str(), (unsigned)m_cfg.port, m_gamemode->Name(), m_cfg.maxPlayers);
 	return true;
@@ -97,6 +104,11 @@ void Server::Run()
 
 		UpdateMasterAnnounce();
 
+		if(t - m_lastProfileFlush >= 10.0){
+			m_lastProfileFlush = t;
+			FlushProfiles();
+		}
+
 		if(m_cfg.netstatsInterval > 0 && t - m_lastNetStats >= m_cfg.netstatsInterval){
 			m_lastNetStats = t;
 			Log("netstats: sent=%u KB recv=%u KB",
@@ -112,7 +124,9 @@ void Server::Run()
 		}
 
 		Sleep(1);
+
 	}
+	FlushProfiles();
 	Log("server shutting down");
 }
 
@@ -232,6 +246,7 @@ void Server::OnDisconnect(ENetPeer* peer)
 	// leave any vehicle (broadcasts MSG_VEH_EXIT so clients unseat the puppet)
 	ClearPlayerVehicles(p, true);
 
+	SaveProfile(p);
 	Log("[LEAVE] id=%d name=%s", p->id, p->name.c_str());
 	if(m_gamemode) m_gamemode->OnPlayerDisconnect(*this, p->id);
 
@@ -276,6 +291,7 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 	case MSG_DAMAGE:      if(p) HandleDamage(p, r); break;
 	case MSG_VEH_ENTER:   if(p) HandleVehEnter(p, r); break;
 	case MSG_VEH_EXIT:    if(p) HandleVehExit(p, r); break;
+	case MSG_INVENTORY:   if(p) HandleInventory(p, r); break;
 	case MSG_RCON_AUTH:   if(p) HandleRcon(p, r, true); break;
 	case MSG_RCON_CMD:    if(p) HandleRcon(p, r, false); break;
 	case MSG_PING: {
@@ -381,6 +397,25 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	np.moneySeen = 0;
 	np.moneyGranted = 0;
 	np.floodStrikes = 0;
+	// persistent profile: restore the saved wallet + weapon inventory
+	if(m_profiles.IsOpen() && m_profiles.Load(np.name, np.savedProfile)){
+		np.hasProfile = true;
+		np.moneyInit = true;
+		np.moneySeen = np.savedProfile.money;   // wallet baseline = saved balance
+		np.savedMoney = np.savedProfile.money;
+		np.inv.playerId = np.id;
+		np.inv.money = np.savedProfile.money;
+		np.inv.currentWeapon = np.savedProfile.currentWeapon;
+		np.inv.count = 0;
+		for(size_t i = 0; i < np.savedProfile.weapons.size() && np.inv.count < MAX_INV_ENTRIES; i++){
+			np.inv.entries[np.inv.count].weapon = np.savedProfile.weapons[i].weapon;
+			np.inv.entries[np.inv.count].ammo = np.savedProfile.weapons[i].ammo;
+			np.inv.count++;
+		}
+		np.invSet = true;
+		Log("[PROFILE] loaded name=%s money=%d weapons=%d", np.name.c_str(),
+		    np.savedProfile.money, (int)np.inv.count);
+	}
 	peer->data = &np;
 
 	Log("[JOIN] id=%d name=%s", np.id, np.name.c_str());
@@ -542,6 +577,11 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 
 	// server-tracked economy: the wallet may only grow by granted amounts
 	// (admins are trusted — give-money and gamemode rewards bypass the ledger)
+	if(!p->moneyInit){
+		// fresh name: the first reported wallet becomes the session baseline
+		p->moneySeen = st.money;
+		p->moneyInit = true;
+	}
 	if(admin){
 		p->moneySeen = st.money;
 	}else{
@@ -556,6 +596,7 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 			}
 		}
 	}
+	if(st.money != p->savedMoney) p->profileDirty = true;   // wallet moved: persist
 
 	// authoritative vitals
 	st.playerId = p->id;
@@ -642,7 +683,104 @@ void Server::HandleChat(ServerPlayer* p, BitReader& r)
 
 void Server::HandleSpawnReq(ServerPlayer* p)
 {
-	if(m_gamemode) m_gamemode->OnPlayerSpawnRequest(*this, p->id);
+	if(m_gamemode) m_gamemode->OnPlayerSpawnRequest(*this, p->id);   // broadcasts MSG_SPAWN first
+
+	// one profile restore per session, right after the spawn so the ped
+	// exists client-side to apply it
+	if(!p->profileSent){
+		p->profileSent = true;
+		if(p->hasProfile) SendInventory(p);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Persistent profiles (SQLite)
+// ---------------------------------------------------------------------------
+void Server::HandleInventory(ServerPlayer* p, BitReader& r)
+{
+	MsgInventory m;
+	if(!ReadInventory(r, m)) return;
+	if(Now() - p->invTime < 0.5) return;    // snapshot throttle
+	p->invTime = Now();
+
+	// fresh name: the first report also establishes the wallet baseline
+	if(!p->moneyInit){
+		int32_t w = m.money;
+		if(w < 0 || w > MONEY_MAX) w = 0;
+		p->moneySeen = w;
+		p->moneyInit = true;
+	}
+
+	// sanitize the weapon table: valid types only, deduped, bounded
+	MsgInventory clean;
+	clean.playerId = p->id;
+	clean.money = p->moneySeen;            // economy stays on the validated wallet
+	clean.currentWeapon = (m.currentWeapon < 128) ? m.currentWeapon : 0;
+	clean.count = 0;
+	for(int i = 0; i < m.count && clean.count < MAX_INV_ENTRIES; i++){
+		uint8_t wpn = m.entries[i].weapon;
+		if(wpn == 0 || wpn >= 128) continue;
+		bool dup = false;
+		for(int j = 0; j < clean.count; j++)
+			if(clean.entries[j].weapon == wpn){ dup = true; break; }
+		if(dup) continue;
+		clean.entries[clean.count].weapon = wpn;
+		clean.entries[clean.count].ammo = m.entries[i].ammo;
+		clean.count++;
+	}
+	p->inv = clean;
+	p->invSet = true;
+	p->profileDirty = true;
+}
+
+void Server::SendInventory(ServerPlayer* p)
+{
+	if(!p || !p->peer) return;
+	BitWriter w;
+	BeginMsg(w, MSG_INVENTORY);
+	rnet::MsgInventory m = p->inv;
+	m.playerId = p->id;
+	m.money = p->moneySeen;
+	WriteInventory(w, m);
+	SendTo(p->peer, w, CHAN_RELIABLE, true);
+}
+
+void Server::SaveProfile(ServerPlayer* p)
+{
+	if(!m_profiles.IsOpen() || !p || p->name.empty()) return;
+
+	PlayerProfile prof;
+	if(p->moneyInit)
+		prof.money = p->moneySeen;
+	else if(p->hasProfile)
+		prof.money = p->savedProfile.money;
+	prof.currentWeapon = p->inv.currentWeapon;
+	for(int i = 0; i < p->inv.count; i++)
+		prof.weapons.push_back({ p->inv.entries[i].weapon, p->inv.entries[i].ammo });
+	if(!p->invSet && p->hasProfile){
+		prof.weapons = p->savedProfile.weapons;
+		prof.currentWeapon = p->savedProfile.currentWeapon;
+	}
+
+	if(m_profiles.Save(p->name, prof)){
+		p->savedMoney = prof.money;
+		p->savedProfile = prof;
+		p->hasProfile = true;
+		p->profileDirty = false;
+		Log("[PROFILE] saved name=%s money=%d weapons=%d", p->name.c_str(),
+		    prof.money, (int)prof.weapons.size());
+	}else{
+		Log("[PROFILE] save FAILED name=%s: %s", p->name.c_str(), m_profiles.LastError());
+	}
+}
+
+void Server::FlushProfiles()
+{
+	if(!m_profiles.IsOpen()) return;
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(p.active && p.profileDirty) SaveProfile(&p);
+	}
 }
 
 void Server::HandleDamage(ServerPlayer* p, BitReader& r)
@@ -1028,6 +1166,27 @@ void Server::SendGive(uint8_t targetId, uint8_t kind, int32_t amount, uint16_t a
 	// grant ledger: the client may legally grow its wallet by exactly this
 	if(kind == GIVE_MONEY && amount > 0)
 		p->moneyGranted += amount;
+	// keep weapon grants in the persisted inventory even before the client
+	// reports its table back
+	if(kind == GIVE_WEAPON && amount > 0){
+		uint8_t wpn = (uint8_t)(arg & 0x7F);
+		if(wpn){
+			int found = -1;
+			for(int i = 0; i < p->inv.count; i++)
+				if(p->inv.entries[i].weapon == wpn){ found = i; break; }
+			if(found >= 0){
+				int32_t sum = (int32_t)p->inv.entries[found].ammo + amount;
+				p->inv.entries[found].ammo = (uint16_t)(sum > 65535 ? 65535 : sum);
+			}else if(p->inv.count < MAX_INV_ENTRIES){
+				p->inv.entries[p->inv.count].weapon = wpn;
+				p->inv.entries[p->inv.count].ammo = (uint16_t)(amount > 65535 ? 65535 : amount);
+				p->inv.count++;
+			}
+			if(!p->inv.currentWeapon) p->inv.currentWeapon = wpn;
+			p->invSet = true;
+			p->profileDirty = true;
+		}
+	}
 	BitWriter w;
 	BeginMsg(w, MSG_GIVE);
 	MsgGive g;

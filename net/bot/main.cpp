@@ -2,7 +2,7 @@
 //
 // Usage:
 //   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos]
-//                [-duration 30] [-expect-chat SUBSTR] [-rcon PW] [-seed N] [-verbose]
+//                [-duration 30] [-expect-chat SUBSTR] [-rcon PW] [-cmd "RCON CMD"] [-seed N] [-verbose]
 //
 // Prints 1 Hz telemetry lines consumed by the E2E harness:
 //   [<unix t>] IAM <x> <y> <z>       — this bot's authoritative position
@@ -46,6 +46,7 @@ struct BotConfig {
 	double duration = 30.0;
 	std::string expectChat;
 	std::string rconPassword;
+	std::vector<std::string> rconCmds;   // extra RCON commands after auth (repeatable)
 	uint32_t seed = 0;
 	bool verbose = false;
 	bool discover = false;
@@ -168,6 +169,7 @@ int main(int argc, char** argv)
 		else if(a == "-duration" && hasNext) cfg.duration = atof(argv[++i]);
 		else if(a == "-expect-chat" && hasNext) cfg.expectChat = argv[++i];
 		else if(a == "-rcon" && hasNext) cfg.rconPassword = argv[++i];
+		else if(a == "-cmd" && hasNext) cfg.rconCmds.push_back(argv[++i]);
 		else if(a == "-seed" && hasNext) cfg.seed = (uint32_t)atoi(argv[++i]);
 		else if(a == "-verbose") cfg.verbose = true;
 		else if(a == "-discover") cfg.discover = true;
@@ -682,7 +684,7 @@ int main(int argc, char** argv)
 			enet_peer_send(peer, CHAN_RELIABLE, pkt);
 		}
 
-		// rcon follow-up command
+		// rcon follow-up command(s)
 		if(rconTimer > 0 && t >= rconTimer){
 			rconTimer = -1;
 			BitWriter w;
@@ -690,6 +692,15 @@ int main(int argc, char** argv)
 			WriteStringMsg(w, "status", 255);
 			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 			enet_peer_send(peer, CHAN_RELIABLE, pkt);
+			for(size_t i = 0; i < cfg.rconCmds.size(); i++){
+				BitWriter wc;
+				BeginMsg(wc, MSG_RCON_CMD);
+				WriteStringMsg(wc, cfg.rconCmds[i].c_str(), 255);
+				ENetPacket* pc = enet_packet_create(wc.Data(), wc.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+				enet_peer_send(peer, CHAN_RELIABLE, pc);
+				if(cfg.verbose)
+					std::printf("[%.3f] RCON CMD: %s\n", elapsed(), cfg.rconCmds[i].c_str());
+			}
 		}
 
 		// 1 Hz telemetry (wall-clock: e2e aligns samples across staggered bots)

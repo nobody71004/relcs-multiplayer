@@ -10,7 +10,7 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 3;  // v3: PlayerState.moveFlags + MSG_GIVE
+constexpr uint16_t PROTOCOL_VERSION   = 4;  // v4: MSG_INVENTORY profile sync
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
 constexpr uint16_t DEFAULT_MASTER_PORT= 7800;  // ENet master server
@@ -67,6 +67,7 @@ enum MsgType : uint8_t {
 	MSG_VEH_ENTER       = 30,
 	MSG_VEH_EXIT        = 31,
 	MSG_VEH_SPAWN       = 32,
+	MSG_INVENTORY       = 34, // profile sync: full money+weapon snapshot (both ways)
 	// world / gamemode
 	MSG_WORLD           = 40,
 	MSG_SCORE_UPDATE    = 41,
@@ -115,6 +116,22 @@ struct PlayerState {
 	uint16_t vehicleId = 0xFFFF; // 0xFFFF = on foot
 	uint8_t  seat = 0xFF;
 	uint8_t  moveFlags = 0;      // MOVEFLAG_*
+};
+
+// Full inventory snapshot (MSG_INVENTORY): the player's wallet and weapon table.
+// client -> server: periodic report (server persists it in the profile DB)
+// server -> client: profile restore on join (client applies it absolutely)
+constexpr int MAX_INV_ENTRIES = 32;
+struct InvEntry {
+	uint8_t  weapon = 0;    // eWeaponType (0 = unarmed, unused)
+	uint16_t ammo = 0;
+};
+struct MsgInventory {
+	uint16_t playerId = 0;
+	int32_t  money = 0;
+	uint8_t  currentWeapon = 0;
+	uint8_t  count = 0;
+	InvEntry entries[MAX_INV_ENTRIES];
 };
 
 // animFlags bits

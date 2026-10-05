@@ -1159,6 +1159,63 @@ static double s_lastLog = 0.0;
 // flagged teleport and the server resets its movement reference instead of
 // anti-cheat kicking us (snap-back used to ping-pong with the game at 20 Hz)
 static CVector s_lastSentPos(0.0f, 0.0f, 0.0f);
+
+// --- persistent profile sync: wallet + weapon table -------------------------
+static rnet::MsgInventory s_invLast;
+static bool   s_invHave = false;
+static double s_invLastSend = -100.0;
+static bool   s_invForce = false;     // send on next frame regardless of throttle
+
+static rnet::MsgInventory BuildInventory()
+{
+	rnet::MsgInventory m;
+	m.money = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
+	CPlayerPed* me = FindPlayerPed();
+	if(me){
+		m.currentWeapon = (uint8_t)me->GetWeapon()->m_eWeaponType;
+		for(int i = 0; i < TOTAL_WEAPON_SLOTS && m.count < rnet::MAX_INV_ENTRIES; i++){
+			if(!me->HasWeaponSlot((uint8)i)) continue;
+			CWeapon& w = me->GetWeapon((uint8)i);
+			uint8_t type = (uint8_t)w.m_eWeaponType;
+			if(type == 0) continue;
+			int32_t ammo = w.m_nAmmoTotal;
+			m.entries[m.count].weapon = type;
+			m.entries[m.count].ammo = (uint16_t)(ammo < 0 ? 0 : (ammo > 65535 ? 65535 : ammo));
+			m.count++;
+		}
+	}
+	return m;
+}
+
+static bool InvDiffers(const rnet::MsgInventory& a, const rnet::MsgInventory& b)
+{
+	if(a.money != b.money || a.count != b.count || a.currentWeapon != b.currentWeapon)
+		return true;
+	for(int i = 0; i < a.count; i++)
+		if(a.entries[i].weapon != b.entries[i].weapon || a.entries[i].ammo != b.entries[i].ammo)
+			return true;
+	return false;
+}
+
+// apply a server profile restore absolutely: wallet + full weapon table
+static void ApplyInventory(const rnet::MsgInventory& m)
+{
+	CPlayerPed* me = FindPlayerPed();
+	if(!me) return;
+	CWorld::Players[CWorld::PlayerInFocus].m_nMoney = m.money;
+	me->ClearWeapons();
+	int selSlot = 0;
+	for(int i = 0; i < m.count; i++){
+		int slot = me->GiveWeapon((eWeaponType)m.entries[i].weapon, (uint32)m.entries[i].ammo, true);
+		if(m.entries[i].weapon == m.currentWeapon) selSlot = slot;
+	}
+	me->SetCurrentWeapon(selSlot);
+	s_invLast = m;
+	s_invHave = true;
+	s_invForce = false;
+	fprintf(stderr, "[NET] profile restored: $%d + %d weapons\n", (int)m.money, (int)m.count);
+	fflush(stderr);
+}
 static bool s_haveLastSent = false;
 static double s_lastTeleportLog = 0.0;
 
@@ -1211,8 +1268,14 @@ void NetGame_Frame(void)
 				s_haveLastSent = true;
 			}
 			s_welcomeUntil = NowSec() + 6.0;
+			// push the first inventory snapshot right after spawning
+			s_invForce = true;
 			break;
 		}
+		case NetClient::EV_INVENTORY:
+			// profile restore from the server (sent once, after our spawn)
+			ApplyInventory(ev.inv);
+			break;
 		case NetClient::EV_CORRECTION:{
 			CPlayerPed* me = FindPlayerPed();
 			if(me){
@@ -1516,6 +1579,18 @@ void NetGame_Frame(void)
 		s_lastSentPos = pos;
 		s_haveLastSent = true;
 		s_net.SendState(st);
+
+		// persistent profile: report the wallet + weapon table when it changes
+		// (throttled — the server stores the latest snapshot in SQLite)
+		rnet::MsgInventory inv = BuildInventory();
+		if((s_invForce || now - s_invLastSend >= 0.5) && (!s_invHave || InvDiffers(s_invLast, inv))){
+			inv.playerId = s_net.MyId();
+			s_net.SendInventory(inv);
+			s_invLast = inv;
+			s_invHave = true;
+			s_invLastSend = now;
+			s_invForce = false;
+		}
 
 		// the driver streams the vehicle (seat 0 is authoritative for the car)
 		if(inVehicle && s_myVehNet != rnet::VEHICLE_NONE && s_mySeat == 0 && me->m_pMyVehicle){

@@ -151,6 +151,17 @@ void NetClient::SendVehState(const VehicleState& s)
 	enet_peer_send((ENetPeer*)m_peer, CHAN_STATE, pkt);
 }
 
+void NetClient::SendInventory(const MsgInventory& m)
+{
+	if(!m_host || !m_peer || !m_connected) return;
+	BitWriter w;
+	BeginMsg(w, MSG_INVENTORY);
+	WriteInventory(w, m);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+	enet_peer_send((ENetPeer*)m_peer, CHAN_RELIABLE, pkt);
+	enet_host_flush((ENetHost*)m_host);
+}
+
 void NetClient::SendSpawnRequest()
 {
 	if(!m_host || !m_peer || !m_connected) return;
@@ -342,6 +353,16 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			e.kind = g.kind;
 			e.amount = g.amount;
 			e.arg = g.arg;
+			m_events.push_back(e);
+		}
+		break;
+	}
+	case MSG_INVENTORY:{
+		MsgInventory m;
+		if(ReadInventory(r, m)){
+			Event e;
+			e.type = EV_INVENTORY;
+			e.inv = m;
 			m_events.push_back(e);
 		}
 		break;
