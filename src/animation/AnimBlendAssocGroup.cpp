@@ -47,6 +47,11 @@ CAnimBlendAssocGroup::DestroyAssociations(void)
 CAnimBlendAssociation*
 CAnimBlendAssocGroup::GetAnimation(uint32 id)
 {
+	// the port's anim tables don't cover every LCS animation and blocks may be
+	// unloaded; an out-of-range id used to return a wild pointer that survived
+	// nil checks and crashed deep inside anim code. return nil instead.
+	if(assocList == nil || (int32)id < firstAnimId || (int32)id >= firstAnimId + numAssociations)
+		return nil;
 	return &assocList[id - firstAnimId];
 }
 

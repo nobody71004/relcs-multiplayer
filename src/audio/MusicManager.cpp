@@ -232,7 +232,9 @@ cMusicManager::SetRadioChannelByScript(uint32 station, int32 pos)
 		if (station <= STREAMED_SOUND_RADIO_POLICE) {
 			m_bRadioSetByScript = TRUE;
 			m_nRadioStationScript = station;
-			m_nRadioPosition = pos == -1 ? -1 : pos % m_aTracks[station].m_nLength;
+			// No stream file behind the track means length zero; modulo zero would
+			// crash, so fall back to 'no position'.
+			m_nRadioPosition = (pos == -1 || m_aTracks[station].m_nLength == 0) ? -1 : pos % m_aTracks[station].m_nLength;
 		}
 	}
 }
@@ -1192,6 +1194,10 @@ cMusicManager::GetTrackStartPos(uint32 track)
 	else
 		m_aTracks[track].m_nLastPosCheckTimer = CTimer::GetTimeInMillisecondsPauseMode();
 
+	// A track with no stream file behind it has length zero; modulo zero is a
+	// crash (c0000094), so treat it as having no start position instead.
+	if (m_aTracks[track].m_nLength == 0)
+		return 0;
 	if (pos > m_aTracks[track].m_nLength)
 		pos %= m_aTracks[track].m_nLength;
 	return pos;

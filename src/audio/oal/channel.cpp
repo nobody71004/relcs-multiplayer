@@ -17,7 +17,11 @@ bool bChannelsCreated = false;
 
 int32 CChannel::channelsThatNeedService = 0;
 
-uint8 tempStereoBuffer[PED_BLOCKSIZE * 2];
+// Must hold the largest sample the 2D-to-stereo conversion can see: mission
+// audio allows MISSION_AUDIO_BLOCKSIZE bytes of mono data, doubled for stereo.
+// (PED_BLOCKSIZE was too small for mission audio and the conversion below
+// overran this buffer, corrupting whatever global came after it.)
+uint8 tempStereoBuffer[MISSION_AUDIO_BLOCKSIZE * 2];
 
 void
 CChannel::InitChannels()
@@ -122,12 +126,18 @@ void CChannel::Start()
 		// convert mono data to stereo
 		int16 *monoData = (int16*)Data;
 		int16 *stereoData = (int16*)tempStereoBuffer;
-		for (size_t i = 0; i < DataSize / 2; i++)
+		// Never convert more than tempStereoBuffer can hold, whatever size the
+		// caller claims its data is.
+		size_t maxSamples = sizeof(tempStereoBuffer) / (2 * sizeof(int16));
+		size_t samples = DataSize / 2;
+		if (samples > maxSamples)
+			samples = maxSamples;
+		for (size_t i = 0; i < samples; i++)
 		{
 			*(stereoData++) = *monoData;
 			*(stereoData++) = *(monoData++);
 		}
-		alBufferData(alBuffers[id], AL_FORMAT_STEREO16, tempStereoBuffer, DataSize * 2, Frequency);
+		alBufferData(alBuffers[id], AL_FORMAT_STEREO16, tempStereoBuffer, (ALsizei)(samples * 2 * sizeof(int16)), Frequency);
 	}
 	else
 		alBufferData(alBuffers[id], AL_FORMAT_MONO16, Data, DataSize, Frequency);

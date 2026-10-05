@@ -419,6 +419,14 @@ CPopulation::PedCreationDistMultiplier()
 CPed*
 CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors, int32 modifier)
 {
+	// when the pool is full, CPed::operator new returns nil and the constructor
+	// crashes writing through a null 'this'; cull a random ped first and bail
+	// out cleanly if there is nothing left to cull
+	if (CPools::GetPedPool()->GetNoOfFreeSpaces() == 0) {
+		RemovePedsIfThePoolGetsFull();
+		if (CPools::GetPedPool()->GetNoOfFreeSpaces() == 0)
+			return nil;
+	}
 	switch (pedType) {
 		case PEDTYPE_CIVMALE:
 		case PEDTYPE_CIVFEMALE:
@@ -893,6 +901,8 @@ CPopulation::AddPedInCar(CVehicle* car, bool isDriver)
 	}
 
 	CPed *newPed = CPopulation::AddPed((ePedType)pedType, preferredModel, car->GetPosition(), miamiViceIndex);
+	if (!newPed)
+		return nil;
 	newPed->bUsesCollision = false;
 
 	if (newPed->GetWeapon()->m_eWeaponType != WEAPONTYPE_UNARMED) {
@@ -1176,6 +1186,8 @@ CPopulation::AddDeadPedInFrontOfCar(const CVector& pos, CVehicle* pCulprit)
 	if (!CModelInfo::GetModelInfo(MI_MALE01)->GetRwObject())
 		return nil;
 	CPed* pPed = CPopulation::AddPed(PEDTYPE_CIVMALE, MI_MALE01, pos);
+	if (!pPed)
+		return nil;
 	pPed->SetDie();
 	pPed->m_nPedMoney = 0;
 	pPed->bDeadPedInFrontOfCar = true;

@@ -1,4 +1,5 @@
 #include "common.h"
+#include "net/nethooks.h"
 #include <time.h>
 #include "rpmatfx.h"
 #include "rphanim.h"
@@ -1478,6 +1479,7 @@ Render2dStuff(void)
 	else
 #endif
 		CHud::Draw();
+	NetGame_DrawHud();
 
 	CSpecialFX::Render2DFXs();
 	CUserDisplay::OnscnTimer.ProcessForDisplay();
@@ -1533,6 +1535,8 @@ Idle(void *arg)
 {
 	CTimer::Update();
 
+	NetGame_Frame();
+
 	tbInit();
 
 	CSprite2d::InitPerFrame();
@@ -1570,13 +1574,10 @@ Idle(void *arg)
 
 	if(!FrontEndMenuManager.m_bMenuActive && TheCamera.GetScreenFadeStatus() != FADE_2)
 	{
-		// This is from SA, but it's nice for windowed mode
-#if defined(GTA_PC) && !defined(RW_GL3)
-		RwV2d pos;
-		pos.x = SCREEN_WIDTH / 2.0f;
-		pos.y = SCREEN_HEIGHT / 2.0f;
-		RsMouseSetPos(&pos);
-#endif
+		// NOTE: the SA-style cursor recentre that used to live here warped the OS
+		// cursor to the screen centre every frame. That froze any overlay that
+		// tracks the real cursor position (e.g. the RTX Remix Alt+X menu), so the
+		// warp is gone: camera look uses DirectInput deltas and does not need it.
 
 		tbStartTimer(0, "CnstrRenderList");
 #ifdef PC_WATER
@@ -1701,6 +1702,7 @@ FrontendIdle(void)
 	CFont::InitPerFrame();
 	CPad::UpdatePads();
 	FrontEndMenuManager.Process();
+	NetGame_FrontendTick();
 
 	if(RsGlobal.quit)
 		return;
@@ -1763,6 +1765,7 @@ AppEventHandler(RsEvent event, void *param)
 
 		case rsTERMINATE:
 		{
+			NetGame_Shutdown();
 			CGame::FinalShutdown();
 
 			return rsEVENTPROCESSED;
@@ -1778,6 +1781,13 @@ AppEventHandler(RsEvent event, void *param)
 			AttachInputDevices();
 
 			return rsEVENTPROCESSED;
+		}
+
+		case rsCOMMANDLINE:
+		{
+			if(NetGame_OnCommandLine((const char *)param))
+				return rsEVENTPROCESSED;
+			return rsEVENTNOTPROCESSED;
 		}
 
 		case rsIDLE:

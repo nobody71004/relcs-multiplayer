@@ -3,6 +3,19 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
+# --- multiplayer (net/) build artifacts & generated data ---
+net/bin/
+net/build/
+net/cef/
+net/cef_minimal.tar.bz2
+net/cef-index.json
+net/e2e-out/
+*.log
+
+# --- local test screenshots / scratch ---
+game-shot.png
+game-shot.html
+
 # User-specific files
 *.rsuser
 *.suo

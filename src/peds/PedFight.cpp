@@ -287,11 +287,13 @@ CPed::SetAttack(CEntity *victim)
 				bIsAttacking = false;
 
 				CAnimBlendAssociation *animAssoc = CAnimManager::BlendAnimation(GetClump(), curWeapon->m_AnimToPlay, ANIM_MELEE_ATTACK_START, 8.0f);
-				animAssoc->SetRun();
-				if (animAssoc->currentTime == animAssoc->hierarchy->totalLength)
-					animAssoc->SetCurrentTime(0.0f);
+				if (animAssoc) {
+					animAssoc->SetRun();
+					if (animAssoc->currentTime == animAssoc->hierarchy->totalLength)
+						animAssoc->SetCurrentTime(0.0f);
 
-				animAssoc->SetFinishCallback(FinishedAttackCB, this);
+					animAssoc->SetFinishCallback(FinishedAttackCB, this);
+				}
 			}
 		} else {
 			StartFightAttack(CGeneral::GetRandomNumber());
@@ -1547,37 +1549,41 @@ CPed::Fight(void)
 			animAssoc = CAnimManager::BlendAnimation(GetClump(), m_curFightMove < FIGHTMOVE_MELEE1 ? ASSOCGRP_STD : weaponInfo->m_AnimToPlay,
 				tFightMoves[m_curFightMove].animId, 8.0f);
 
-			if (weaponInfo->m_AnimToPlay != ASSOCGRP_KNIFE || m_curFightMove < FIGHTMOVE_MELEE1) {
-				animAssoc->speed = 0.8f;
-			} else {
-				switch (GetWeapon()->m_eWeaponType) {
-					case WEAPONTYPE_SCREWDRIVER:
-					case WEAPONTYPE_KNIFE:
-						animAssoc->speed = 1.05f;
-						break;
-					case WEAPONTYPE_GOLFCLUB:
-					case WEAPONTYPE_NIGHTSTICK:
-					case WEAPONTYPE_BASEBALLBAT:
-					case WEAPONTYPE_HAMMER:
-					case WEAPONTYPE_KATANA:
-						animAssoc->speed = 0.8f;
-						break;
-					case WEAPONTYPE_CLEAVER:
-					case WEAPONTYPE_MACHETE:
-						animAssoc->speed = 0.9f;
-						break;
+			// BlendAnimation returns nil for animations missing from this port's
+			// tables; skip the move setup instead of dereferencing it
+			if (animAssoc) {
+				if (weaponInfo->m_AnimToPlay != ASSOCGRP_KNIFE || m_curFightMove < FIGHTMOVE_MELEE1) {
+					animAssoc->speed = 0.8f;
+				} else {
+					switch (GetWeapon()->m_eWeaponType) {
+						case WEAPONTYPE_SCREWDRIVER:
+						case WEAPONTYPE_KNIFE:
+							animAssoc->speed = 1.05f;
+							break;
+						case WEAPONTYPE_GOLFCLUB:
+						case WEAPONTYPE_NIGHTSTICK:
+						case WEAPONTYPE_BASEBALLBAT:
+						case WEAPONTYPE_HAMMER:
+						case WEAPONTYPE_KATANA:
+							animAssoc->speed = 0.8f;
+							break;
+						case WEAPONTYPE_CLEAVER:
+						case WEAPONTYPE_MACHETE:
+							animAssoc->speed = 0.9f;
+							break;
+					}
 				}
-			}
 
-			if (m_fightState == FIGHTSTATE_MOVE_FINISHED && animAssoc->currentTime != 0.0f) {
-				animAssoc->SetRun();
-				if (!IsPlayer())
-					animAssoc->SetCurrentTime(0.0f);
-			}
-			if (IsPlayer())
-				animAssoc->SetCurrentTime(0.08f);
+				if (m_fightState == FIGHTSTATE_MOVE_FINISHED && animAssoc->currentTime != 0.0f) {
+					animAssoc->SetRun();
+					if (!IsPlayer())
+						animAssoc->SetCurrentTime(0.0f);
+				}
+				if (IsPlayer())
+					animAssoc->SetCurrentTime(0.08f);
 
-			animAssoc->SetFinishCallback(FinishFightMoveCB, this);
+				animAssoc->SetFinishCallback(FinishFightMoveCB, this);
+			}
 			m_fightButtonPressure = 0;
 		}
 		m_fightState = FIGHTSTATE_NO_MOVE;

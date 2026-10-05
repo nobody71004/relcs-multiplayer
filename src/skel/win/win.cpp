@@ -50,6 +50,7 @@
 #include "skeleton.h"
 #include "platform.h"
 #include "crossplatform.h"
+#include "net/nethooks.h"
 
 #define MAX_SUBSYSTEMS		(16)
 
@@ -969,7 +970,22 @@ MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		case WM_SETCURSOR:
 		{
-			ShowCursor(FALSE);
+			// a UI panel (F6 admin / console / chat) owns the mouse: show the
+			// standard arrow cursor while it is open
+			if( NetGame_WantMouse() )
+			{
+				SetCursor(LoadCursor(NULL, IDC_ARROW));
+				break;
+			}
+
+			// ShowCursor(FALSE) decrements the display counter every call, so only
+			// do it once; otherwise the cursor can never be shown again.
+			static BOOL s_cursorHidden = FALSE;
+			if( !s_cursorHidden )
+			{
+				ShowCursor(FALSE);
+				s_cursorHidden = TRUE;
+			}
 			
 			SetCursor(nil);
 			
@@ -2016,6 +2032,10 @@ WinMain(HINSTANCE instance,
 	RwV2d pos;
 	RwInt32 argc, i;
 	RwChar **argv;
+	// Unbuffered stdout/stderr so a redirected log always ends at the last
+	// line printed before a crash.
+	setvbuf(stdout, nil, _IONBF, 0);
+	setvbuf(stderr, nil, _IONBF, 0);
 	SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, nil, SPIF_SENDCHANGE);
 
 #ifndef MASTER

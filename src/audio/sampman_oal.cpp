@@ -1021,7 +1021,7 @@ cSampleManager::Initialise(void)
 				
 				nStreamLength[i] = tatalms;
 			} else
-				USERERROR("Can't open '%s'\n", StreamedNameTable[i]);
+				debug("Can't open '%s' (stream audio missing; radio and cutscenes will be silent)\n", StreamedNameTable[i]);
 		}
 #ifdef AUDIO_CACHE
 		cacheFile = fcaseopen("audio\\sound.cache", "wb");

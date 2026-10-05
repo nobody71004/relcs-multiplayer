@@ -731,6 +731,8 @@ CHeli::SendDownSwat(void)
 	float groundZ = CWorld::FindGroundZFor3DCoord(pos.x, pos.y, pos.z, nil);
 	if(Abs(FindPlayerCoors().z - groundZ) < 2.5f && CRopes::RegisterRope((uintptr)this + m_numSwat-1, pos, false)){
 		CCopPed *swat = (CCopPed*)CPopulation::AddPed(PEDTYPE_COP, COP_HELI_SWAT, pos);
+		if(!swat)
+			return false;
 		swat->bUsesCollision = false;
 		swat->m_pRopeEntity = this;
 		RegisterReference(&swat->m_pRopeEntity);

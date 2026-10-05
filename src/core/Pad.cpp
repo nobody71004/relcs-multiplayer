@@ -13,6 +13,7 @@
 
 #include "Pad.h"
 #include "ControllerConfig.h"
+#include "net/nethooks.h"
 #include "Timer.h"
 #include "Frontend.h"
 #include "Camera.h"
@@ -886,10 +887,30 @@ CMouseControllerState CMousePointerStateHelper::GetMouseSetUp()
 void CPad::UpdateMouse()
 {
 #if defined RW_D3D9 || defined RWLIBS
+	// UI panels (F6 admin, chat, console) own the mouse while open: run the
+	// device non-exclusive so the OS cursor is free for the CEF overlay, and
+	// keep gameplay (camera look, mouse steering, fire) blind to it
+	static bool s_uiMouseActive = false;
+	bool uiMouse = NetGame_WantMouse();
+	if ( uiMouse != s_uiMouseActive )
+	{
+		s_uiMouseActive = uiMouse;
+		if ( PSGLOBAL(mouse) )
+			_InputShutdownMouse(); // re-acquired below with the right coop level
+	}
+	if ( s_uiMouseActive )
+	{
+		PCTempMouseControllerState.Clear();
+		OldMouseControllerState = NewMouseControllerState;
+		NewMouseControllerState = PCTempMouseControllerState;
+	}
 	if ( IsForegroundApp() )
 	{
 		if ( PSGLOBAL(mouse) == nil )
-			_InputInitialiseMouse(!FrontEndMenuManager.m_bMenuActive && _InputMouseNeedsExclusive());
+			_InputInitialiseMouse(s_uiMouseActive ? false : (!FrontEndMenuManager.m_bMenuActive && _InputMouseNeedsExclusive()));
+
+		if ( s_uiMouseActive )
+			return; // the panel reads the real cursor itself (GetCursorPos)
 
 		DIMOUSESTATE2 state;
 

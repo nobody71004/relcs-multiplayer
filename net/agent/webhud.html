@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LCS Online — Server HUD</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --edge: #262c36; --text: #d6dce5;
+    --dim: #7d8590; --gold: #f0c14b; --green: #56d364; --red: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.5 "Segoe UI", system-ui, sans-serif; padding: 18px; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+  header h1 { font-size: 18px; letter-spacing: 2px; color: var(--gold); }
+  header .sub { color: var(--dim); }
+  header .spacer { flex: 1; }
+  input, select, button, textarea {
+    background: var(--panel); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 7px 10px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  button.danger:hover { border-color: var(--red); }
+  .grid { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 14px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--edge); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  .money { color: var(--green); }
+  .hp { color: var(--red); }
+  pre { color: var(--dim); font: 12px/1.6 Consolas, monospace; white-space: pre-wrap; }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .row > * { flex: 1; }
+  .row > button { flex: 0 0 auto; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--edge); }
+  .tag.on { color: var(--green); border-color: var(--green); }
+  #console pre { max-height: 180px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LIBERTY CITY STORIES ONLINE</h1>
+  <span class="sub" id="hostline">connecting…</span>
+  <span class="spacer"></span>
+  <input id="pw" type="password" placeholder="rcon password" style="width:160px">
+  <span id="conn" class="tag">offline</span>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>Players &amp; Inventory</h2>
+    <table id="players">
+      <thead><tr><th>#</th><th>Player</th><th>Money</th><th>HP</th><th>Arm</th><th>Weapon</th><th>Ammo</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h2 style="margin-top:14px">Server</h2>
+    <pre id="status">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>Admin Panel</h2>
+    <div class="row"><input id="say" placeholder="broadcast to all players…"><button onclick="say()">Send</button></div>
+    <div class="row">
+      <input id="gTarget" placeholder="player id/name">
+      <select id="gKind"><option>money</option><option>weapon</option><option>god</option><option>health</option></select>
+    </div>
+    <div class="row">
+      <input id="gValue" type="number" placeholder="amount / weapon id / 0-1">
+      <input id="gArg" type="number" placeholder="ammo" style="flex:0 0 90px">
+      <button onclick="give()">Give</button>
+    </div>
+    <div class="row">
+      <input id="bName" placeholder="bot name">
+      <select id="bScen"><option>roam</option><option>combat</option><option>drive</option><option>chaos</option></select>
+      <button onclick="spawnBot()">Spawn NPC</button>
+    </div>
+    <h2 style="margin-top:14px">Console</h2>
+    <div class="row"><input id="cmd" placeholder="server console command…" onkeydown="if(event.key==='Enter')rcon()"><button onclick="rcon()">Run</button></div>
+    <div id="console"><pre id="out">—</pre></div>
+  </div>
+
+  <div class="card">
+    <h2>Network</h2>
+    <pre id="netstats">—</pre>
+    <h2 style="margin-top:14px">Quick Actions</h2>
+    <div class="row"><button onclick="quick('give '+first()+' god 1')">Godmode: first</button><button onclick="quick('give '+first()+' money 100000')">$100k: first</button></div>
+    <div class="row"><button onclick="quick('spawnprop '+spawnPos()+' 4 50')">Spawn prop at first</button><button class="danger" onclick="quick('loadmode survivor')">Restart survivor</button></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let firstId = "";
+
+function pw() { return $("pw").value; }
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: { "X-Rcon": pw(), "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r.json();
+}
+
+function render(data) {
+  $("conn").textContent = data.ok ? "online" : "auth?";
+  $("conn").className = "tag" + (data.ok ? " on" : "");
+  $("status").textContent = (data.status || []).join("\n") || "—";
+  $("netstats").textContent = (data.netstats || []).join("\n") || "—";
+  const tb = $("players").querySelector("tbody");
+  tb.innerHTML = "";
+  firstId = "";
+  for (const line of (data.inventory || [])) {
+    const m = line.match(/^#(\d+)\s+(\S+)\s+money=(-?\d+)\s+hp=(\d+)\s+armour=(\d+)\s+weapon=(\d+)\s+ammo=(\d+)/);
+    if (!m) continue;
+    if (!firstId) firstId = m[1];
+    tb.insertAdjacentHTML("beforeend",
+      `<tr><td>${m[1]}</td><td>${m[2]}</td><td class="money">$${Number(m[3]).toLocaleString()}</td>` +
+      `<td class="hp">${m[4]}</td><td>${m[5]}</td><td>${m[6]}</td><td>${m[7]}</td></tr>`);
+  }
+  if ((data.status || []).length) {
+    const h = (data.status.find(l => l.includes("hostname=")) || "");
+    if (h) $("hostline").textContent = h;
+  }
+}
+
+async function refresh() {
+  try { render(await api("/v1/status")); }
+  catch (e) { $("conn").textContent = "offline"; $("conn").className = "tag"; }
+}
+
+function show(r) { $("out").textContent = JSON.stringify(r, null, 1).slice(0, 2500); }
+async function say()    { show(await api("/v1/say", { text: $("say").value })); }
+async function give()   { show(await api("/v1/give", { target: $("gTarget").value, kind: $("gKind").value, value: +$("gValue").value, arg: +$("gArg").value || 200 })); }
+async function rcon()   { show(await api("/v1/rcon", { command: $("cmd").value })); }
+async function quick(c) { $("cmd").value = c; show(await api("/v1/rcon", { command: c })); }
+async function spawnBot() { show(await api("/v1/bot", { name: $("bName").value || "NPC", scenario: $("bScen").value, duration: 600 })); }
+function first() { return firstId || "1"; }
+function spawnPos() { return "1133 -624 24"; }
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

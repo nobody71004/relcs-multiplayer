@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LCS Online — Game UI</title>
+<style>
+  :root {
+    --gold: #f0c14b; --green: #56d364; --red: #f85149; --blue: #58a6ff;
+    --text: #e8edf4; --dim: #9aa4b2; --panel: rgba(10, 13, 18, 0.82);
+    --edge: rgba(255, 255, 255, 0.14);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: transparent;
+    font: 14px/1.45 "Segoe UI", system-ui, sans-serif; color: var(--text);
+    user-select: none; cursor: default; }
+
+  /* ---------- top server bar (always on) ---------- */
+  #topbar {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 18px; align-items: center;
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 8px 22px; font-size: 14px; letter-spacing: 0.4px;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.35);
+  }
+  #topbar .name { color: var(--green); font-weight: 600; text-transform: uppercase; }
+  #topbar .stat { color: var(--dim); }
+  #topbar .stat b { color: var(--text); font-weight: 600; }
+  #topbar .badge { color: var(--gold); font-weight: 600; }
+
+  /* ---------- panels ---------- */
+  .panel {
+    position: absolute; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 12px 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    backdrop-filter: blur(3px); display: none;
+  }
+  .panel h2 {
+    font-size: 11px; letter-spacing: 2px; color: var(--dim);
+    text-transform: uppercase; margin-bottom: 8px;
+  }
+  .log {
+    overflow-y: auto; font-size: 13.5px; line-height: 1.55;
+  }
+  .log .sys  { color: var(--green); }
+  .log .warn { color: var(--red); }
+  .log .adm  { color: var(--gold); }
+  .log .me   { color: var(--blue); }
+
+  /* chat: center screen */
+  #chat { left: 50%; top: 50%; transform: translate(-50%, -50%); width: 560px; }
+  #chatLog { height: 210px; }
+  input {
+    width: 100%; margin-top: 10px; padding: 9px 12px; font-size: 14px;
+    background: rgba(255,255,255,0.07); color: var(--text);
+    border: 1px solid var(--edge); border-radius: 8px; outline: none;
+  }
+  input:focus { border-color: var(--gold); }
+
+  /* console */
+  #console { left: 4%; top: 9%; width: 620px; }
+  #conLog { height: 260px; font-family: Consolas, monospace; font-size: 12.5px; }
+
+  /* inventory */
+  #inventory { right: 3%; top: 16%; width: 330px; }
+  #inventory .money { font-size: 26px; color: var(--green); font-weight: 700; }
+  .bar { height: 10px; border-radius: 6px; background: rgba(255,255,255,0.12); margin: 6px 0 12px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 6px; }
+  .bar.hp i { background: linear-gradient(90deg, #2ea86b, var(--green)); }
+  .bar.arm i { background: linear-gradient(90deg, #2c6fd6, var(--blue)); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  td { padding: 5px 4px; border-top: 1px solid rgba(255,255,255,0.08); }
+  td.ammo { text-align: right; color: var(--dim); }
+
+  /* admin */
+  #admin { left: 50%; top: 50%; transform: translate(-50%, -50%); width: 520px; }
+  #admin .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  #admin .full { grid-column: 1 / -1; }
+  #admin label { font-size: 11px; color: var(--dim); letter-spacing: 1px; text-transform: uppercase; }
+  .abtn {
+    padding: 8px 12px; border-radius: 8px; border: 1px solid var(--edge);
+    background: rgba(255,255,255,0.07); color: var(--text); font-size: 13px;
+    font-weight: 600; cursor: pointer; width: 100%;
+  }
+  .abtn:hover { border-color: var(--gold); color: var(--gold); }
+  .abtn.on { background: rgba(86, 211, 100, 0.18); border-color: var(--green); color: var(--green); }
+  .inline { display: flex; gap: 8px; }
+  .inline > input, .inline > select { flex: 1; }
+  .inline > .abtn { width: auto; flex: none; padding: 8px 16px; }
+
+  /* welcome splash */
+  #welcome {
+    position: absolute; top: 34%; left: 50%; transform: translate(-50%, -50%);
+    text-align: center; pointer-events: none; opacity: 0;
+    transition: opacity 1.2s ease; width: 100%;
+  }
+  #welcome.show { opacity: 1; }
+  #welcome h1 {
+    font-size: 44px; font-weight: 800; letter-spacing: 3px;
+    color: var(--gold); text-shadow: 0 4px 26px rgba(0,0,0,0.6);
+  }
+  #welcome p { margin-top: 8px; font-size: 16px; letter-spacing: 5px; color: var(--text); opacity: .85; }
+
+  .hint {
+    position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+    color: var(--dim); font-size: 12px; letter-spacing: 0.6px;
+    background: var(--panel); padding: 5px 14px; border-radius: 8px; display: none;
+  }
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <span class="name" id="serverName">LIBERTY CITY STORIES ONLINE</span>
+    <span class="stat">players online: <b id="playerCount">0</b></span>
+    <span class="stat">fps: <b id="fps">30</b></span>
+    <span class="badge" id="mode"></span>
+  </div>
+
+  <div class="panel" id="chat">
+    <h2>Chat — Enter to send, Esc to close</h2>
+    <div class="log" id="chatLog"></div>
+    <input id="chatInput" maxlength="150" placeholder="Say something…" autocomplete="off">
+  </div>
+
+  <div class="panel" id="console">
+    <h2>Developer Console — Enter to run, Esc to close</h2>
+    <div class="log" id="conLog"></div>
+    <input id="conInput" maxlength="180" placeholder="help" autocomplete="off">
+  </div>
+
+  <div class="panel" id="inventory">
+    <h2>Inventory</h2>
+    <div class="money" id="money">$0</div>
+    <div class="bar hp"><i id="hpBar" style="width:100%"></i></div>
+    <div class="bar arm"><i id="armBar" style="width:0%"></i></div>
+    <table id="weapons"></table>
+  </div>
+
+  <div class="panel" id="admin">
+    <h2>Server Admin Panel — Esc to close</h2>
+    <div class="grid">
+      <div class="full">
+        <label>Broadcast to all players</label>
+        <div class="inline">
+          <input id="admBroadcast" maxlength="120" placeholder="Server announcement…">
+          <button class="abtn" id="admSend">Send</button>
+        </div>
+      </div>
+      <div>
+        <label>Give money</label>
+        <div class="inline">
+          <input id="admMoney" type="number" value="10000" min="1" max="1000000">
+          <button class="abtn" id="admGiveMoney">Give</button>
+        </div>
+      </div>
+      <div>
+        <label>Give weapon</label>
+        <div class="inline">
+          <select id="admWeapon">
+            <option value="22">Colt45</option><option value="24">Shotgun</option>
+            <option value="27">Tec9</option><option value="32">Ruger</option>
+            <option value="33">Sniper</option><option value="36">Flamethrower</option>
+            <option value="10">Katana</option><option value="6">Bat</option>
+            <option value="16">Molotov</option><option value="23">Python</option>
+          </select>
+          <button class="abtn" id="admGiveWeapon">Give</button>
+        </div>
+      </div>
+      <button class="abtn" id="admGod">Godmode: OFF</button>
+      <button class="abtn" id="admNoclip">NoClip: OFF</button>
+      <button class="abtn" id="admProp">Spawn prop here</button>
+      <div>
+        <label>Spawn NPC bot</label>
+        <div class="inline">
+          <input id="admBotName" maxlength="16" placeholder="NPC name">
+          <button class="abtn" id="admBot">Spawn</button>
+        </div>
+      </div>
+      <div class="full">
+        <label>FPS limit</label>
+        <div class="inline">
+          <select id="admFps">
+            <option>30</option><option>60</option><option selected>120</option>
+            <option>240</option><option>360</option><option value="0">UNLIMITED</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="welcome">
+    <h1>WELCOME TO LIBERTY CITY STORIES</h1>
+    <p>ONLINE</p>
+  </div>
+
+  <div class="hint" id="hint"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// ---- JS -> host: custom scheme through a hidden iframe ------------------
+const iframe = document.createElement("iframe");
+iframe.style.display = "none";
+document.body.appendChild(iframe);
+function send(req) { iframe.src = "lcs://" + req; }
+
+// ---- panels ------------------------------------------------------------
+const panels = { chat: $("chat"), console: $("console"), inventory: $("inventory"), admin: $("admin") };
+let openPanel = null;
+
+function show(name) {
+  for (const k in panels) panels[k].style.display = "none";
+  openPanel = name && panels[name] ? name : null;
+  if (openPanel) {
+    panels[openPanel].style.display = "block";
+    const inp = openPanel === "chat" ? $("chatInput") : openPanel === "console" ? $("conInput") : null;
+    if (inp) setTimeout(() => inp.focus(), 30);
+    if (openPanel === "chat") renderChat();
+    if (openPanel === "console") renderCon();
+    if (openPanel === "inventory") renderInv();
+    if (openPanel === "admin") renderAdmin();
+  }
+}
+window.GameUI = { show: show };
+
+// ---- state -------------------------------------------------------------
+let state = {
+  server: "", players: 0, fps: 30, mode: "",
+  money: 0, hp: 100, armour: 0,
+  weapons: [], chat: [], console: []
+};
+
+function renderTop() {
+  $("serverName").textContent = (state.server || "LCS ONLINE").toUpperCase();
+  $("playerCount").textContent = state.players;
+  $("fps").textContent = state.fps;
+  $("mode").textContent = state.mode || "";
+}
+
+function renderChat() {
+  const el = $("chatLog");
+  el.innerHTML = state.chat.map(l => {
+    let cls = "";
+    if (l.startsWith("[SERVER]") || l.startsWith("[SYSTEM]")) cls = "sys";
+    else if (l.startsWith("[ADMIN]")) cls = "adm";
+    else if (l.startsWith("You:")) cls = "me";
+    return `<div class="${cls}">${escapeHtml(l)}</div>`;
+  }).join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderCon() {
+  const el = $("conLog");
+  el.innerHTML = state.console.map(l => {
+    let cls = l.includes("[error]") || l.includes("unknown") ? "warn" :
+              l.startsWith(">") ? "me" : "";
+    return `<div class="${cls}">${escapeHtml(l)}</div>`;
+  }).join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderInv() {
+  $("money").textContent = "$" + (state.money | 0).toLocaleString();
+  $("hpBar").style.width = Math.max(0, Math.min(100, state.hp)) + "%";
+  $("armBar").style.width = Math.max(0, Math.min(100, state.armour)) + "%";
+  $("weapons").innerHTML = (state.weapons || []).map(w =>
+    `<tr><td>${escapeHtml(w.name)}</td><td class="ammo">${w.ammo} rounds</td></tr>`
+  ).join("") || `<tr><td colspan="2" style="color:var(--dim)">Unarmed</td></tr>`;
+}
+
+function renderAdmin() {
+  const god = (state.mode || "").includes("GOD");
+  const nc = (state.mode || "").includes("NOCLIP");
+  $("admGod").textContent = "Godmode: " + (god ? "ON" : "OFF");
+  $("admGod").classList.toggle("on", god);
+  $("admNoclip").textContent = "NoClip: " + (nc ? "ON" : "OFF");
+  $("admNoclip").classList.toggle("on", nc);
+}
+
+function renderWelcome() {
+  $("welcome").classList.toggle("show", !!state.welcome);
+}
+
+function con(cmd) { send("console?cmd=" + encodeURIComponent(cmd)); }
+
+$("admSend").addEventListener("click", () => {
+  const v = $("admBroadcast").value.trim();
+  if (v) { con("broadcast " + v); $("admBroadcast").value = ""; }
+});
+$("admGiveMoney").addEventListener("click", () =>
+  con("give money " + (+$("admMoney").value || 10000)));
+$("admGiveWeapon").addEventListener("click", () =>
+  con("give weapon " + $("admWeapon").value + " 200"));
+$("admGod").addEventListener("click", () => con("god"));
+$("admNoclip").addEventListener("click", () => con("noclip"));
+$("admProp").addEventListener("click", () => con("spawnprop"));
+$("admBot").addEventListener("click", () =>
+  con("spawnbot " + ($("admBotName").value.trim() || "NPC") + " roam"));
+$("admFps").addEventListener("change", () => con("fps " + $("admFps").value));
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// host pushes state
+window.GameUI.push = function (json) {
+  try { Object.assign(state, JSON.parse(json)); } catch (e) {}
+  renderTop();
+  renderWelcome();
+  if (openPanel === "chat") renderChat();
+  if (openPanel === "console") renderCon();
+  if (openPanel === "inventory") renderInv();
+  if (openPanel === "admin") renderAdmin();
+};
+
+// ---- inputs ------------------------------------------------------------
+$("chatInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const v = $("chatInput").value.trim();
+    if (v) send("chat?text=" + encodeURIComponent(v));
+    $("chatInput").value = "";
+    e.preventDefault();
+  } else if (e.key === "Escape") {
+    send("close");
+    e.preventDefault();
+  }
+  e.stopPropagation();
+});
+
+$("conInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const v = $("conInput").value.trim();
+    if (v) send("console?cmd=" + encodeURIComponent(v));
+    $("conInput").value = "";
+    e.preventDefault();
+  } else if (e.key === "Escape") {
+    send("close");
+    e.preventDefault();
+  }
+  e.stopPropagation();
+});
+
+// ---- boot --------------------------------------------------------------
+send("loaded");
+$("hint").style.display = "none";
+</script>
+</body>
+</html>

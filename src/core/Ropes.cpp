@@ -167,6 +167,8 @@ CRopes::CreateRopeWithSwatComingDown(CVector pos)
 	if(!CStreaming::HasModelLoaded(MI_SWAT) || !RegisterRope(ropeId+100, pos, true))
 		return false;
 	CCopPed *swat = (CCopPed*)CPopulation::AddPed(PEDTYPE_COP, COP_HELI_SWAT, pos);
+	if(!swat)
+		return false;
 	swat->bUsesCollision = false;
 	swat->m_pRopeEntity = (CEntity*)1;
 	swat->m_nRopeID = 100 + ropeId;

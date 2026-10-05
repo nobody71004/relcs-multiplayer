@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Liberty City Stories Online — Launcher</title>
+<style>
+  :root {
+    --bg: #0b0e13; --panel: #12161f; --panel2: #171c27; --edge: rgba(255,255,255,0.10);
+    --text: #e8edf4; --dim: #8b94a3; --gold: #f0c14b; --green: #56d364;
+    --red: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: radial-gradient(1200px 500px at 70% -10%, #1b2333 0%, var(--bg) 55%);
+    color: var(--text); font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden; user-select: none;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 18px;
+    padding: 20px 26px 16px;
+  }
+  .logo {
+    width: 46px; height: 46px; border-radius: 12px; flex: none;
+    background: linear-gradient(135deg, var(--gold), #b8860b);
+    display: grid; place-items: center; font-size: 22px; font-weight: 800; color: #141414;
+    box-shadow: 0 6px 18px rgba(240, 193, 75, 0.25);
+  }
+  header h1 { font-size: 21px; letter-spacing: 1.2px; font-weight: 700; }
+  header h1 span { color: var(--gold); }
+  header .sub { color: var(--dim); font-size: 12.5px; letter-spacing: 0.6px; }
+  header .spacer { flex: 1; }
+  .btn {
+    padding: 9px 18px; border-radius: 9px; border: 1px solid var(--edge);
+    background: var(--panel2); color: var(--text); font-size: 13.5px; font-weight: 600;
+    cursor: pointer; transition: all .12s ease;
+  }
+  .btn:hover { border-color: var(--gold); color: var(--gold); }
+  .btn.primary {
+    background: linear-gradient(135deg, var(--gold), #d9a521); color: #141414;
+    border: none; padding: 10px 26px; font-size: 14.5px;
+    box-shadow: 0 6px 18px rgba(240, 193, 75, 0.3);
+  }
+  .btn.primary:hover { filter: brightness(1.08); }
+
+  main { flex: 1; display: flex; gap: 18px; padding: 0 26px 18px; min-height: 0; }
+
+  /* ---- left: profile + settings ---- */
+  .side { width: 290px; display: flex; flex-direction: column; gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 14px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 10.5px; letter-spacing: 2.2px; color: var(--dim);
+    text-transform: uppercase; margin-bottom: 12px;
+  }
+  label { display: block; font-size: 11.5px; color: var(--dim); margin: 10px 0 5px; }
+  input, select {
+    width: 100%; padding: 9px 11px; font-size: 13.5px;
+    background: rgba(255,255,255,0.06); color: var(--text);
+    border: 1px solid var(--edge); border-radius: 8px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--gold); }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .tip { font-size: 11px; color: var(--dim); margin-top: 6px; }
+
+  /* ---- center: browser ---- */
+  .browser { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .tab {
+    padding: 8px 20px; border-radius: 9px 9px 0 0; cursor: pointer;
+    color: var(--dim); font-weight: 600; font-size: 13px;
+    border: 1px solid transparent; border-bottom: none;
+  }
+  .tab.active {
+    color: var(--gold); background: var(--panel);
+    border-color: var(--edge);
+  }
+  .list {
+    flex: 1; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 0 12px 12px 12px; overflow-y: auto;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    position: sticky; top: 0; background: var(--panel2); text-align: left;
+    font-size: 10.5px; letter-spacing: 1.6px; text-transform: uppercase;
+    color: var(--dim); padding: 11px 14px;
+  }
+  td { padding: 11px 14px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 13px; }
+  tr.server { cursor: pointer; }
+  tr.server:hover { background: rgba(240, 193, 75, 0.06); }
+  tr.server.sel { background: rgba(240, 193, 75, 0.13); }
+  td.name { font-weight: 600; }
+  td.addr { color: var(--dim); font-family: Consolas, monospace; font-size: 12px; }
+  .pill {
+    display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 11px;
+    background: rgba(88, 166, 255, 0.15); color: var(--blue);
+  }
+  .empty { padding: 40px; text-align: center; color: var(--dim); }
+
+  footer {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 26px; border-top: 1px solid var(--edge); background: var(--panel);
+    font-size: 12.5px; color: var(--dim);
+  }
+  #status { flex: 1; }
+  #status.ok { color: var(--green); }
+  #status.err { color: var(--red); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">L</div>
+    <div>
+      <h1>LIBERTY CITY STORIES <span>ONLINE</span></h1>
+      <div class="sub">MULTIPLAYER LAUNCHER — CHROMIUM EDITION</div>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn" id="btnRefresh">⟳ Refresh</button>
+    <button class="btn primary" id="btnJoin">▶ JOIN SERVER</button>
+  </header>
+
+  <main>
+    <div class="side">
+      <div class="card">
+        <h2>Player Profile</h2>
+        <label>Username</label>
+        <div class="row">
+          <input id="nick" maxlength="20" placeholder="Toni" autocomplete="off">
+          <button class="btn" id="btnSaveUser" style="flex:0 0 auto">Save</button>
+        </div>
+        <label>Saved usernames</label>
+        <select id="profiles"></select>
+        <div class="tip">3–20 characters: letters, digits and underscore. Saved to usernames.ini.</div>
+      </div>
+
+      <div class="card">
+        <h2>Connection</h2>
+        <label>Direct address (ip:port)</label>
+        <input id="direct" value="127.0.0.1:7777" autocomplete="off">
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="btnJoinDirect">Join Direct</button>
+          <button class="btn" id="btnAddFav">★ Add Favorite</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Settings</h2>
+        <label>Game executable</label>
+        <input id="game" autocomplete="off">
+        <label>Master server</label>
+        <input id="master" autocomplete="off">
+        <label>Server RCON password (enables admin panel: broadcast, give, …)</label>
+        <input id="rcon" type="password" placeholder="optional" autocomplete="off">
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="btnSaveCfg">Save Settings</button>
+          <button class="btn" id="btnQuit">Quit</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="browser">
+      <div class="tabs" id="tabs">
+        <div class="tab active" data-tab="internet">INTERNET</div>
+        <div class="tab" data-tab="lan">LAN</div>
+        <div class="tab" data-tab="favorites">FAVORITES</div>
+      </div>
+      <div class="list">
+        <table>
+          <thead>
+            <tr><th style="width:34%">Server</th><th>Players</th><th>Ping</th><th>Mode</th><th>Address</th></tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="5" class="empty">Press ⟳ Refresh to find servers</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <div id="status">ready</div>
+    <div id="build">LCS Online Launcher · CEF</div>
+  </footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const iframe = document.createElement("iframe");
+iframe.style.display = "none";
+document.body.appendChild(iframe);
+function send(req) { iframe.src = "lcs://" + req; }
+function jenc(s) { return encodeURIComponent(s); }
+
+let servers = [];
+let selected = -1;
+let tab = "internet";
+
+function setStatus(text, cls) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+function renderRows() {
+  const tb = $("rows");
+  if (!servers.length) {
+    tb.innerHTML = `<tr><td colspan="5" class="empty">No servers found — check your network or add a favorite</td></tr>`;
+    selected = -1;
+    return;
+  }
+  tb.innerHTML = servers.map((s, i) => `
+    <tr class="server ${i === selected ? "sel" : ""}" data-i="${i}">
+      <td class="name">${esc(s.hostname)}</td>
+      <td><span class="pill">${s.players}/${s.maxPlayers}</span></td>
+      <td>${s.pingMs || "—"} ms</td>
+      <td>${esc(s.gameMode)}</td>
+      <td class="addr">${esc(s.address)}</td>
+    </tr>`).join("");
+  tb.querySelectorAll("tr.server").forEach(tr => {
+    tr.addEventListener("click", () => {
+      selected = +tr.dataset.i;
+      renderRows();
+      setStatus("selected: " + servers[selected].address);
+    });
+    tr.addEventListener("dblclick", () => joinSelected());
+  });
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function renderProfiles(list) {
+  const sel = $("profiles");
+  sel.innerHTML = (list || []).map(u => `<option>${esc(u)}</option>`).join("");
+}
+
+// ---- host replies ---------------------------------------------------------
+window.onCefReply = function (json) {
+  let msg;
+  try { msg = JSON.parse(json); } catch (e) { return; }
+  switch (msg.reply) {
+    case "init":
+      $("nick").value = msg.nick || "";
+      $("game").value = msg.game || "";
+      $("master").value = msg.master || "";
+      $("rcon").value = msg.rcon || "";
+      renderProfiles(msg.profiles);
+      setStatus("ready — signed in as " + (msg.nick || "Player"));
+      refresh();
+      break;
+    case "servers":
+      servers = msg.rows || [];
+      selected = servers.length ? 0 : -1;
+      renderRows();
+      setStatus(`${servers.length} server(s) from ${msg.source}`, "ok");
+      break;
+    case "join":
+      setStatus(msg.ok ? "launched: " + msg.address : "join failed: " + (msg.error || ""),
+                msg.ok ? "ok" : "err");
+      break;
+    case "saveuser":
+      renderProfiles(msg.profiles);
+      setStatus(msg.ok ? "username saved: " + msg.nick : "invalid username (3-20 chars: letters, digits, _)",
+                msg.ok ? "ok" : "err");
+      break;
+    case "config":
+      setStatus("settings saved", "ok");
+      break;
+    case "addfav":
+      setStatus(msg.ok ? "favorite saved" : "select a server first", msg.ok ? "ok" : "err");
+      break;
+    case "selftest":
+      setStatus("selftest: " + msg.detail, msg.ok ? "ok" : "err");
+      break;
+  }
+};
+
+// ---- actions --------------------------------------------------------------
+function refresh() {
+  setStatus("refreshing " + tab + "…");
+  send("refresh?tab=" + tab);
+}
+function joinSelected() {
+  if (selected < 0 || !servers[selected]) {
+    setStatus("select a server first (or use Join Direct)", "err");
+    return;
+  }
+  const s = servers[selected];
+  send(`join?address=${jenc(s.address)}&nick=${jenc($("nick").value)}`);
+}
+
+$("btnRefresh").addEventListener("click", refresh);
+$("btnJoin").addEventListener("click", joinSelected);
+$("btnJoinDirect").addEventListener("click", () =>
+  send(`join?address=${jenc($("direct").value)}&nick=${jenc($("nick").value)}`));
+$("btnAddFav").addEventListener("click", () => {
+  const s = selected >= 0 ? servers[selected] : { address: $("direct").value, hostname: "favorite" };
+  send(`addfav?address=${jenc(s.address)}&name=${jenc(s.hostname)}`);
+});
+$("btnSaveUser").addEventListener("click", () =>
+  send(`saveuser?nick=${jenc($("nick").value)}`));
+$("btnSaveCfg").addEventListener("click", () =>
+  send(`config?game=${jenc($("game").value)}&master=${jenc($("master").value)}&nick=${jenc($("nick").value)}&rcon=${jenc($("rcon").value)}`));
+$("btnQuit").addEventListener("click", () => send("quit"));
+
+$("profiles").addEventListener("change", () => {
+  $("nick").value = $("profiles").value;
+});
+
+document.querySelectorAll(".tab").forEach(t => {
+  t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+    t.classList.add("active");
+    tab = t.dataset.tab;
+    selected = -1;
+    refresh();
+  });
+});
+
+$("nick").addEventListener("keydown", e => {
+  if (e.key === "Enter") joinSelected();
+});
+
+// tell the host we are ready
+send("loaded");
+</script>
+</body>
+</html>

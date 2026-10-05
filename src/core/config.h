@@ -33,8 +33,8 @@ enum Config {
 	// Pool sizes
 	NUMPTRNODES = 50000,	// only 30100
 	NUMENTRYINFOS = 4000,
-	NUMPEDS = 140,		// only 70
-	NUMVEHICLES = 110,	// only 70
+	NUMPEDS = 256,		// only 70; raised for net play (MAX_PLAYERS avatars + population)
+	NUMVEHICLES = 224,	// only 70; raised for net play (MAX_VEHICLES + traffic)
 	NUMBUILDINGS = 7000,	// only 6757
 	NUMTREADABLES = 1300,
 	NUMOBJECTS = 475,

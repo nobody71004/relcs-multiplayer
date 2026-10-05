@@ -1325,6 +1325,8 @@ CAnimManager::GetAnimGroupName(AssocGroupId groupId)
 	return ms_aAnimAssocDefinitions[groupId].name;
 }
 
+static CAnimBlendAssociation *EmptyAnimAssoc(void);	// defined below
+
 CAnimBlendAssociation*
 CAnimManager::CreateAnimAssociation(AssocGroupId groupId, AnimationId animId)
 {
@@ -1347,6 +1349,8 @@ CAnimBlendAssociation*
 CAnimManager::AddAnimation(RpClump *clump, AssocGroupId groupId, AnimationId animId)
 {
 	CAnimBlendAssociation *anim = CreateAnimAssociation(groupId, animId);
+	if(anim == nil)
+		anim = EmptyAnimAssoc();
 	CAnimBlendClumpData *clumpData = *RPANIMBLENDCLUMPDATA(clump);
 	if(anim->IsMovement()){
 		CAnimBlendAssociation *syncanim = nil;
@@ -1372,6 +1376,8 @@ CAnimBlendAssociation*
 CAnimManager::AddAnimationAndSync(RpClump *clump, CAnimBlendAssociation *syncanim, AssocGroupId groupId, AnimationId animId)
 {
 	CAnimBlendAssociation *anim = CreateAnimAssociation(groupId, animId);
+	if(anim == nil)
+		anim = EmptyAnimAssoc();
 	CAnimBlendClumpData *clumpData = *RPANIMBLENDCLUMPDATA(clump);
 	if (anim->IsMovement() && syncanim){
 		anim->SyncAnimation(syncanim);
@@ -1383,12 +1389,52 @@ CAnimManager::AddAnimationAndSync(RpClump *clump, CAnimBlendAssociation *syncani
 	return anim;
 }
 
+// The port's animation tables do not cover every LCS animation, so lookups
+// can legitimately fail. Callers treat the result of BlendAnimation /
+// AddAnimation as always valid and write to fields unconditionally, so hand
+// out benign fallbacks instead of nil (the nil returns used to become wild
+// pointer dereferences at struct offsets, e.g. ->speed at +0x34).
+static CAnimBlendHierarchy s_missingHierarchy;		// totalLength 0, no sequences
+static CAnimBlendAssociation s_missingAssoc;		// never linked into a clump
+static bool s_missingAnimInit = false;
+
+static CAnimBlendAssociation*
+MissingAnimAssoc(void)
+{
+	if(!s_missingAnimInit){
+		s_missingAssoc.hierarchy = &s_missingHierarchy;
+		s_missingAnimInit = true;
+	}
+	// reset the per-use state callers poke at
+	s_missingAssoc.flags = 0;
+	s_missingAssoc.blendAmount = 1.0f;
+	s_missingAssoc.blendDelta = 0.0f;
+	s_missingAssoc.currentTime = 0.0f;
+	s_missingAssoc.speed = 1.0f;
+	s_missingAssoc.callbackType = CAnimBlendAssociation::CB_NONE;
+	s_missingAssoc.callback = nil;
+	s_missingAssoc.callbackArg = nil;
+	return &s_missingAssoc;
+}
+
+// heap fallback for the AddAnimation family, which links the association into
+// a clump (the shared dummy can only live in one list at a time)
+static CAnimBlendAssociation*
+EmptyAnimAssoc(void)
+{
+	CAnimBlendAssociation *a = new CAnimBlendAssociation();
+	a->hierarchy = &s_missingHierarchy;
+	return a;
+}
+
 CAnimBlendAssociation*
 CAnimManager::BlendAnimation(RpClump *clump, AssocGroupId groupId, AnimationId animId, float delta)
 {
 	int removePrevAnim = 0;
 	CAnimBlendClumpData *clumpData = *RPANIMBLENDCLUMPDATA(clump);
 	CAnimBlendAssociation *anim = GetAnimAssociation(groupId, animId);
+	if (clumpData == nil || anim == nil)
+		return MissingAnimAssoc();
 	bool isMovement = anim->IsMovement();
 	bool isPartial = anim->IsPartial();
 	CAnimBlendLink *link;
@@ -1456,9 +1502,14 @@ CAnimManager::CreateAnimAssocGroups(void)
 		group->groupId = i;
 		group->firstAnimId = def->animDescs[0].animId;
 		group->CreateAssociations(def->blockName, clump, def->animNames, def->numAnims);
-		for(j = 0; j < group->numAssociations; j++)
+		for(j = 0; j < group->numAssociations; j++){
 			// GetAnimation(i) in III (but it's in LoadAnimFiles), GetAnimation(group->animDesc[j].animId) in VC
-			group->GetAnimation(def->animDescs[j].animId)->flags |= def->animDescs[j].flags;
+			// animDescs ids can fall outside the created range when animations
+			// are missing from the port's tables; that used to be a wild write
+			CAnimBlendAssociation *a = group->GetAnimation(def->animDescs[j].animId);
+			if(a)
+				a->flags |= def->animDescs[j].flags;
+		}
 		if(IsClumpSkinned(clump))
 			RpClumpForAllAtomics(clump, AtomicRemoveAnimFromSkinCB, nil);
 		RpClumpDestroy(clump);

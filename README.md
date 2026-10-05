@@ -35,3 +35,46 @@ There are various settings at the very bottom of [config.h](https://github.com/G
 ## Contributing
 Please read the [Coding Style](https://github.com/GTAmodding/re3/blob/master/CODING_STYLE.md) Document
 
+
+## Multiplayer (net/) — SA-MP-style platform
+
+This fork adds a full multiplayer stack on top of the port:
+
+| Component | Path | What it is |
+|---|---|---|
+| Launcher (CEF GUI) | `net/launcher/` | Chromium/CEF launcher: server browser, settings, join flow, in-game UI host |
+| Dedicated server | `net/server/` | 20 Hz authoritative server: movement anticheat, vehicle sync, gamemodes, RCON |
+| Master server | `net/master/` | LAN/internet server listing |
+| Bot / test client | `net/bot/` | Scriptable scenario bot (drive/roam/combat) for E2E tests |
+| Agent | `net/agent/` | Tracing/telemetry harness |
+| Game hooks | `src/net/` | nethooks (HUD/chat/console/admin), netclient, CEF HUD glue |
+| Tests | `net/tests/` | 3143-check unit suite (protocol codecs, validator) |
+| E2E run book | `net/e2e.sh` | 21-check end-to-end script |
+
+### Building the net stack
+
+```
+cd net
+../premake5.exe vs2019
+# open build/reLCS-net.sln, targets: enet net-tests net-server net-bot net-launcher net-agent
+```
+
+Outputs land in `net/bin/Release/`. The game hooks build together with `reLCS.exe`.
+
+### Releases
+
+The GitHub Releases page ships ready-to-run zips (no build needed):
+
+- **`relcs-launcher-win64.zip`** — launcher + full CEF runtime + `launcher.html`. Configure `launcher.ini` (game path, nickname, master, RCON password) and run `reLCS-launcher.exe`.
+- **`relcs-server-tools-win64.zip`** — `reLCS-server.exe`, `reLCS-master.exe`, `relcs-netbot.exe`, `reLCS-agentd.exe` for hosting.
+
+Server quick start: `reLCS-server.exe -rcon_password <pw> -lan_discover 1 -announce 1`
+Launcher CLI: `-join ip:port -nick X`, `-query "<raw UI query>"`, `-selftest`.
+Game CLI: `-connect ip:port -nick X -rcon <pw> -fps N`.
+
+RCON-authenticated players are exempt from the movement anticheat (admin tools such
+as noclip legitimately exceed movement budgets). All other players get the full
+tough validator. See `patches/librw-geoplg-readmesh-guard.patch` for a required
+librw crash-guard fix (apply inside `vendor/librw`).
+
+Protocol, validator and EAC planning docs: `net/docs/`.

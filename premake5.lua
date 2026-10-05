@@ -250,6 +250,16 @@ local function addSrcFiles( prefix )
 	return prefix .. "/*cpp", prefix .. "/*.h", prefix .. "/*.c", prefix .. "/*.ico", prefix .. "/*.rc"
 end
 
+project "enet"
+	kind "StaticLib"
+	language "C"
+	targetname "enet"
+	targetdir "bin/%{cfg.platform}/%{cfg.buildcfg}"
+	files { "vendor/enet/*.c", "vendor/enet/include/**/*.h" }
+	includedirs { "vendor/enet/include" }
+	defines { "ENET_STATIC", "_WINSOCK_DEPRECATED_NO_WARNINGS", "_CRT_SECURE_NO_WARNINGS" }
+	removefiles { "vendor/enet/unix.c" }
+
 project "reLCS"
 	kind "WindowedApp"
 	targetname "reLCS"
@@ -284,6 +294,13 @@ project "reLCS"
 	files { addSrcFiles("src/vehicles") }
 	files { addSrcFiles("src/weapons") }
 	files { addSrcFiles("src/extras") }
+	files { addSrcFiles("src/net") }
+	includedirs { "vendor/enet/include" }
+	defines { "ENET_STATIC" }
+	dependson "enet"
+	filter "system:windows"
+		links { "enet", "ws2_32", "winmm" }
+	filter {}
 	if(not _OPTIONS["no-git-hash"]) then
 		files { "src/extras/GitSHA1.cpp" } -- this won't be in repo in first build
 	else
@@ -486,3 +503,61 @@ project "reLCS"
 		includedirs {"/usr/local/include" }
 		libdirs { "/opt/local/lib" }
 		libdirs { "/usr/local/lib" }
+
+-- ---------------------------------------------------------------------------
+-- Chromium Embedded Framework UI stack (net/cefui) — Windows only, built
+-- when the CEF distribution is present in net/cef. The game and the launcher
+-- have NO build-time dependency on CEF: they load cefui.dll dynamically.
+--   cefui-core : static lib — libcef_dll wrapper + the UI core (C++20)
+--   cefui     : the DLL exposing the C API in net/cefui/cefui.h
+--   cefsub    : the tiny CEF subprocess exe (renderer/gpu processes)
+-- ---------------------------------------------------------------------------
+if os.is("windows") and os.isdir("net/cef") then
+	project "cefui-core"
+		kind "StaticLib"
+		language "C++"
+		cppdialect "C++20"
+		targetdir "bin/%{cfg.platform}/%{cfg.buildcfg}"
+		files {
+			"net/cef/libcef_dll/*.cc",
+			"net/cef/libcef_dll/**/*.cc",
+			"net/cefui/cefui_impl.cpp",
+		}
+		includedirs { "net/cefui", "net/cef", "net/cef/include" }
+		defines { "WRAPPING_CEF_SHARED", "NOMINMAX", "WIN32_LEAN_AND_MEAN", "_CRT_SECURE_NO_WARNINGS" }
+		filter "platforms:not win-amd64-*"
+			flags { "ExcludeFromBuild" }
+		filter {}
+
+	project "cefui"
+		kind "SharedLib"
+		language "C++"
+		cppdialect "C++20"
+		targetname "cefui"
+		targetdir "bin/%{cfg.platform}/%{cfg.buildcfg}"
+		files { "net/cefui/cefui_dll.cpp" }
+		includedirs { "net/cefui" }
+		defines { "NOMINMAX", "WIN32_LEAN_AND_MEAN", "_CRT_SECURE_NO_WARNINGS" }
+		links { "cefui-core", "libcef" }
+		libdirs { "net/cef/Release" }
+		dependson "cefui-core"
+		filter "platforms:not win-amd64-*"
+			flags { "ExcludeFromBuild" }
+		filter {}
+
+	project "cefsub"
+		kind "WindowedApp"
+		language "C++"
+		cppdialect "C++20"
+		targetname "cefsub"
+		targetdir "bin/%{cfg.platform}/%{cfg.buildcfg}"
+		files { "net/cefsub/main.cpp" }
+		includedirs { "net/cef", "net/cef/include" }
+		defines { "NOMINMAX", "WIN32_LEAN_AND_MEAN", "_CRT_SECURE_NO_WARNINGS" }
+		links { "cefui-core", "libcef" }
+		libdirs { "net/cef/Release" }
+		dependson "cefui-core"
+		filter "platforms:not win-amd64-*"
+			flags { "ExcludeFromBuild" }
+		filter {}
+end
