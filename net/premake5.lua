@@ -46,7 +46,7 @@ project "net-tests"
 	language "C++"
 	cppdialect "C++17"
 	targetname "net-tests"
-	files { "tests/main.cpp", "server/profiles.cpp", "server/profiles.h" }
+	files { "tests/main.cpp", "server/profiles.cpp", "server/profiles.h", "server/resource.cpp", "server/resource.h" }
 	includedirs { "server", "../vendor/sqlite" }
 	links { "sqlite" }
 	netCommon()
@@ -58,7 +58,7 @@ project "net-server"
 	targetname "reLCS-server"
 	files { "server/*.cpp", "server/*.h" }
 	includedirs { "../vendor/sqlite" }
-	links { "sqlite" }
+	links { "sqlite", "iphlpapi" }
 	netCommon()
 
 project "net-bot"
@@ -74,7 +74,9 @@ project "net-master"
 	language "C++"
 	cppdialect "C++17"
 	targetname "reLCS-master"
-	files { "master/*.cpp" }
+	files { "master/*.cpp", "master/*.h" }
+	includedirs { "../vendor/sqlite" }
+	links { "sqlite" }
 	netCommon()
 
 project "net-proxy"
@@ -100,4 +102,4 @@ project "net-launcher"
 	targetname "reLCS-launcher"
 	files { "launcher/*.cpp", "launcher/*.h" }
 	netCommon()
-	links { "comctl32", "shell32", "ole32" }
+	links { "advapi32", "comctl32", "shell32", "ole32", "iphlpapi" }

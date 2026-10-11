@@ -5,6 +5,7 @@
 
 # --- multiplayer (net/) build artifacts & generated data ---
 net/bin/
+net/obj/
 net/build/
 net/cef/
 net/cef_minimal.tar.bz2
