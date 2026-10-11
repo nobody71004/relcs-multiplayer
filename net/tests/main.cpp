@@ -6,8 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
+#include <vector>
 
 using namespace rnet;
 
@@ -565,9 +568,413 @@ static void TestProfileStore()
 	std::remove(path);
 }
 
+// ---------------------------------------------------------------------------
+// resource pipeline (mod/resource manager)
+// ---------------------------------------------------------------------------
+#include "resource.h"
+
+static void TestResourceParsing()
+{
+	// manifest: happy path
+	ResourceInfo m;
+	CHECK(ResourceManager::ParseManifest(
+	    "# pack\nname=welcome-pack\nversion=1.2\nauthor=nobody\n"
+	    "description=greets players\ntype=internal\nmotd=hi there\n", m));
+	CHECK(m.name == "welcome-pack");
+	CHECK(m.version == "1.2");
+	CHECK(m.author == "nobody");
+	CHECK(m.type == "internal");
+	CHECK(m.motd == "hi there");
+	CHECK(m.autoload);
+
+	// manifest: missing name fails
+	ResourceInfo bad;
+	CHECK(!ResourceManager::ParseManifest("version=1\n", bad));
+	CHECK(!bad.error.empty());
+
+	// manifest: bad type fails
+	ResourceInfo bad2;
+	CHECK(!ResourceManager::ParseManifest("name=x\ntype=worm\n", bad2));
+
+	// manifest: autoload=0 honored
+	ResourceInfo la;
+	CHECK(ResourceManager::ParseManifest("name=y\nautoload=0\n", la));
+	CHECK(!la.autoload);
+
+	// script: hooks + command lines + comments
+	ResourceInfo s;
+	CHECK(ResourceManager::ParseScript(
+	    "# comment\n"
+	    "@on start\n"
+	    "settime 8 0\n"
+	    "broadcast hello\n"
+	    "@on join\n"
+	    "give %id% money 100\n"
+	    "@on cmd rules\n"
+	    "say rules: be nice %name%\n"
+	    "@on interval 30\n"
+	    "say tick\n", s));
+	CHECK(s.hooks.size() == 4);
+	CHECK(s.hooks[0].event == "start" && s.hooks[0].lines.size() == 2);
+	CHECK(s.hooks[1].event == "join" && s.hooks[1].lines.size() == 1);
+	CHECK(s.hooks[2].event == "cmd" && s.hooks[2].arg == "rules");
+	CHECK(s.hooks[3].event == "interval" && s.hooks[3].interval == 30.0);
+
+	// script: command before any hook fails
+	ResourceInfo s2;
+	CHECK(!ResourceManager::ParseScript("say orphan\n", s2));
+	CHECK(!s2.error.empty());
+
+	// script: unknown hook fails
+	ResourceInfo s3;
+	CHECK(!ResourceManager::ParseScript("@on explode\nsay x\n", s3));
+
+	// script: interval < 1s fails
+	ResourceInfo s4;
+	CHECK(!ResourceManager::ParseScript("@on interval 0.5\nsay x\n", s4));
+}
+
+static void TestResourceExpand()
+{
+	CHECK(ResourceManager::Expand("give %id% money 500", 7, "alice", "") ==
+	      "give 7 money 500");
+	CHECK(ResourceManager::Expand("say hi %name%", 1, "bob", "") == "say hi bob");
+	CHECK(ResourceManager::Expand("say %args%", 1, "bob", "be nice") ==
+	      "say be nice");
+	// unknown placeholders survive verbatim
+	CHECK(ResourceManager::Expand("say %zzz%", 1, "b", "") == "say %zzz%");
+}
+
+static void TestResourceSandbox()
+{
+	// external packs: safe commands allowed
+	CHECK(ResourceManager::ExternalAllowed("say hello"));
+	CHECK(ResourceManager::ExternalAllowed("broadcast hi"));
+	CHECK(ResourceManager::ExternalAllowed("settime 8 0"));
+	CHECK(ResourceManager::ExternalAllowed("setweather 2"));
+	CHECK(ResourceManager::ExternalAllowed("spawnprop 1 2 3 4 50"));
+	CHECK(ResourceManager::ExternalAllowed("give 3 money 10"));
+	// everything else blocked
+	CHECK(!ResourceManager::ExternalAllowed("kick 1"));
+	CHECK(!ResourceManager::ExternalAllowed("res disable x"));
+	CHECK(!ResourceManager::ExternalAllowed("quit"));
+	CHECK(!ResourceManager::ExternalAllowed("exec evil.cfg"));
+}
+
+static void TestResourceManagerOps()
+{
+	// build a temp resources dir with one good and one broken pack
+	const char* root = "test-resources-tmp";
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(std::string(root) + "/good");
+	std::filesystem::create_directories(std::string(root) + "/broken");
+	{
+		std::ofstream f(std::string(root) + "/good/resource.cfg");
+		f << "name=good\nversion=0.1\ntype=internal\n";
+	}
+	{
+		std::ofstream f(std::string(root) + "/good/main.rsc");
+		f << "@on start\nsay started\n@on cmd hi\nsay hello %name%\n";
+	}
+	{
+		std::ofstream f(std::string(root) + "/broken/resource.cfg");
+		f << "type=external\n";   // no name= -> invalid
+	}
+	// uninstall graveyard must NOT be scanned as a resource
+	std::filesystem::create_directories(std::string(root) + "/removed/old-pack");
+	{
+		std::ofstream f(std::string(root) + "/removed/old-pack/resource.cfg");
+		f << "name=old-pack\n";
+	}
+
+	std::vector<std::string> ran;
+	ResourceManager mgr;
+	mgr.Configure(root,
+	    [&](const std::string& line, int to){
+		    ran.push_back(std::to_string(to) + "|" + line);
+	    },
+	    [](const std::string&){});
+	CHECK(mgr.Reload());
+	CHECK(mgr.List().size() == 2);   // good + broken; removed/ is skipped
+	CHECK(!mgr.Find("old-pack"));
+	const ResourceInfo* good = mgr.Find("good");
+	const ResourceInfo* broken = mgr.Find("broken");
+	CHECK(good && good->valid);
+	CHECK(broken && !broken->valid);
+
+	// run the start hook through the exec sink
+	std::string err;
+	CHECK(mgr.RunEvent("good", "start", "", -1, -1, "", err));
+	CHECK(ran.size() == 1 && ran[0] == "-1|say started");
+
+	// player command hook expands placeholders and routes to the player
+	CHECK(mgr.OnPlayerCommand("hi there", 4, "alice"));
+	CHECK(ran.size() == 2 && ran[1] == "4|say hello alice");
+	CHECK(!mgr.OnPlayerCommand("nosuch", 4, "alice"));
+
+	// disable blocks execution
+	CHECK(mgr.SetEnabled("good", false, err));
+	CHECK(!mgr.RunEvent("good", "start", "", -1, -1, "", err));
+	CHECK(err == "resource disabled");
+	// ... and the flag persisted
+	CHECK(mgr.SetEnabled("good", true, err));
+
+	// missing resource reports cleanly
+	CHECK(!mgr.RunEvent("ghost", "start", "", -1, -1, "", err));
+	CHECK(err.find("no such resource") == 0);
+
+	// run a specific hook by name (res run good start)
+	ran.clear();
+	CHECK(mgr.RunEvent("good", "cmd", "hi", 2, 2, "bob", err));
+	CHECK(ran.size() == 1 && ran[0] == "2|say hello bob");
+
+	std::filesystem::remove_all(root);
+}
+
+static void TestResListCodec()
+{
+	// mod/resource inventory round-trips through the wire format
+	MsgResList in;
+	in.count = 2;
+	CopyStr(in.entries[0].name, sizeof in.entries[0].name, "welcome-pack");
+	CopyStr(in.entries[0].version, sizeof in.entries[0].version, "1.2");
+	in.entries[0].type = 0; in.entries[0].enabled = 1; in.entries[0].valid = 1;
+	CopyStr(in.entries[1].name, sizeof in.entries[1].name, "shop");
+	in.entries[1].type = 1; in.entries[1].enabled = 0; in.entries[1].valid = 0;
+	BitWriter w;
+	BeginMsg(w, MSG_RES_LIST);
+	WriteResList(w, in);
+	BitReader r(w.Data() + 1, w.ByteSize() - 1);
+	MsgResList out;
+	CHECK(ReadResList(r, out));
+	CHECK(out.count == 2);
+	CHECK(std::string(out.entries[0].name) == "welcome-pack");
+	CHECK(std::string(out.entries[0].version) == "1.2");
+	CHECK(out.entries[0].type == 0 && out.entries[0].enabled == 1 && out.entries[0].valid == 1);
+	CHECK(std::string(out.entries[1].name) == "shop");
+	CHECK(out.entries[1].type == 1 && out.entries[1].enabled == 0 && out.entries[1].valid == 0);
+
+	// bogus count is rejected
+	BitWriter w2;
+	w2.WriteU8(200);
+	BitReader r2(w2.Data(), w2.ByteSize());
+	MsgResList bad;
+	CHECK(!ReadResList(r2, bad));
+}
+
+// v5: live server info in WELCOME (map/players) — the launcher's tooltip reads
+// these straight off a probe handshake
+static void TestWelcomeLiveInfo()
+{
+	MsgWelcome w1;
+	w1.playerId = 3;
+	w1.tickRate = 20;
+	w1.streamDistance = 200.0f;
+	w1.hour = 9; w1.minute = 30; w1.weather = 1;
+	CopyStr(w1.gameMode, sizeof w1.gameMode, "survivor");
+	CopyStr(w1.hostname, sizeof w1.hostname, "i8 Showroom");
+	w1.players = 2;
+	w1.maxPlayers = 32;
+	CopyStr(w1.mapName, sizeof w1.mapName, "Liberty City");
+
+	BitWriter w;
+	BeginMsg(w, MSG_WELCOME);
+	WriteWelcome(w, w1);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_WELCOME);
+	MsgWelcome w2;
+	CHECK(ReadWelcome(r, w2));
+	CHECK(w2.playerId == 3 && w2.tickRate == 20);
+	CHECK(w2.players == 2 && w2.maxPlayers == 32);
+	CHECK(strcmp(w2.mapName, "Liberty City") == 0);
+	CHECK(strcmp(w2.hostname, "i8 Showroom") == 0);
+
+	// a v4 server stops after the hostname: the v5 tail must read as empty
+	BitWriter w4;
+	w4.WriteU8(1); w4.WriteU16(20); w4.WriteF32(200.0f);
+	w4.WriteU8(12); w4.WriteU8(0); w4.WriteU8(0);
+	w4.WriteString("freeroam", 31);
+	w4.WriteString("old server", MAX_HOSTNAME_LEN - 1);
+	BitReader r4(w4.Data(), w4.ByteSize());
+	MsgWelcome w5;
+	CHECK(ReadWelcome(r4, w5));
+	CHECK(w5.players == 0 && w5.mapName[0] == 0);
+	CHECK(strcmp(w5.hostname, "old server") == 0);
+}
+
+// v5: static vehicles can be retired server-side (MSG_VEH_DESPAWN)
+static void TestVehDespawnCodec()
+{
+	MsgVehDespawn d;
+	d.vehicleId = 4242;
+	BitWriter w;
+	BeginMsg(w, MSG_VEH_DESPAWN);
+	WriteVehDespawn(w, d);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_VEH_DESPAWN);
+	MsgVehDespawn out;
+	CHECK(ReadVehDespawn(r, out));
+	CHECK(out.vehicleId == 4242);
+}
+
+// v5: server-side favorites — list/add/delete round trips
+static void TestFavoritesCodec()
+{
+	MsgFavReq req;
+	CopyStr(req.nick, sizeof req.nick, "MattTest");
+	BitWriter w;
+	BeginMsg(w, MSG_MASTER_FAV_LIST);
+	WriteFavReq(w, req);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_MASTER_FAV_LIST);
+	MsgFavReq req2;
+	CHECK(ReadFavReq(r, req2));
+	CHECK(strcmp(req2.nick, "MattTest") == 0);
+
+	MsgFavAdd add;
+	CopyStr(add.nick, sizeof add.nick, "MattTest");
+	CopyStr(add.address, sizeof add.address, "203.0.113.9:7777");
+	CopyStr(add.name, sizeof add.name, "Liberty City Survivor #1");
+	BitWriter w2;
+	BeginMsg(w2, MSG_MASTER_FAV_ADD);
+	WriteFavAdd(w2, add);
+	BitReader r2(w2.Data(), w2.ByteSize());
+	CHECK((MsgType)r2.ReadU8() == MSG_MASTER_FAV_ADD);
+	MsgFavAdd add2;
+	CHECK(ReadFavAdd(r2, add2));
+	CHECK(strcmp(add2.nick, "MattTest") == 0);
+	CHECK(strcmp(add2.address, "203.0.113.9:7777") == 0);
+	CHECK(strcmp(add2.name, "Liberty City Survivor #1") == 0);
+
+	// DEL shares the add layout; the name field is ignored
+	BitWriter w3;
+	BeginMsg(w3, MSG_MASTER_FAV_DEL);
+	WriteFavAdd(w3, add);
+	BitReader r3(w3.Data(), w3.ByteSize());
+	CHECK((MsgType)r3.ReadU8() == MSG_MASTER_FAV_DEL);
+	MsgFavAdd del;
+	CHECK(ReadFavAdd(r3, del));
+	CHECK(strcmp(del.address, "203.0.113.9:7777") == 0);
+
+	MsgFavResp resp;
+	resp.ok = 1;
+	resp.count = 2;
+	CopyStr(resp.entries[0].address, sizeof resp.entries[0].address, "127.0.0.1:7777");
+	CopyStr(resp.entries[0].name, sizeof resp.entries[0].name, "local test server");
+	CopyStr(resp.entries[1].address, sizeof resp.entries[1].address, "10.0.0.5:7792");
+	CopyStr(resp.entries[1].name, sizeof resp.entries[1].name, "i8 Showroom");
+	BitWriter w4;
+	BeginMsg(w4, MSG_MASTER_FAV_RESP);
+	WriteFavResp(w4, resp);
+	BitReader r4(w4.Data(), w4.ByteSize());
+	CHECK((MsgType)r4.ReadU8() == MSG_MASTER_FAV_RESP);
+	MsgFavResp resp2;
+	CHECK(ReadFavResp(r4, resp2));
+	CHECK(resp2.ok == 1 && resp2.count == 2);
+	CHECK(strcmp(resp2.entries[0].address, "127.0.0.1:7777") == 0);
+	CHECK(strcmp(resp2.entries[1].name, "i8 Showroom") == 0);
+
+	// an error response carries no entries
+	MsgFavResp bad;
+	bad.ok = 0;
+	bad.count = 0;
+	CopyStr(bad.error, sizeof bad.error, "invalid username");
+	BitWriter w5;
+	BeginMsg(w5, MSG_MASTER_FAV_RESP);
+	WriteFavResp(w5, bad);
+	BitReader r5(w5.Data(), w5.ByteSize());
+	CHECK((MsgType)r5.ReadU8() == MSG_MASTER_FAV_RESP);
+	MsgFavResp bad2;
+	CHECK(ReadFavResp(r5, bad2));
+	CHECK(bad2.ok == 0 && bad2.count == 0);
+	CHECK(strcmp(bad2.error, "invalid username") == 0);
+}
+
+// v5: map + protocol version ride the master list so the browser can show a map
+// column and flag stale servers before joining
+static void TestMasterEntryLiveInfo()
+{
+	MasterListEntry e;
+	e.ipv4 = 0x0100007F;
+	e.gamePort = 7792;
+	e.players = 3;
+	e.maxPlayers = 32;
+	e.pingMs = 0;
+	CopyStr(e.hostname, sizeof e.hostname, "i8 Showroom");
+	CopyStr(e.gameMode, sizeof e.gameMode, "freeroam");
+	CopyStr(e.mapName, sizeof e.mapName, "Liberty City");
+	e.protocolVersion = PROTOCOL_VERSION;
+
+	BitWriter w;
+	BeginMsg(w, MSG_MASTER_LIST_RESP);
+	w.WriteU16(1);
+	WriteMasterEntry(w, e);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_MASTER_LIST_RESP);
+	CHECK(r.ReadU16() == 1);
+	MasterListEntry e2;
+	CHECK(ReadMasterEntry(r, e2));
+	CHECK(e2.gamePort == 7792 && e2.players == 3);
+	CHECK(strcmp(e2.mapName, "Liberty City") == 0);
+	CHECK(e2.protocolVersion == PROTOCOL_VERSION);
+
+	// a v4 entry stops after the game mode
+	BitWriter w4;
+	w4.WriteU32(0x0100007F); w4.WriteU16(7777);
+	w4.WriteU8(1); w4.WriteU8(32); w4.WriteU16(0);
+	w4.WriteString("old", MAX_HOSTNAME_LEN - 1);
+	w4.WriteString("survivor", 31);
+	BitReader r4(w4.Data(), w4.ByteSize());
+	MasterListEntry e4;
+	CHECK(ReadMasterEntry(r4, e4));
+	CHECK(e4.mapName[0] == 0 && e4.protocolVersion == 0);
+
+	// the announce carries the map to the master
+	MsgMasterAnnounce a;
+	a.gamePort = 7792;
+	a.players = 1;
+	a.maxPlayers = 32;
+	a.protocolVersion = PROTOCOL_VERSION;
+	CopyStr(a.hostname, sizeof a.hostname, "i8 Showroom");
+	CopyStr(a.gameMode, sizeof a.gameMode, "freeroam");
+	CopyStr(a.mapName, sizeof a.mapName, "Liberty City");
+	a.advertisedIp = 0x0A000005;
+	BitWriter wa;
+	BeginMsg(wa, MSG_MASTER_ANNOUNCE);
+	WriteMasterAnnounce(wa, a);
+	BitReader ra(wa.Data(), wa.ByteSize());
+	CHECK((MsgType)ra.ReadU8() == MSG_MASTER_ANNOUNCE);
+	MsgMasterAnnounce a2;
+	CHECK(ReadMasterAnnounce(ra, a2));
+	CHECK(strcmp(a2.mapName, "Liberty City") == 0);
+	CHECK(a2.advertisedIp == 0x0A000005);
+
+	// a v4 announce has only the advertised IP tail
+	BitWriter wa4;
+	wa4.WriteU16(7777); wa4.WriteU8(0); wa4.WriteU8(32); wa4.WriteU16(4);
+	wa4.WriteString("old", MAX_HOSTNAME_LEN - 1);
+	wa4.WriteString("freeroam", 31);
+	wa4.WriteU32(0x0A000006);
+	BitReader ra4(wa4.Data(), wa4.ByteSize());
+	MsgMasterAnnounce a4;
+	CHECK(ReadMasterAnnounce(ra4, a4));
+	CHECK(a4.mapName[0] == 0);
+	CHECK(a4.advertisedIp == 0x0A000006);
+	CHECK(a4.protocolVersion == 4);
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
+	TestWelcomeLiveInfo();
+	TestVehDespawnCodec();
+	TestFavoritesCodec();
+	TestMasterEntryLiveInfo();
+	TestResListCodec();
+	TestResourceParsing();
+	TestResourceExpand();
+	TestResourceSandbox();
+	TestResourceManagerOps();
 	TestBitstreamRoundTrip();
 	TestQuantization();
 	TestStateCodecs();

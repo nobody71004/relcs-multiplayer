@@ -8,8 +8,14 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm>
+#include <fstream>
 
-#include <ws2tcpip.h>
+#include "compat.h"
+#ifdef _WIN32
+#include <iphlpapi.h>
+#endif
+
+static uint32_t LanIPv4();   // LAN address for master announces (defined below)
 
 using namespace rnet;
 
@@ -70,6 +76,22 @@ bool Server::Init(const ServerConfig& cfg)
 		else
 			Log("profiles: DISABLED (%s)", m_profiles.LastError());
 	}
+
+	// mod/resource pipeline: scan packs, run their start hooks
+	if(!m_cfg.resourcesDir.empty()){
+		m_resources.Configure(m_cfg.resourcesDir,
+		    [this](const std::string& line, int respondTo){ HandleCommand(line, respondTo); },
+		    [this](const std::string& s){ Log("%s", s.c_str()); });
+		m_resources.Reload();
+		std::string err;
+		for(const auto& r : m_resources.List())
+			if(r.valid && r.enabled)
+				m_resources.RunEvent(r.dir, "start", "", -1, -1, "", err);
+	}
+
+	// static vehicles: cars that live in the world permanently (a modded model,
+	// a parked showcase car) instead of only existing while somebody drives it
+	LoadVehicleSpawns(m_cfg.vehiclesFile);
 
 	Log("reLCS server '%s' listening on UDP %u | mode=%s | maxplayers=%d",
 	    m_cfg.hostname.c_str(), (unsigned)m_cfg.port, m_gamemode->Name(), m_cfg.maxPlayers);
@@ -248,6 +270,7 @@ void Server::OnDisconnect(ENetPeer* peer)
 
 	SaveProfile(p);
 	Log("[LEAVE] id=%d name=%s", p->id, p->name.c_str());
+	m_resources.OnPlayerLeave(p->id, p->name);
 	if(m_gamemode) m_gamemode->OnPlayerDisconnect(*this, p->id);
 
 	BitWriter w;
@@ -355,6 +378,10 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		wel.hour = m_cfg.hour; wel.minute = m_cfg.minute; wel.weather = m_cfg.weather;
 		CopyStr(wel.gameMode, sizeof wel.gameMode, m_gamemode->Name());
 		CopyStr(wel.hostname, sizeof wel.hostname, m_cfg.hostname.c_str());
+		// live info for the launcher's browser tooltip
+		wel.players = (uint8_t)ActivePlayerCount();
+		wel.maxPlayers = (uint8_t)m_cfg.maxPlayers;
+		CopyStr(wel.mapName, sizeof wel.mapName, m_cfg.mapName.c_str());
 		WriteWelcome(w, wel);
 		SendTo(peer, w, CHAN_RELIABLE, true);
 		enet_peer_disconnect_later(peer, 0);
@@ -419,6 +446,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	peer->data = &np;
 
 	Log("[JOIN] id=%d name=%s", np.id, np.name.c_str());
+	m_resources.OnPlayerJoin(np.id, np.name);   // resource @on join hooks
 
 	// welcome
 	BitWriter w;
@@ -430,8 +458,23 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	wel.hour = m_cfg.hour; wel.minute = m_cfg.minute; wel.weather = m_cfg.weather;
 	CopyStr(wel.gameMode, sizeof wel.gameMode, m_gamemode->Name());
 	CopyStr(wel.hostname, sizeof wel.hostname, m_cfg.hostname.c_str());
+	wel.players = (uint8_t)ActivePlayerCount();
+	wel.maxPlayers = (uint8_t)m_cfg.maxPlayers;
+	CopyStr(wel.mapName, sizeof wel.mapName, m_cfg.mapName.c_str());
 	WriteWelcome(w, wel);
 	SendTo(peer, w, CHAN_RELIABLE, true);
+
+	// let the admin panel see the mod/resource inventory
+	SendResList(peer);
+
+	// restore the persisted profile NOW (hello-time): it is queued on the
+	// reliable channel before the client can possibly report its inventory,
+	// so an empty pre-restore snapshot can never clobber the saved wallet/
+	// weapons (the spawn-time restore raced the client's first report)
+	if(np.hasProfile){
+		np.profileSent = true;
+		SendInventory(&np);
+	}
 
 	// tell the newcomer about everyone already here
 	for(int i = 0; i < MAX_PLAYERS; i++){
@@ -662,6 +705,8 @@ void Server::HandleChat(ServerPlayer* p, BitReader& r)
 		std::string cmd = chat.text + 1;
 		if(m_gamemode && m_gamemode->OnPlayerCommand(*this, p->id, cmd))
 			return;
+		if(m_resources.OnPlayerCommand(cmd, p->id, p->name))   // resource @on cmd hooks
+			return;
 		if(HandleCommand(cmd, p->id))
 			return;
 		SendChatTo(p->id, "Unknown command.");
@@ -684,13 +729,6 @@ void Server::HandleChat(ServerPlayer* p, BitReader& r)
 void Server::HandleSpawnReq(ServerPlayer* p)
 {
 	if(m_gamemode) m_gamemode->OnPlayerSpawnRequest(*this, p->id);   // broadcasts MSG_SPAWN first
-
-	// one profile restore per session, right after the spawn so the ped
-	// exists client-side to apply it
-	if(!p->profileSent){
-		p->profileSent = true;
-		if(p->hasProfile) SendInventory(p);
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -836,39 +874,11 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	uint16_t vid = m.vehicleId;
 
 	if(vid == 0xFFFF){
-		// allocate new vehicle at the player's position
-		for(int i = 0; i < MAX_VEHICLES; i++){
-			if(!m_vehicles[i].active){
-				v = &m_vehicles[i];
-				vid = (uint16_t)(i + 1);
-				break;
-			}
-		}
+		// allocate a new vehicle at the player's position
+		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
+		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false);
 		if(!v) return;
-		v->active = true;
-		v->id = vid;
-		v->modelId = m.modelId;
-		v->driverId = 0xFF;
-		for(int s = 0; s < 8; s++) v->occupants[s] = 0xFF;
-		v->state = VehicleState();
-		v->state.vehicleId = vid;
-		v->state.modelId = m.modelId;
-		v->state.xMm = p->state.xMm;
-		v->state.yMm = p->state.yMm;
-		v->state.zMm = p->state.zMm;
-		v->state.heading = p->state.heading;
-
-		BitWriter w;
-		BeginMsg(w, MSG_VEH_SPAWN);
-		MsgVehSpawn vs;
-		vs.vehicleId = vid;
-		vs.modelId = m.modelId;
-		vs.x = p->state.xMm / 1000.0f;
-		vs.y = p->state.yMm / 1000.0f;
-		vs.z = p->state.zMm / 1000.0f;
-		vs.heading = DequantAngle(p->state.heading);
-		WriteVehSpawn(w, vs);
-		Broadcast(w, CHAN_RELIABLE, true);
+		vid = v->id;
 		Log("[VEH] player %d spawned vehicle id=%d model=%d", p->id, vid, (int)m.modelId);
 	}else{
 		v = FindVehicle(vid);
@@ -1042,13 +1052,47 @@ void Server::Tick()
 		m_lastWorldUpdate = t;
 		m_cfg.minute++;
 		if(m_cfg.minute >= 60){ m_cfg.minute = 0; m_cfg.hour = (m_cfg.hour + 1) % 24; }
-		BitWriter w;
-		BeginMsg(w, MSG_WORLD);
-		MsgWorld wrld;
-		wrld.hour = m_cfg.hour; wrld.minute = m_cfg.minute; wrld.weather = m_cfg.weather;
-		WriteWorld(w, wrld);
-		Broadcast(w, CHAN_RELIABLE, true);
+		BroadcastWorld();
 	}
+
+	// resource @on interval hooks
+	m_resources.Tick(t);
+}
+
+void Server::BroadcastWorld(void)
+{
+	BitWriter w;
+	BeginMsg(w, MSG_WORLD);
+	MsgWorld wrld;
+	wrld.hour = m_cfg.hour; wrld.minute = m_cfg.minute; wrld.weather = m_cfg.weather;
+	WriteWorld(w, wrld);
+	Broadcast(w, CHAN_RELIABLE, true);
+}
+
+void Server::SendResList(ENetPeer* peer)
+{
+	if(!peer) return;
+	BitWriter w;
+	BeginMsg(w, MSG_RES_LIST);
+	MsgResList list;
+	for(const auto& r : m_resources.List()){
+		if(list.count >= MAX_RES_ENTRIES) break;
+		MsgResEntry& e = list.entries[list.count++];
+		CopyStr(e.name, sizeof e.name, r.dir.c_str());
+		CopyStr(e.version, sizeof e.version, r.version.c_str());
+		e.type = (r.type == "external") ? 1 : 0;
+		e.enabled = r.enabled ? 1 : 0;
+		e.valid = r.valid ? 1 : 0;
+	}
+	WriteResList(w, list);
+	SendTo(peer, w, CHAN_RELIABLE, true);
+}
+
+void Server::BroadcastResList(void)
+{
+	for(int i = 0; i < MAX_PLAYERS; i++)
+		if(m_players[i].active && m_players[i].peer)
+			SendResList(m_players[i].peer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,7 +1201,9 @@ void Server::KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId)
 	BroadcastScores();
 }
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 void Server::SendGive(uint8_t targetId, uint8_t kind, int32_t amount, uint16_t arg)
 {
@@ -1209,6 +1255,123 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 	fix.health = p->health; fix.armour = p->armour;
 	WritePlayerState(w, fix);
 	SendTo(p->peer, w, CHAN_RELIABLE, true);
+}
+
+// ---------------------------------------------------------------------------
+// vehicles: allocate a car in the world and tell every client about it.
+// permanent = static spawn (vehicles.cfg / `spawncar`): it stays in the world
+// after its driver walks away, exactly like a car parked on the street.
+// ---------------------------------------------------------------------------
+ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
+                                    float heading, bool permanent)
+{
+	if(modelId == 0){
+		Log("[VEH] refusing model 0");
+		return nullptr;
+	}
+
+	int slot = -1;
+	for(int i = 0; i < MAX_VEHICLES; i++)
+		if(!m_vehicles[i].active){ slot = i; break; }
+	if(slot < 0){
+		Log("[VEH] cannot spawn model=%d: no free vehicle slots", (int)modelId);
+		return nullptr;
+	}
+
+	ServerVehicle* v = &m_vehicles[slot];
+	v->active = true;
+	v->permanent = permanent;
+	v->id = (uint16_t)(slot + 1);
+	v->modelId = modelId;
+	v->driverId = 0xFF;
+	for(int s = 0; s < 8; s++) v->occupants[s] = 0xFF;
+	v->state = VehicleState();
+	v->state.vehicleId = v->id;
+	v->state.modelId = modelId;
+	v->state.xMm = QuantPos(x);
+	v->state.yMm = QuantPos(y);
+	v->state.zMm = QuantPos(z);
+	v->state.heading = QuantAngle(heading);
+	v->lastStateTime = 0.0;   // nobody has driven it yet
+
+	BitWriter w;
+	BeginMsg(w, MSG_VEH_SPAWN);
+	MsgVehSpawn vs;
+	vs.vehicleId = v->id;
+	vs.modelId = modelId;
+	vs.x = x; vs.y = y; vs.z = z; vs.heading = heading;
+	WriteVehSpawn(w, vs);
+	Broadcast(w, CHAN_RELIABLE, true);
+
+	Log("[VEH] spawn id=%d model=%d at (%.1f, %.1f, %.1f) heading=%.0f%s",
+	    (int)v->id, (int)modelId, x, y, z, heading, permanent ? " [static]" : "");
+	return v;
+}
+
+void Server::RemoveVehicle(uint16_t vehicleId)
+{
+	ServerVehicle* v = FindVehicle(vehicleId);
+	if(!v) return;
+
+	// unseat anyone inside first: clients unseat the puppet, then drop it
+	for(int s = 0; s < 8; s++){
+		if(v->occupants[s] == 0xFF) continue;
+		BitWriter we;
+		BeginMsg(we, MSG_VEH_EXIT);
+		MsgVehExit ex;
+		ex.playerId = v->occupants[s];
+		ex.vehicleId = v->id;
+		WriteVehExit(we, ex);
+		Broadcast(we, CHAN_RELIABLE, true);
+		ServerPlayer* occ = FindPlayer(v->occupants[s]);
+		if(occ){ occ->state.vehicleId = VEHICLE_NONE; occ->state.seat = 0xFF; }
+		v->occupants[s] = 0xFF;
+	}
+	v->driverId = 0xFF;
+
+	BitWriter w;
+	BeginMsg(w, MSG_VEH_DESPAWN);
+	MsgVehDespawn d;
+	d.vehicleId = vehicleId;
+	WriteVehDespawn(w, d);
+	Broadcast(w, CHAN_RELIABLE, true);
+
+	Log("[VEH] despawn id=%d (model=%d)", (int)vehicleId, (int)v->modelId);
+	v->active = false;
+	v->permanent = false;
+	v->state = VehicleState();
+}
+
+// vehicles.cfg — one static vehicle per line:
+//   <model> <x> <y> <z> [heading]     # comment
+void Server::LoadVehicleSpawns(const std::string& path)
+{
+	if(path.empty()) return;
+	std::ifstream f(path);
+	if(!f){
+		Log("vehicles: no %s (no static spawns)", path.c_str());
+		return;
+	}
+	std::string line;
+	int n = 0, bad = 0;
+	while(std::getline(f, line)){
+		if(!line.empty() && line.back() == '\r') line.pop_back();
+		size_t start = line.find_first_not_of(" \t");
+		if(start == std::string::npos) continue;
+		line = line.substr(start);
+		if(line[0] == '#' || line[0] == ';') continue;
+		unsigned model = 0;
+		float x = 0, y = 0, z = 0, heading = 0;
+		int got = sscanf(line.c_str(), "%u %f %f %f %f", &model, &x, &y, &z, &heading);
+		if(got < 4){
+			Log("vehicles: bad line '%s' (want: <model> <x> <y> <z> [heading])", line.c_str());
+			bad++;
+			continue;
+		}
+		if(SpawnVehicle((uint16_t)model, x, y, z, heading, true)) n++;
+	}
+	Log("vehicles: %d static spawn(s) from %s%s", n, path.c_str(),
+	    bad ? " (bad lines skipped)" : "");
 }
 
 void Server::SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour)
@@ -1278,6 +1441,7 @@ void Server::RestartGameMode()
 void Server::SetServerVar(const std::string& key, const std::string& value)
 {
 	if(key == "hostname") m_cfg.hostname = value;
+	else if(key == "map") m_cfg.mapName = value;
 	else if(key == "stream_distance") m_cfg.streamDistance = (float)atof(value.c_str());
 	else if(key == "tick_rate") m_cfg.tickRate = atoi(value.c_str());
 	else if(key == "weather") m_cfg.weather = (uint8_t)atoi(value.c_str());
@@ -1327,13 +1491,14 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 	};
 
 	if(cmd == "help"){
-		respond("commands: help status players say kick ban banip unban setr getr gmx loadmode respawn teleport exec uptime version netstats quit");
+		respond("commands: help status players say kick ban banip unban setr getr settime setweather res gmx loadmode respawn teleport spawncar delcar cars exec uptime version netstats quit");
+		respond("res: list info enable disable reload run install uninstall log");
 		return true;
 	}
 	if(cmd == "status"){
-		respond("hostname=%s players=%d/%d mode=%s uptime=%.0fs tick=%d",
+		respond("hostname=%s players=%d/%d mode=%s map=%s uptime=%.0fs tick=%d",
 		        m_cfg.hostname.c_str(), ActivePlayerCount(), m_cfg.maxPlayers,
-		        m_gamemode ? m_gamemode->Name() : "?", Now(), m_cfg.tickRate);
+		        m_gamemode ? m_gamemode->Name() : "?", m_cfg.mapName.c_str(), Now(), m_cfg.tickRate);
 		return true;
 	}
 	if(cmd == "players"){
@@ -1396,9 +1561,112 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 		SetServerVar(rest.substr(0, sp2), rest.substr(sp2 + 1));
 		return true;
 	}
+	if(cmd == "settime"){
+		// settime <hour 0-23> <minute 0-59> — authoritative world clock
+		int h = -1, mi = -1;
+		if(sscanf(rest.c_str(), "%d %d", &h, &mi) == 2 && h >= 0 && h < 24 && mi >= 0 && mi < 60){
+			m_cfg.hour = (uint8_t)h; m_cfg.minute = (uint8_t)mi;
+			BroadcastWorld();
+			respond("time set to %02d:%02d (all clients)", h, mi);
+		}else
+			respond("usage: settime <hour 0-23> <minute 0-59>");
+		return true;
+	}
+	if(cmd == "setweather"){
+		// setweather <0-5>: 0 sunny 1 cloudy 2 rainy 3 foggy 4 extra-sunny 5 hurricane
+		int w = -1;
+		if(sscanf(rest.c_str(), "%d", &w) == 1 && w >= 0 && w <= 5){
+			m_cfg.weather = (uint8_t)w;
+			BroadcastWorld();
+			respond("weather set to %d (all clients)", w);
+		}else
+			respond("usage: setweather <0-5> (0 sunny 1 cloudy 2 rainy 3 foggy 4 extra-sunny 5 hurricane)");
+		return true;
+	}
+	if(cmd == "res" || cmd == "resources"){
+		// mod/resource pipeline management
+		char sub[24] = {}, arg1[80] = {}, arg2[80] = {};
+		sscanf(rest.c_str(), "%23s %79s %79s", sub, arg1, arg2);
+		std::string s = sub, a1 = arg1, a2 = arg2;
+		auto errOut = [&](const std::string& e){ respond("res: %s", e.c_str()); };
+		if(s.empty() || s == "list"){
+			auto list = m_resources.List();
+			respond("res: %d resource(s) in %s", (int)list.size(), m_cfg.resourcesDir.c_str());
+			for(const auto& r : list)
+				respond("  %s v%s [%s] %s%s%s",
+				        r.dir.c_str(), r.version.empty() ? "-" : r.version.c_str(),
+				        r.type.c_str(), r.enabled ? "ENABLED" : "disabled",
+				        r.valid ? "" : " ERROR", r.valid ? "" : (": " + r.error).c_str());
+			return true;
+		}
+		if(s == "info"){
+			const ResourceInfo* r = m_resources.Find(a1);
+			if(!r){ errOut("no such resource: " + a1); return true; }
+			respond("res: %s v%s by %s [%s] %s", r->dir.c_str(),
+			        r->version.empty() ? "-" : r->version.c_str(),
+			        r->author.empty() ? "-" : r->author.c_str(), r->type.c_str(),
+			        r->enabled ? "ENABLED" : "disabled");
+			if(!r->description.empty()) respond("  %s", r->description.c_str());
+			if(!r->motd.empty()) respond("  motd: %s", r->motd.c_str());
+			for(const auto& h : r->hooks)
+				respond("  @on %s%s (%d line(s))", h.event.c_str(),
+				        h.arg.empty() ? "" : (" " + h.arg).c_str(), (int)h.lines.size());
+			if(!r->valid) respond("  ERROR: %s", r->error.c_str());
+			return true;
+		}
+		if(s == "enable" || s == "disable"){
+			std::string e;
+			if(!m_resources.SetEnabled(a1, s == "enable", e)) errOut(e);
+			else{
+				respond("res: %s %sd", a1.c_str(), s.c_str());
+				BroadcastResList();
+			}
+			return true;
+		}
+		if(s == "reload"){
+			m_resources.Reload();
+			respond("res: reloaded (%d resource(s))", (int)m_resources.List().size());
+			BroadcastResList();
+			return true;
+		}
+		if(s == "run"){
+			std::string e;
+			if(!m_resources.RunEvent(a1, a2.empty() ? "start" : a2, "", respondTo, -1, "", e))
+					errOut(e);
+			else respond("res: ran %s %s", a1.c_str(), a2.empty() ? "start" : a2.c_str());
+			return true;
+		}
+		if(s == "install"){
+			std::string e;
+			if(!m_resources.Install(a1, e)) errOut(e);
+			else{
+				respond("res: installed %s", a1.c_str());
+				BroadcastResList();
+			}
+			return true;
+		}
+		if(s == "uninstall"){
+			std::string e;
+			if(!m_resources.Uninstall(a1, e)) errOut(e);
+			else{
+				respond("res: uninstalled %s", a1.c_str());
+				BroadcastResList();
+			}
+			return true;
+		}
+		if(s == "log"){
+			const ResourceInfo* r = m_resources.Find(a1);
+			if(!r){ errOut("no such resource: " + a1); return true; }
+			if(r->log.empty()) respond("  (no log entries)");
+			for(const auto& l : r->log) respond("  %s", l.c_str());
+			return true;
+		}
+		respond("usage: res list|info|enable|disable|reload|run|install|uninstall|log");
+		return true;
+	}
 	if(cmd == "getr"){
-		respond("hostname=%s stream_distance=%.1f tick_rate=%d hour=%d minute=%d weather=%d",
-		        m_cfg.hostname.c_str(), m_cfg.streamDistance, m_cfg.tickRate,
+		respond("hostname=%s map=%s stream_distance=%.1f tick_rate=%d hour=%d minute=%d weather=%d",
+		        m_cfg.hostname.c_str(), m_cfg.mapName.c_str(), m_cfg.streamDistance, m_cfg.tickRate,
 		        (int)m_cfg.hour, (int)m_cfg.minute, (int)m_cfg.weather);
 		return true;
 	}
@@ -1450,14 +1718,34 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 		CopyStr(c.text, sizeof c.text, rest.c_str());
 		WriteChat(w, c);
 		Broadcast(w, CHAN_RELIABLE, true);
+		// also a gamemode event: clients render this as a large center-screen banner
+		BroadcastEvent(GMEV_TEXT, 0, 0, rest.c_str());
 		respond("broadcast sent");
 		return true;
 	}
 	if(cmd == "give"){
 		// give <id|name> money <amount> | weapon <type> [ammo] | god [0|1] | health <hp>
+		// kind-first "give money 5000" targets the command sender (self-serve admin UI)
 		char who[40] = {}, what[24] = {};
 		int a1 = 0, a2 = 0;
 		int n = sscanf(rest.c_str(), "%39s %23s %d %d", who, what, &a1, &a2);
+		auto isKind = [](const char* s){
+			return !strcmp(s, "money") || !strcmp(s, "weapon") ||
+			       !strcmp(s, "god") || !strcmp(s, "health");
+		};
+		if(n >= 1 && isKind(who)){
+			if(respondTo < 0){ respond("usage: give <id|name> money|weapon|god|health <value> [ammo]"); return true; }
+			char kind[24];
+			snprintf(kind, sizeof kind, "%s", who);
+			// kind-first: value tokens sit one slot left of the id-form
+			int v1 = (n >= 2) ? atoi(what) : 0;
+			int v2 = (n >= 3) ? a1 : 0;
+			snprintf(who, sizeof who, "%d", respondTo);
+			snprintf(what, sizeof what, "%s", kind);
+			a1 = v1; a2 = v2;
+			if(!strcmp(what, "god") && n < 2) a1 = 1;   // bare "give god" = on
+			n = 4;
+		}
 		if(n < 3){ respond("usage: give <id|name> money|weapon|god|health <value> [ammo]"); return true; }
 		ServerPlayer* tp = FindPlayer((uint8_t)atoi(who));
 		if(!tp || !tp->active){
@@ -1489,6 +1777,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 		if(!name[0]){ respond("usage: spawnbot <name> [roam|combat|drive|chaos]"); return true; }
 		if(!scen[0]) snprintf(scen, sizeof scen, "roam");
 		char exePath[MAX_PATH] = {};
+#ifdef _WIN32
 		GetModuleFileNameA(NULL, exePath, MAX_PATH);
 		std::string bot = exePath;
 		size_t slash = bot.find_last_of("\\/");
@@ -1503,6 +1792,111 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 			CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
 		}else
 			respond("spawnbot failed (error %u)", (unsigned)GetLastError());
+#else
+		ssize_t xn = readlink("/proc/self/exe", exePath, sizeof exePath - 1);
+		if(xn > 0) exePath[xn] = 0;
+		std::string bot = exePath;
+		size_t slash = bot.find_last_of("\\/");
+		bot = (slash == std::string::npos ? std::string(".") : bot.substr(0, slash)) + "/relcs-netbot";
+		char portStr[16], seedStr[16];
+		snprintf(portStr, sizeof portStr, "%u", (unsigned)m_cfg.port);
+		snprintf(seedStr, sizeof seedStr, "%u", (unsigned)(rand() % 10000));
+		pid_t pid = fork();
+		if(pid == 0){
+			setsid();   // detach from the server's terminal
+			std::string serverArg = std::string("127.0.0.1:") + portStr;
+			execl(bot.c_str(), bot.c_str(), "-name", name, "-server", serverArg.c_str(),
+			      "-scenario", scen, "-duration", "600", "-seed", seedStr, (char*)nullptr);
+			_exit(127);
+		}
+		if(pid > 0)
+			respond("bot %s spawned (pid %d, %s)", name, (int)pid, scen);
+		else
+			respond("spawnbot failed (fork error)");
+#endif
+		return true;
+	}
+	if(cmd == "spawncar"){
+		// spawncar <model> [<playerId> | <x> <y> <z> [heading]] — a static car
+		// (stays in the world after the driver leaves, like a parked street car)
+		unsigned model = 0;
+		float a1 = 0, a2 = 0, a3 = 0, a4 = 0;
+		int got = sscanf(rest.c_str(), "%u %f %f %f %f", &model, &a1, &a2, &a3, &a4);
+		if(got < 1 || model == 0){
+			respond("usage: spawncar <model> [<playerId> | <x> <y> <z> [heading]]");
+			return true;
+		}
+		float x = 0, y = 0, z = 0, heading = 0;
+		bool havePos = false;
+		bool fromPlayer = false;
+		if(got >= 4){
+			x = a1; y = a2; z = a3; heading = a4; havePos = true;
+		}else if(got == 2){
+			ServerPlayer* tgt = FindPlayer((uint8_t)atoi(rest.c_str() + rest.find(' ')));
+			if(!tgt){ respond("no player id %d", (int)a1); return true; }
+			x = DequantPos(tgt->state.xMm); y = DequantPos(tgt->state.yMm); z = DequantPos(tgt->state.zMm);
+			heading = DequantAngle(tgt->state.heading);
+			havePos = true;
+			fromPlayer = true;
+		}
+		if(!havePos){
+			// no position given: drop it next to the first player, else the first spawn point
+			ServerPlayer* tgt = nullptr;
+			for(int i = 0; i < MAX_PLAYERS && !tgt; i++)
+				if(m_players[i].active) tgt = &m_players[i];
+			if(tgt){
+				x = DequantPos(tgt->state.xMm); y = DequantPos(tgt->state.yMm); z = DequantPos(tgt->state.zMm);
+				heading = DequantAngle(tgt->state.heading);
+				fromPlayer = true;
+			}else{
+				SpawnPoint sp = RandomSpawnPoint();
+				x = sp.x; y = sp.y; z = sp.z; heading = sp.heading;
+			}
+		}
+		if(fromPlayer){
+			// spawning the car on the player's own coordinates buries it around
+			// them: the camera sits inside the body and backface culling hides
+			// everything, which reads as "the car never spawned". Drop it a few
+			// metres ahead instead (GTA heading: forward = (-sin h, cos h)).
+			x += -std::sin(heading) * 5.0f;
+			y +=  std::cos(heading) * 5.0f;
+		}
+		ServerVehicle* nv = SpawnVehicle((uint16_t)model, x, y, z, heading, true);
+		if(!nv) respond("cannot spawn model %u (no free slots)", model);
+		else respond("spawned vehicle #%d model=%u at (%.1f, %.1f, %.1f)",
+		             (int)nv->id, model, x, y, z);
+		return true;
+	}
+	if(cmd == "delcar"){
+		// delcar <id> | all — retire static/any vehicles
+		if(rest == "all"){
+			int n = 0;
+			for(int i = 0; i < MAX_VEHICLES; i++)
+				if(m_vehicles[i].active){ RemoveVehicle(m_vehicles[i].id); n++; }
+			respond("removed %d vehicle(s)", n);
+			return true;
+		}
+		int id = atoi(rest.c_str());
+		if(id < 1 || !FindVehicle((uint16_t)id)){ respond("no vehicle #%d (see: cars)", id); return true; }
+		RemoveVehicle((uint16_t)id);
+		respond("removed vehicle #%d", id);
+		return true;
+	}
+	if(cmd == "cars"){
+		int n = 0;
+		for(int i = 0; i < MAX_VEHICLES; i++){
+			ServerVehicle& v = m_vehicles[i];
+			if(!v.active) continue;
+			int seats = 0;
+			for(int s = 0; s < 8; s++) if(v.occupants[s] != 0xFF) seats++;
+			respond("#%d model=%d%s pos=(%.1f, %.1f, %.1f) driver=%s passengers=%d",
+			        (int)v.id, (int)v.modelId, v.permanent ? " [static]" : "",
+			        DequantPos(v.state.xMm), DequantPos(v.state.yMm), DequantPos(v.state.zMm),
+			        v.driverId == 0xFF ? "-" : std::to_string((int)v.driverId).c_str(),
+			        seats ? seats - 1 : 0);
+			n++;
+		}
+		respond("%d vehicle(s) in the world (max %d)", n, (int)MAX_VEHICLES);
 		return true;
 	}
 	if(cmd == "spawnprop"){
@@ -1598,8 +1992,10 @@ void Server::UpdateMasterAnnounce()
 		a.players = (uint8_t)ActivePlayerCount();
 		a.maxPlayers = (uint8_t)m_cfg.maxPlayers;
 		a.protocolVersion = PROTOCOL_VERSION;
+		a.advertisedIp = LanIPv4();
 		CopyStr(a.hostname, sizeof a.hostname, m_cfg.hostname.c_str());
 		CopyStr(a.gameMode, sizeof a.gameMode, m_gamemode ? m_gamemode->Name() : "");
+		CopyStr(a.mapName, sizeof a.mapName, m_cfg.mapName.c_str());
 		WriteMasterAnnounce(w, a);
 		ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 		if(enet_peer_send(m_masterPeer, 0, pkt) == 0){
@@ -1608,6 +2004,58 @@ void Server::UpdateMasterAnnounce()
 		}
 		// on failure keep m_masterLastAnnounce as-is -> retried next tick
 	}
+}
+
+// first non-loopback IPv4 (network byte order) — the address LAN peers
+// should dial; prefer RFC1918 so VPN/virtual adapters don't win
+static uint32_t LanIPv4()
+{
+#ifdef _WIN32
+	ULONG sz = 16 * 1024;
+	for(int attempt = 0; attempt < 3; attempt++){
+		std::vector<uint8_t> buf(sz);
+		IP_ADAPTER_ADDRESSES* addrs = (IP_ADAPTER_ADDRESSES*)buf.data();
+		ULONG rc = GetAdaptersAddresses(AF_INET,
+		         GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+		         nullptr, addrs, &sz);
+		if(rc == ERROR_BUFFER_OVERFLOW) continue;
+		if(rc != NO_ERROR) return 0;
+		uint32_t fallback = 0;
+		for(IP_ADAPTER_ADDRESSES* a = addrs; a; a = a->Next){
+			if(a->OperStatus != IfOperStatusUp) continue;
+			for(IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u; u = u->Next){
+				if(u->Address.lpSockaddr->sa_family != AF_INET) continue;
+				uint32_t ip = ((sockaddr_in*)u->Address.lpSockaddr)->sin_addr.s_addr;
+				if((ip & 0xFF) == 127) continue;
+				if(!fallback) fallback = ip;
+				uint8_t b0 = (uint8_t)(ip & 0xFF);
+				uint8_t b1 = (uint8_t)((ip >> 8) & 0xFF);
+				if(b0 == 10 || b0 == 192 || (b0 == 172 && b1 >= 16 && b1 <= 31))
+					return ip;
+			}
+		}
+		return fallback;
+	}
+	return 0;
+#else
+	struct ifaddrs* ifs = nullptr;
+	if(getifaddrs(&ifs) != 0) return 0;
+	uint32_t fallback = 0;
+	for(struct ifaddrs* a = ifs; a; a = a->ifa_next){
+		if(!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+		uint32_t ip = ((struct sockaddr_in*)a->ifa_addr)->sin_addr.s_addr;
+		if((ip & 0xFF) == 127) continue;
+		if(!fallback) fallback = ip;
+		uint8_t b0 = (uint8_t)(ip & 0xFF);
+		uint8_t b1 = (uint8_t)((ip >> 8) & 0xFF);
+		if(b0 == 10 || b0 == 192 || (b0 == 172 && b1 >= 16 && b1 <= 31)){
+			freeifaddrs(ifs);
+			return ip;
+		}
+	}
+	freeifaddrs(ifs);
+	return fallback;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,7 +2091,7 @@ void Server::PumpDiscovery()
 
 	char buf[256];
 	sockaddr_in from;
-	int flen = sizeof from;
+	socklen_t flen = sizeof from;
 	int n = recvfrom(m_discSock, buf, sizeof buf - 1, 0, (sockaddr*)&from, &flen);
 	if(n <= 0) return;
 	buf[n] = '\0';
@@ -1651,10 +2099,12 @@ void Server::PumpDiscovery()
 	if(strcmp(buf, LAN_DISCOVER_MAGIC) == 0){
 		char resp[512];
 		int players = ActivePlayerCount();
-		snprintf(resp, sizeof resp, "%s|%s|%d|%d|%s|%d|%u",
+		// tail fields: the master's port (other machines find the list with no
+		// configuration) and the map (launcher tooltip without a probe)
+		snprintf(resp, sizeof resp, "%s|%s|%d|%d|%s|%d|%u|%u|%s",
 		         LAN_RESP_MAGIC, m_cfg.hostname.c_str(), players, m_cfg.maxPlayers,
 		         m_gamemode ? m_gamemode->Name() : "", (int)PROTOCOL_VERSION,
-		         (unsigned)m_cfg.port);
+		         (unsigned)m_cfg.port, (unsigned)m_cfg.masterPort, m_cfg.mapName.c_str());
 		sendto(m_discSock, resp, (int)strlen(resp), 0, (sockaddr*)&from, flen);
 	}
 }

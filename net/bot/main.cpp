@@ -57,8 +57,7 @@ struct BotConfig {
 // ---------------------------------------------------------------------------
 // Utility modes (no game session)
 // ---------------------------------------------------------------------------
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "compat.h"
 
 static int RunDiscover()
 {
@@ -85,7 +84,7 @@ static int RunDiscover()
 	double t0 = NowSec();
 	while(NowSec() - t0 < 2.0){
 		char buf[512];
-		sockaddr_in from; int flen = sizeof from;
+		sockaddr_in from; socklen_t flen = sizeof from;
 		int n = recvfrom(s, buf, sizeof buf - 1, 0, (sockaddr*)&from, &flen);
 		if(n > 0){
 			buf[n] = '\0';

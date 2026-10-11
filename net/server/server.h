@@ -1,7 +1,9 @@
 // net/server/server.h — reLCS dedicated multiplayer server.
 #pragma once
 
+#include "compat.h"
 #include "profiles.h"
+#include "resource.h"
 #include "rnet_protocol.h"
 #include "rnet_validator.h"
 
@@ -29,6 +31,9 @@ struct ServerConfig {
 	uint8_t hour = 12, minute = 0, weather = 0;
 	int netstatsInterval = 0;		// >0: log bandwidth/rtt stats every N seconds
 	std::string profilesDb = "profiles.db";  // SQLite player profiles ("" disables)
+	std::string resourcesDir = "resources";  // mod/resource packs ("" disables)
+	std::string vehiclesFile = "vehicles.cfg"; // static vehicle spawn list ("" disables)
+	std::string mapName = "Liberty City";    // shown in the launcher's server tooltip
 };
 
 struct ServerPlayer {
@@ -74,6 +79,7 @@ struct ServerPlayer {
 
 struct ServerVehicle {
 	bool active = false;
+	bool permanent = false;          // static spawn: kept in the world while the server runs
 	uint16_t id = 0;
 	uint16_t modelId = 0;
 	rnet::VehicleState state;
@@ -104,10 +110,15 @@ public:
 	void BroadcastChat(const char* text, uint8_t fromId = 0);
 	void SendChatTo(uint8_t playerId, const char* text, uint8_t fromId = 0);
 	void BroadcastEvent(uint8_t type, uint8_t arg1 = 0, uint8_t arg2 = 0, const char* text = "");
+	void BroadcastWorld(void);   // MSG_WORLD clock/weather sync to everyone
+	void BroadcastResList(void); // MSG_RES_LIST mod/resource inventory to everyone
+	void SendResList(ENetPeer* peer);
 	void SpawnPlayer(uint8_t playerId, float x, float y, float z, float heading,
 	                 uint16_t skin, uint8_t health, uint8_t armour);
 	void KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId);
 	void TeleportPlayer(uint8_t playerId, float x, float y, float z, float heading);
+	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent);
+	void RemoveVehicle(uint16_t vehicleId);
 	void SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour);
 	void BroadcastScores();
 	void KickPlayer(uint8_t playerId, const char* reason);
@@ -118,6 +129,7 @@ public:
 	double Now() const;               // seconds since start
 	const ServerConfig& Config() const { return m_cfg; }
 	void SetServerVar(const std::string& key, const std::string& value);
+	ResourceManager& Resources() { return m_resources; }
 
 private:
 	void PumpNetwork();
@@ -140,6 +152,7 @@ private:
 	void HandleVehExit(ServerPlayer* p, rnet::BitReader& r);
 	void ClearPlayerVehicles(ServerPlayer* p, bool broadcast); // drop all seats held by p
 	void HandleRcon(ServerPlayer* p, rnet::BitReader& r, bool auth);
+	void LoadVehicleSpawns(const std::string& path); // vehicles.cfg -> permanent vehicles
 
 	// helpers
 	void SendTo(ENetPeer* peer, const rnet::BitWriter& w, uint8_t channel, bool reliable);
@@ -163,6 +176,7 @@ private:
 
 	GameMode* m_gamemode = nullptr;
 	ProfileStore m_profiles;
+	ResourceManager m_resources;
 	double m_lastProfileFlush = -100.0;
 
 	std::mutex m_cmdMutex;

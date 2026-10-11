@@ -12,6 +12,7 @@
 
 static Server* g_server = nullptr;
 
+#ifdef _WIN32
 static BOOL WINAPI ConsoleHandler(DWORD type)
 {
 	if(type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT){
@@ -20,6 +21,9 @@ static BOOL WINAPI ConsoleHandler(DWORD type)
 	}
 	return FALSE;
 }
+#else
+static void SignalHandler(int){ if(g_server) g_server->Shutdown(); }
+#endif
 
 static void ConsoleThread()
 {
@@ -55,6 +59,8 @@ static void ApplyKeyVal(ServerConfig& cfg, const std::string& key, const std::st
 	else if(key == "weather") cfg.weather = (uint8_t)atoi(val.c_str());
 	else if(key == "netstats_interval") cfg.netstatsInterval = atoi(val.c_str());
 	else if(key == "profiles") cfg.profilesDb = val;
+	else if(key == "resources") cfg.resourcesDir = val;
+	else if(key == "vehicles") cfg.vehiclesFile = val;
 }
 
 static bool LoadConfigFile(ServerConfig& cfg, const std::string& path)
@@ -95,7 +101,12 @@ int main(int argc, char** argv)
 		}
 	}
 
+#ifdef _WIN32
 	SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+#else
+	signal(SIGINT, SignalHandler);
+	signal(SIGTERM, SignalHandler);
+#endif
 
 	Server server;
 	g_server = &server;
