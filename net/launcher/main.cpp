@@ -49,7 +49,10 @@ struct ServerRow {
 static std::string g_gameExe = "reLCS.exe";
 static std::string g_nick = "Player";
 static std::string g_rconPw; // server rcon password for in-game admin tools
-static std::string g_masterHost = "127.0.0.1";
+// public staging master (VPS) — the Internet tab lists its servers by default.
+// launcher.ini `master = host:port` overrides it; the LAN tab (broadcast) is
+// independent of this and keeps finding local servers.
+static std::string g_masterHost = "88.214.59.166";
 static uint16_t g_masterPort = DEFAULT_MASTER_PORT;
 static std::vector<std::string> g_profiles;   // saved usernames (usernames.ini)
 
