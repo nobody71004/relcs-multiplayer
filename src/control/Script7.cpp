@@ -2,6 +2,7 @@
 
 #include "Script.h"
 #include "ScriptCommands.h"
+#include "net/nethooks.h"
 
 #include "CarCtrl.h"
 #include "ColStore.h"
@@ -171,6 +172,9 @@ int8 CRunningScript::ProcessCommands1200To1299(int32 command)
 	case COMMAND_CREATE_SCRIPT_ROADBLOCK:
 	{
 		CollectParameters(&m_nIp, 6);
+		// [NET] scripted roadblocks are disabled on multiplayer clients
+		if (NetGame_RulesActive())
+			return 0;
 		CRoadBlocks::RegisterScriptRoadBlock(GET_VECTOR_PARAM(0), GET_VECTOR_PARAM(3));
 		return 0;
 	}

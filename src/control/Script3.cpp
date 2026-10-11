@@ -2,6 +2,7 @@
 
 #include "Script.h"
 #include "ScriptCommands.h"
+#include "net/nethooks.h"
 
 #include "Boat.h"
 #include "CarCtrl.h"
@@ -90,6 +91,9 @@ int8 CRunningScript::ProcessCommands500To599(int32 command)
 	{
 		wchar* text = CTheScripts::GetTextByKeyFromScript(&m_nIp);
 		CollectParameters(&m_nIp, 8);
+		// [NET] kill frenzies are disabled on multiplayer clients
+		if (NetGame_RulesActive())
+			return 0;
 		CDarkel::StartFrenzy((eWeaponType)GET_INTEGER_PARAM(0), GET_INTEGER_PARAM(1), GET_INTEGER_PARAM(2),
 			GET_INTEGER_PARAM(3), text, GET_INTEGER_PARAM(4), GET_INTEGER_PARAM(5),
 			GET_INTEGER_PARAM(6), GET_INTEGER_PARAM(7) != 0, false);
@@ -2026,6 +2030,17 @@ int8 CRunningScript::ProcessCommands700To799(int32 command)
 		return 0;
 	}
 	case COMMAND_START_CUTSCENE:
+		// [NET] cutscenes are disabled on multiplayer clients — but simply
+		// skipping StartCutscene() deadlocks the cutscene's script (its wait
+		// loop keys off the camera spline, which only advances once started)
+		// and leaves the game stuck in cutscene mode: invisible player, dead
+		// input, adrift camera. Unwind the cutscene fully instead; the script
+		// then proceeds to CLEAR_CUTSCENE and play continues normally.
+		if (NetGame_RulesActive()) {
+			CCutsceneMgr::FinishCutscene();
+			CCutsceneMgr::DeleteCutsceneData();
+			return 0;
+		}
 		CCutsceneMgr::StartCutscene();
 		return 0;
 	case COMMAND_GET_CUTSCENE_TIME:

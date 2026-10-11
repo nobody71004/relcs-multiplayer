@@ -1,4 +1,5 @@
 #include "common.h"
+#include "net/nethooks.h"
 
 #include "main.h"
 #include "smallHeap.h"
@@ -311,6 +312,9 @@ CColStore::LoadCollision(const CVector &pos, eLevelName level)
 		}
 */
 
+		// [NET] every island's collision stays resident in multiplayer
+		if(NetGame_RulesActive())
+			wantThisOne = true;
 		if(wantThisOne){
 			CStreaming::RequestCol(i, STREAMFLAGS_PRIORITY);
 			requestedSomething = true;

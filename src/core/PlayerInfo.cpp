@@ -659,6 +659,12 @@ FindPlayerCoors(void)
 		return TheCamera.GetPosition();
 #endif
 	CPlayerPed *ped = FindPlayerPed();
+	// The player ped doesn't exist yet while CREATE_PLAYER is streaming the
+	// player model in (or while a mission reset recreates the player) — script
+	// and collision code still query the player position in that window, so
+	// fall back to the camera instead of dereferencing nil.
+	if(!ped)
+		return TheCamera.GetPosition();
 	if(ped->InVehicle())
 		return ped->m_pMyVehicle->GetPosition();
 	else
@@ -668,12 +674,16 @@ FindPlayerCoors(void)
 const CVector &
 FindPlayerSpeed(void)
 {
+	static CVector vecZeroSpeed(0.0f, 0.0f, 0.0f);
 #ifdef FIX_BUGS
-	static CVector vecTmpVector(0.0f, 0.0f, 0.0f);
 	if (CReplay::IsPlayingBack())
-		return vecTmpVector;
+		return vecZeroSpeed;
 #endif
 	CPlayerPed *ped = FindPlayerPed();
+	// no player yet (see FindPlayerCoors) — zero speed keeps radar/streaming/
+	// network callers mathematically sane instead of crashing
+	if(!ped)
+		return vecZeroSpeed;
 	if(ped->InVehicle())
 		return ped->m_pMyVehicle->m_vecMoveSpeed;
 	else
@@ -692,6 +702,8 @@ CEntity *
 FindPlayerEntity(void)
 {
 	CPlayerPed *ped = FindPlayerPed();
+	if(!ped)
+		return nil;
 	if(ped->InVehicle())
 		return ped->m_pMyVehicle;
 	else
@@ -722,7 +734,8 @@ FindPlayerCentreOfWorld(int32 player)
 	if(CCarCtrl::bCarsGeneratedAroundCamera) return TheCamera.GetPosition();
 	if(CWorld::Players[player].m_pRemoteVehicle) return CWorld::Players[player].m_pRemoteVehicle->GetPosition();
 	if(FindPlayerVehicle()) return FindPlayerVehicle()->GetPosition();
-	return CWorld::Players[player].m_pPed->GetPosition();
+	if(CWorld::Players[player].m_pPed) return CWorld::Players[player].m_pPed->GetPosition();
+	return TheCamera.GetPosition();
 }
 
 const CVector &
@@ -735,7 +748,8 @@ FindPlayerCentreOfWorld_NoSniperShift(void)
 	if(CWorld::Players[CWorld::PlayerInFocus].m_pRemoteVehicle)
 		return CWorld::Players[CWorld::PlayerInFocus].m_pRemoteVehicle->GetPosition();
 	if(FindPlayerVehicle()) return FindPlayerVehicle()->GetPosition();
-	return FindPlayerPed()->GetPosition();
+	if(FindPlayerPed()) return FindPlayerPed()->GetPosition();
+	return TheCamera.GetPosition();
 }
 
 float
@@ -744,7 +758,8 @@ FindPlayerHeading(void)
 	if(CWorld::Players[CWorld::PlayerInFocus].m_pRemoteVehicle)
 		return CWorld::Players[CWorld::PlayerInFocus].m_pRemoteVehicle->GetForward().Heading();
 	if(FindPlayerVehicle()) return FindPlayerVehicle()->GetForward().Heading();
-	return FindPlayerPed()->GetForward().Heading();
+	if(FindPlayerPed()) return FindPlayerPed()->GetForward().Heading();
+	return 0.0f;
 }
 
 bool

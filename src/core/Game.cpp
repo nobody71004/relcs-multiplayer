@@ -1,4 +1,5 @@
 #include "common.h"
+#include "net/nethooks.h"
 #include "platform.h"
 
 #include "Game.h"
@@ -1353,6 +1354,12 @@ CGame::InitAfterFocusLoss()
 {
 	FrontEndMenuManager.m_nPrefsAudio3DProviderIndex = FrontEndMenuManager.m_lastWorking3DAudioProvider;
 	DMAudio.SetCurrent3DProvider(FrontEndMenuManager.m_lastWorking3DAudioProvider);
+
+	// multiplayer: never auto-open the pause menu on focus loss. It froze the
+	// world and ate input, leaving the player stuck mid-air and unresponsive
+	// whenever another window stole focus for a moment.
+	if (NetGame_RulesActive())
+		return;
 
 	if (!FrontEndMenuManager.m_bGameNotLoaded && !FrontEndMenuManager.m_bMenuActive)
 		FrontEndMenuManager.m_bStartUpFrontEndRequested = true;

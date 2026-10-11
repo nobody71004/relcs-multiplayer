@@ -86,16 +86,17 @@ CClock::Update(void)
 }
 
 void
-CClock::SetGameClock(uint8 h, uint8 m)
+CClock::SetGameClock(uint8 h, int32 m)
 {
-	while (m >= 60) {
-		m -= 60;
-		h++;
-	}
-	ms_nGameClockMinutes = m;
-	while (h >= 24)
-		h -= 24;
-	ms_nGameClockHours = h;
+	// robust against junk/partial values from config or net data: use signed
+	// math and wrap properly (a bad time must never corrupt the clock state)
+	int32 hh = (int32)h, mm = m;
+	if(mm < 0){ int32 k = (-mm + 59) / 60; mm += 60*k; hh -= k; }
+	while (mm >= 60) { mm -= 60; hh++; }
+	ms_nGameClockMinutes = (uint8)mm;
+	hh %= 24;
+	if(hh < 0) hh += 24;
+	ms_nGameClockHours = (uint8)hh;
 	ms_nGameClockSeconds = 0;
 	ms_nLastClockTick = CTimer::GetTimeInMilliseconds();
 }

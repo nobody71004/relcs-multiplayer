@@ -1212,6 +1212,11 @@ void re3_assert(const char *expr, const char *filename, unsigned int lineno, con
 	strcat_s(re3_buff, re3_buffsize, "(Press Retry to debug the application)");
 
 
+	// also mirror the assertion to stderr so a redirected/headless run records
+	// exactly which check tripped, not just a modal dialog nobody can read
+	fprintf(stderr, "[ASSERT] %s:%u %s: %s\n", filename, lineno, func, expr);
+	fflush(stderr);
+
 	nCode = ::MessageBoxA(nil, re3_buff, "RELCS Assertion Failed!",
 		MB_ABORTRETRYIGNORE|MB_ICONHAND|MB_SETFOREGROUND|MB_TASKMODAL);
 

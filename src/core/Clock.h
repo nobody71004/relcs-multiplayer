@@ -16,7 +16,7 @@ public:
 
 	static void Initialise(uint32 scale);
 	static void Update(void);
-	static void SetGameClock(uint8 h, uint8 m);
+	static void SetGameClock(uint8 h, int32 m);
 	static int32 GetGameClockMinutesUntil(uint8 h, uint8 m);
 	static bool GetIsTimeInRange(uint8 h1, uint8 h2);
 	static void StoreClock(void);

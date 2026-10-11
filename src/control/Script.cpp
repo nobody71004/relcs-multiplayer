@@ -1,6 +1,7 @@
 #include "common.h"
 
 #include "Script.h"
+#include "net/nethooks.h"
 #include "ScriptCommands.h"
 
 #include "AnimBlendAssociation.h"
@@ -2820,6 +2821,9 @@ int8 CRunningScript::ProcessCommands200To299(int32 command)
 	case COMMAND_LAUNCH_MISSION:
 	{
 		CollectParameters(&m_nIp, 1);
+		// [NET] missions are disabled on multiplayer clients
+		if (NetGame_RulesActive())
+			return 0;
 		CRunningScript* pNew = CTheScripts::StartNewScript(GET_INTEGER_PARAM(0));
 		pNew->m_bIsMissionScript = true;
 		return 0;

@@ -1,5 +1,6 @@
 #include "common.h"
 #include "net/nethooks.h"
+#include "net/cefhud.h"
 #include <time.h>
 #include "rpmatfx.h"
 #include "rphanim.h"
@@ -551,6 +552,9 @@ Initialise3D(void *param)
 static void 
 Terminate3D(void)
 {
+	// release the CEF overlay texture BEFORE RenderWare frees its pools —
+	// CefHud_Shutdown (rsTERMINATE) would otherwise double-free the raster
+	CefHud_ShutdownRW();
 	CGame::ShutdownRenderWare();
 #ifdef DEBUGMENU
 	DebugMenuShutdown();

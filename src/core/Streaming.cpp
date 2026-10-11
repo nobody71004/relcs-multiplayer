@@ -1,4 +1,5 @@
 #include "common.h"
+#include "net/nethooks.h"
 
 #include "General.h"
 #include "Pad.h"
@@ -823,6 +824,16 @@ CStreaming::RequestModel(int32 id, int32 flags)
 	}
 }
 
+// [NET] island LOD stand-in models must never come back once multiplayer has
+// every island loaded as real geometry
+static bool
+NetKeepAllIslands(CBuilding *b)
+{
+	int32 id = b->GetModelIndex();
+	return id != islandLODindust && id != islandLODcomInd && id != islandLODcomSub &&
+	       id != islandLODsubInd && id != islandLODsubCom;
+}
+
 #define BIGBUILDINGFLAGS STREAMFLAGS_DONT_REMOVE
 
 void
@@ -840,7 +851,7 @@ CStreaming::RequestBigBuildings(eLevelName level)
 		        (b != pIslandLODbeachEntity)) ||
 		       (b->m_level == level))
 #else
-		   && b->m_level == level
+		   && (NetGame_RulesActive() ? NetKeepAllIslands(b) : b->m_level == level)
 #endif
 			)
 			if(!b->bStreamBIGBuilding)
@@ -863,7 +874,7 @@ CStreaming::RequestBigBuildings(eLevelName level, const CVector &pos)
 		    && (((FrontEndMenuManager.m_PrefsIslandLoading != CMenuManager::ISLAND_LOADING_LOW) && (b != pIslandLODmainlandEntity) && (b != pIslandLODbeachEntity)
 				) || (b->m_level == level))
 #else
-		   && b->m_level == level
+		   && (NetGame_RulesActive() ? NetKeepAllIslands(b) : b->m_level == level)
 #endif
 		)
 			if(b->bStreamBIGBuilding){
@@ -933,6 +944,10 @@ CStreaming::InstanceLoadedModels(const CVector &pos)
 void
 CStreaming::RequestIslands(eLevelName level)
 {
+	// [NET] all islands load as real geometry in multiplayer, so the LOD
+	// stand-in islands must stay out
+	if(NetGame_RulesActive())
+		return;
 	ISLAND_LOADING_ISNT(HIGH)
 	switch(level){
 	case LEVEL_INDUSTRIAL:
@@ -1156,7 +1171,8 @@ CStreaming::RemoveUnusedBuildings(eLevelName level)
 {
 	for(int i = LEVEL_INDUSTRIAL; i < NUM_LEVELS; i++)
 		if(level != i)
-			RemoveBuildings((eLevelName)i);
+			if(!NetGame_RulesActive()) // [NET] multiplayer keeps every island resident
+				RemoveBuildings((eLevelName)i);
 }
 
 void
@@ -1281,7 +1297,8 @@ CStreaming::RemoveUnusedBigBuildings(eLevelName level)
 	{
 	for(int i = LEVEL_INDUSTRIAL; i < NUM_LEVELS; i++)
 		if(level != i)
-			RemoveBuildings((eLevelName)i);
+			if(!NetGame_RulesActive()) // [NET] multiplayer keeps every island resident
+				RemoveBuildings((eLevelName)i);
 	}
 	RemoveIslandsNotUsed(level);
 }
@@ -1318,6 +1335,16 @@ CStreaming::RemoveIslandsNotUsed(eLevelName level)
 			pIslandLODsubIndEntity = building;
 		else if(building->GetModelIndex() == islandLODsubCom)
 			pIslandLODsubComEntity = building;
+	}
+	// [NET] multiplayer renders every island as real geometry -- drop all
+	// island LOD stand-ins so they can never occlude it
+	if(NetGame_RulesActive()){
+		DeleteIsland(pIslandLODindustEntity);
+		DeleteIsland(pIslandLODcomIndEntity);
+		DeleteIsland(pIslandLODcomSubEntity);
+		DeleteIsland(pIslandLODsubIndEntity);
+		DeleteIsland(pIslandLODsubComEntity);
+		return;
 	}
 #ifdef NO_ISLAND_LOADING
 	if(FrontEndMenuManager.m_PrefsIslandLoading == CMenuManager::ISLAND_LOADING_HIGH) {
@@ -1978,6 +2005,7 @@ CStreaming::LoadBigBuildingsWhenNeeded(void)
 	CTimer::Suspend();
 	CGame::currLevel = CTheZones::m_CurrLevel;
 	ISLAND_LOADING_IS(LOW)
+	if(!NetGame_RulesActive()) // [NET] no island teardown or loading screens in multiplayer
 	{
 		DMAudio.SetEffectsFadeVol(0);
 		CPad::StopPadsShaking();
@@ -1991,7 +2019,8 @@ CStreaming::LoadBigBuildingsWhenNeeded(void)
 	}
 	CReplay::EmptyReplayBuffer();
 	if(CGame::currLevel != LEVEL_GENERIC)
-		LoadSplash(GetLevelSplashScreen(CGame::currLevel));
+		if(!NetGame_RulesActive()) // [NET] no island loading splash in multiplayer
+			LoadSplash(GetLevelSplashScreen(CGame::currLevel));
 
 	ISLAND_LOADING_IS(LOW)
 		CStreaming::RequestBigBuildings(CGame::currLevel, TheCamera.GetPosition());

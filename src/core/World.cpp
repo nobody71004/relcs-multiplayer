@@ -1,4 +1,5 @@
 #include "common.h"
+#include "net/nethooks.h"
 #include "Bike.h"
 #include "Camera.h"
 #include "CarCtrl.h"
@@ -1544,9 +1545,15 @@ void
 CWorld::RemoveEntityInsteadOfProcessingIt(CEntity *ent)
 {
 	if(ent->IsPed()) {
-		if(FindPlayerPed() == ent)
-			Remove(ent);
-		else
+		if(FindPlayerPed() == ent){
+			// multiplayer: the player must never be silently dropped from the
+			// world — that hides the character and freezes the game forever;
+			// clear the deferred-removal flag instead and keep them in the world
+			if(NetGame_RulesActive())
+				ent->bRemoveFromWorld = false;
+			else
+				Remove(ent);
+		}else
 			CPopulation::RemovePed((CPed *)ent);
 	} else {
 		Remove(ent);

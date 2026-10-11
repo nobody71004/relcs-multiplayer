@@ -41,6 +41,7 @@
 #define WITHD3D
 #define WITHDINPUT
 #include "common.h"
+#include "net/nethooks.h"
 #if (defined(_MSC_VER))
 #include <tchar.h>
 #endif /* (defined(_MSC_VER)) */
@@ -2288,7 +2289,9 @@ WinMain(HINSTANCE instance,
 				TheModelViewer();
 			}
 #endif
-			else if( ForegroundApp )
+			// multiplayer: the world must keep running while another window has
+			// focus (server time never stops) — only single-player freezes here
+			else if( ForegroundApp || NetGame_RulesActive() )
 			{
 				switch ( gGameState )
 				{

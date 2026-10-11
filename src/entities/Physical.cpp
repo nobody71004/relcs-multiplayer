@@ -250,12 +250,25 @@ CPhysical::RemoveAndAdd(void)
 			CPed* pThisPed = ((CPed*)this);
 			if (pThisPed->bInVehicle && pThisPed->m_pMyVehicle)
 				MoveVehicleToSafety(pThisPed->m_pMyVehicle);
-			else if (GetType() == ENTITY_TYPE_PED) // why?
-				MovePedToSafety(pThisPed);
 			else
-				return;
+				MovePedToSafety(pThisPed);
 		}
-		else
+		// The rescue above is a no-op for mission-created entities (net puppet
+		// vehicles/peds are MISSION_VEHICLE/UNK_CHAR), and even when it does
+		// teleport us the sector indices computed above are stale. Recompute
+		// and re-validate: the recycle loop below must NEVER run with out-of-
+		// world indices — CWorld::GetSector only clamps the upper bound, so a
+		// negative index returns a wild pointer before ms_aSectors and the
+		// InsertNode/RemoveNode writes corrupt unrelated globals (delayed
+		// 0xc0000005 crashes in whatever touches them next).
+		bounds = GetBoundRect();
+		xstart = CWorld::GetSectorIndexX(bounds.left);
+		xend   = CWorld::GetSectorIndexX(bounds.right);
+		xmid   = CWorld::GetSectorIndexX((bounds.left + bounds.right)/2.0f);
+		ystart = CWorld::GetSectorIndexY(bounds.top);
+		yend   = CWorld::GetSectorIndexY(bounds.bottom);
+		ymid   = CWorld::GetSectorIndexY((bounds.top + bounds.bottom)/2.0f);
+		if (xstart < 0 || xstart >= NUMSECTORS_X || ystart < 0 || ystart >= NUMSECTORS_Y)
 			return;
 	}
 

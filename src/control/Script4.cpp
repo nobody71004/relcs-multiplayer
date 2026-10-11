@@ -2,6 +2,7 @@
 
 #include "Script.h"
 #include "ScriptCommands.h"
+#include "net/nethooks.h"
 
 #include "AnimBlendAssociation.h"
 #include "BulletInfo.h"
@@ -916,6 +917,9 @@ int8 CRunningScript::ProcessCommands800To899(int32 command)
 	{
 		wchar* text = CTheScripts::GetTextByKeyFromScript(&m_nIp);
 		CollectParameters(&m_nIp, 8);
+		// [NET] kill frenzies are disabled on multiplayer clients
+		if (NetGame_RulesActive())
+			return 0;
 		CDarkel::StartFrenzy((eWeaponType)GET_INTEGER_PARAM(0), GET_INTEGER_PARAM(1), GET_INTEGER_PARAM(2),
 			GET_INTEGER_PARAM(3), text, GET_INTEGER_PARAM(4), GET_INTEGER_PARAM(5),
 			GET_INTEGER_PARAM(6), GET_INTEGER_PARAM(7) != 0, true);
