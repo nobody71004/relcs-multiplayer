@@ -308,6 +308,19 @@ static CVehicle* CreatePuppetVehicle(uint16_t modelId, float x, float y, float z
 	SyncPuppetToRw(veh);
 	if(!veh->m_rwObject)
 		fprintf(stderr, "[NET] WARNING: net vehicle model %d has no rw object\n", (int)modelId);
+	else{
+		// render state of the new puppet: a model that is "created" but never
+		// drawn shows renderOn=0 (atomics hidden), trisOn=0 (no geometry) or
+		// nilRaster>0 (texture missing) here
+		VehDiagStats ds;
+		RpClumpForAllAtomics((RpClump*)veh->m_rwObject, VehDiagAtomicCB, &ds);
+		CVector pp = veh->GetPosition();
+		CVector me = FindPlayerCoors();
+		fprintf(stderr, "[NET] puppet diag model=%d atomics=%d renderOn=%d tris=%d trisOn=%d mats=%d textured=%d nilRaster=%d dist=%.1f z=%.2f groundZ=%.2f\n",
+		        (int)modelId, ds.atomics, ds.renderOn, ds.tris, ds.trisOn, ds.mats, ds.textured, ds.nilRaster,
+		        std::sqrt((pp.x - me.x) * (pp.x - me.x) + (pp.y - me.y) * (pp.y - me.y) + (pp.z - me.z) * (pp.z - me.z)),
+		        pp.z, CWorld::FindGroundZForCoord(pp.x, pp.y));
+	}
 	fprintf(stderr, "[NET] net vehicle model=%d created at (%.1f, %.1f, %.1f)\n",
 	        (int)modelId, x, y, z);
 	fflush(stderr);
@@ -811,6 +824,7 @@ static void SendRconFmt(const char* fmt, ...)
 // door-chime (implemented below, near NetGame_Frame)
 static void PlayDoorChime(void);
 static void StopDoorChime(void);
+static void PlayRemoteDoorChime(float x, float y, float z);
 static bool s_doorChime = true;
 
 static void ConsoleExec(const char* line)
@@ -1792,6 +1806,23 @@ static void StopDoorChime(void)
 	s_chimeRinging = false;
 }
 
+// a neighbour opened or left a car: one chime, only when they are close enough
+// to hear it. winmm PlaySound has no panning, so this is a 2D one-shot; the
+// range gate stands in for distance falloff. It never interrupts a local chime
+// that is already ringing, and it respects the local `doorchime off` setting.
+static const float REMOTE_CHIME_RANGE = 60.0f;
+static void PlayRemoteDoorChime(float x, float y, float z)
+{
+	if(!s_doorChime || s_chimeRinging) return;
+	if(!FindPlayerPed()) return;
+	CVector p = FindPlayerCoors();
+	float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+	if(dx * dx + dy * dy + dz * dz > REMOTE_CHIME_RANGE * REMOTE_CHIME_RANGE) return;
+	char full[MAX_PATH];
+	DoorChimeFile(full);
+	PlaySoundA(full, NULL, SND_ASYNC | SND_FILENAME | SND_NODEFAULT);
+}
+
 static void NetGame_DoorChimeTick(void)
 {
 	CPlayerPed* me = FindPlayerPed();
@@ -2056,6 +2087,8 @@ void NetGame_Frame(void)
 					fprintf(stderr, "[NET] remote player %d seated in veh %d seat %d\n",
 					        (int)ev.id, (int)ev.arg, (int)ev.kind);
 					fflush(stderr);
+					CVector vp = veh->GetPosition();
+					PlayRemoteDoorChime(vp.x, vp.y, vp.z);
 				}else
 					s_pendingSeat[ev.id] = std::make_pair(ev.arg, ev.kind);
 			}
@@ -2067,8 +2100,14 @@ void NetGame_Frame(void)
 				s_pendingVeh = nil;
 			}else{
 				auto it = s_remotes.find(ev.id);
-				if(it != s_remotes.end() && it->second.ped)
+				if(it != s_remotes.end() && it->second.ped){
+					CVehicle* leaving = it->second.ped->m_pMyVehicle;
+					if(leaving){
+						CVector lp = leaving->GetPosition();
+						PlayRemoteDoorChime(lp.x, lp.y, lp.z);
+					}
 					UnseatNetPed(it->second.ped);
+				}
 				s_pendingSeat.erase(ev.id);
 			}
 			break;
