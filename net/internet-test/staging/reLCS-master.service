@@ -1,0 +1,17 @@
+[Unit]
+Description=reLCS master server (server list, UDP 7800)
+After=network-online.target
+
+[Service]
+Type=simple
+User=relcs
+WorkingDirectory=/opt/relcs-staging
+ExecStart=/opt/relcs-staging/reLCS-master -port 7800
+Restart=always
+RestartSec=3
+# stdout carries "[master] announce ..." lines — keep them journal-visible
+StandardOutput=append:/opt/relcs-staging/master.log
+StandardError=append:/opt/relcs-staging/master.log
+
+[Install]
+WantedBy=multi-user.target

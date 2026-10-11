@@ -1,0 +1,20 @@
+[Unit]
+Description=reLCS game server (UDP 7777, announces to master)
+After=network-online.target reLCS-master.service
+Wants=reLCS-master.service
+
+[Service]
+Type=simple
+User=relcs
+WorkingDirectory=/opt/relcs-staging
+# -config carries announce/master/master_port/lan_discover/rcon_password.
+# NOTE: do not use "-announce <addr>" on the CLI — announce is a BOOL key and
+# the address would be silently ignored (see RUNBOOK.md section 4).
+ExecStart=/opt/relcs-staging/reLCS-server -config server.cfg
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/relcs-staging/server.log
+StandardError=append:/opt/relcs-staging/server.log
+
+[Install]
+WantedBy=multi-user.target
