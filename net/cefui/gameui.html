@@ -45,9 +45,24 @@
   .log .adm  { color: var(--gold); }
   .log .me   { color: var(--blue); }
 
-  /* chat: center screen */
-  #chat { left: 50%; top: 50%; transform: translate(-50%, -50%); width: 560px; }
-  #chatLog { height: 210px; }
+  /* chat feed: always-on overlay, mid-right side corner (visible to everyone) */
+  #chatFeed {
+    position: absolute; right: 1.4%; top: 50%; transform: translateY(-50%);
+    width: 360px; display: flex; flex-direction: column; gap: 4px;
+    pointer-events: none;
+  }
+  #chatFeed .line {
+    background: rgba(10, 13, 18, 0.55); border-radius: 8px; padding: 5px 10px;
+    font-size: 13.5px; line-height: 1.4; text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+    word-wrap: break-word;
+  }
+  #chatFeed .sys { color: var(--green); }
+  #chatFeed .adm { color: var(--gold); }
+  #chatFeed .me  { color: var(--blue); }
+
+  /* chat input: opens in the same side corner */
+  #chat { right: 1.4%; top: 50%; transform: translateY(-50%); width: 380px; }
+  #chatLog { height: 180px; }
   input {
     width: 100%; margin-top: 10px; padding: 9px 12px; font-size: 14px;
     background: rgba(255,255,255,0.07); color: var(--text);
@@ -99,6 +114,19 @@
   }
   #welcome p { margin-top: 8px; font-size: 16px; letter-spacing: 5px; color: var(--text); opacity: .85; }
 
+  /* server broadcast / round banner (large center-screen announcement) */
+  #banner {
+    position: absolute; top: 22%; left: 50%; transform: translate(-50%, -50%);
+    text-align: center; pointer-events: none; opacity: 0;
+    transition: opacity .5s ease; width: 94%;
+  }
+  #banner.show { opacity: 1; }
+  #banner .btext {
+    display: inline-block; font-size: 52px; font-weight: 800; letter-spacing: 2px;
+    color: #fff; background: rgba(190, 30, 30, 0.82); padding: 14px 36px;
+    border-radius: 12px; text-shadow: 0 3px 18px rgba(0,0,0,0.65);
+  }
+
   .hint {
     position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
     color: var(--dim); font-size: 12px; letter-spacing: 0.6px;
@@ -113,6 +141,8 @@
     <span class="stat">fps: <b id="fps">30</b></span>
     <span class="badge" id="mode"></span>
   </div>
+
+  <div id="chatFeed"></div>
 
   <div class="panel" id="chat">
     <h2>Chat — Enter to send, Esc to close</h2>
@@ -166,12 +196,49 @@
       </div>
       <button class="abtn" id="admGod">Godmode: OFF</button>
       <button class="abtn" id="admNoclip">NoClip: OFF</button>
+      <div>
+        <label>NoClip speed</label>
+        <div class="inline">
+          <select id="admNcSpeed">
+            <option value="5">5 m/s — creep</option>
+            <option value="20" selected>20 m/s — normal</option>
+            <option value="60">60 m/s — fast</option>
+            <option value="150">150 m/s — very fast</option>
+            <option value="400">400 m/s — insane</option>
+          </select>
+        </div>
+      </div>
       <button class="abtn" id="admProp">Spawn prop here</button>
       <div>
         <label>Spawn NPC bot</label>
         <div class="inline">
           <input id="admBotName" maxlength="16" placeholder="NPC name">
           <button class="abtn" id="admBot">Spawn</button>
+        </div>
+      </div>
+      <div class="full">
+        <label>World time — now <b id="admClock">--:--</b></label>
+        <div class="inline">
+          <input id="admHour" type="number" min="0" max="23" value="12" style="width:62px">
+          <input id="admMinute" type="number" min="0" max="59" value="0" style="width:62px">
+          <button class="abtn" id="admSetTime">Set time</button>
+        </div>
+        <div class="inline" style="margin-top:6px">
+          <button class="abtn" data-t="8 0">Morning</button>
+          <button class="abtn" data-t="12 0">Noon</button>
+          <button class="abtn" data-t="19 30">Sunset</button>
+          <button class="abtn" data-t="23 0">Night</button>
+        </div>
+      </div>
+      <div class="full">
+        <label>Weather</label>
+        <div class="inline">
+          <select id="admWeather">
+            <option value="0">Sunny</option><option value="1">Cloudy</option>
+            <option value="2">Rainy</option><option value="3">Foggy</option>
+            <option value="4">Extra sunny</option><option value="5">Hurricane</option>
+          </select>
+          <button class="abtn" id="admSetWeather">Set weather</button>
         </div>
       </div>
       <div class="full">
@@ -183,6 +250,22 @@
           </select>
         </div>
       </div>
+      <div class="full">
+        <label>Resources (mods) — <b id="resCount">0</b> loaded</label>
+        <div id="resList" style="max-height:150px;overflow:auto;margin:4px 0"></div>
+        <div class="inline">
+          <input id="resName" maxlength="24" placeholder="folder name" style="width:120px">
+          <button class="abtn" id="resEnable">Enable</button>
+          <button class="abtn" id="resDisable">Disable</button>
+          <button class="abtn" id="resRun">Run</button>
+          <button class="abtn" id="resReload">Reload all</button>
+        </div>
+        <div class="inline" style="margin-top:6px">
+          <input id="resPath" maxlength="120" placeholder="server path to pack (install)" style="width:220px">
+          <button class="abtn" id="resInstall">Install</button>
+          <button class="abtn" id="resUninstall">Uninstall</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -190,6 +273,8 @@
     <h1>WELCOME TO LIBERTY CITY STORIES</h1>
     <p>ONLINE</p>
   </div>
+
+  <div id="banner"><div class="btext" id="bannerText"></div></div>
 
   <div class="hint" id="hint"></div>
 
@@ -236,16 +321,29 @@ function renderTop() {
   $("mode").textContent = state.mode || "";
 }
 
+function chatClass(l) {
+  if (l.startsWith("[SERVER]") || l.startsWith("[SYSTEM]")) return "sys";
+  if (l.startsWith("[ADMIN]")) return "adm";
+  if (l.startsWith("You:")) return "me";
+  return "";
+}
+
 function renderChat() {
   const el = $("chatLog");
-  el.innerHTML = state.chat.map(l => {
-    let cls = "";
-    if (l.startsWith("[SERVER]") || l.startsWith("[SYSTEM]")) cls = "sys";
-    else if (l.startsWith("[ADMIN]")) cls = "adm";
-    else if (l.startsWith("You:")) cls = "me";
-    return `<div class="${cls}">${escapeHtml(l)}</div>`;
-  }).join("");
+  el.innerHTML = state.chat.map(l =>
+    `<div class="${chatClass(l)}">${escapeHtml(l)}</div>`).join("");
   el.scrollTop = el.scrollHeight;
+}
+
+// always-on chat feed in the side corner — every player sees messages here
+// without opening any panel (hidden only while the chat panel itself is up)
+function renderChatFeed() {
+  const feed = $("chatFeed");
+  feed.style.display = openPanel === "chat" ? "none" : "flex";
+  if (openPanel === "chat") return;
+  const lines = (state.chat || []).slice(-8);
+  feed.innerHTML = lines.map(l =>
+    `<div class="line ${chatClass(l)}">${escapeHtml(l)}</div>`).join("");
 }
 
 function renderCon() {
@@ -280,6 +378,30 @@ function renderWelcome() {
   $("welcome").classList.toggle("show", !!state.welcome);
 }
 
+function renderWorld() {
+  $("admClock").textContent = state.wtime || "--:--";
+}
+
+function renderResources() {
+  const list = state.resources || [];
+  $("resCount").textContent = list.length;
+  $("resList").innerHTML = list.length ? list.map((r) => {
+    const badge = !r.ok ? "ERR" : r.on ? "ON" : "off";
+    const style = !r.ok ? "color:#f66" : r.on ? "color:#8f8" : "color:#999";
+    return `<div style="${style};font:12px monospace;cursor:pointer" ` +
+      `data-res="${escapeHtml(r.name)}" title="click to fill name">` +
+      `[${badge}] ${escapeHtml(r.name)} v${escapeHtml(r.ver || "-")} (${r.type})</div>`;
+  }).join("") : `<div style="color:#999;font:12px monospace">no resources — drop packs in the server's resources/ folder or install one below</div>`;
+  $("resList").querySelectorAll("[data-res]").forEach((el) =>
+    el.addEventListener("click", () => { $("resName").value = el.dataset.res; }));
+}
+
+function renderBanner() {
+  const b = state.banner || "";
+  $("bannerText").textContent = b;
+  $("banner").classList.toggle("show", !!b);
+}
+
 function con(cmd) { send("console?cmd=" + encodeURIComponent(cmd)); }
 
 $("admSend").addEventListener("click", () => {
@@ -296,6 +418,37 @@ $("admProp").addEventListener("click", () => con("spawnprop"));
 $("admBot").addEventListener("click", () =>
   con("spawnbot " + ($("admBotName").value.trim() || "NPC") + " roam"));
 $("admFps").addEventListener("change", () => con("fps " + $("admFps").value));
+$("admSetTime").addEventListener("click", () => {
+  const h = Math.min(23, Math.max(0, +$("admHour").value || 0));
+  const m = Math.min(59, Math.max(0, +$("admMinute").value || 0));
+  con("settime " + h + " " + m);
+});
+document.querySelectorAll("[data-t]").forEach((b) =>
+  b.addEventListener("click", () => con("settime " + b.dataset.t)));
+$("admSetWeather").addEventListener("click", () =>
+  con("setweather " + $("admWeather").value));
+$("admNcSpeed").addEventListener("change", () => con("nocspeed " + $("admNcSpeed").value));
+$("resEnable").addEventListener("click", () => {
+  const v = $("resName").value.trim();
+  if (v) con("res enable " + v);
+});
+$("resDisable").addEventListener("click", () => {
+  const v = $("resName").value.trim();
+  if (v) con("res disable " + v);
+});
+$("resRun").addEventListener("click", () => {
+  const v = $("resName").value.trim();
+  if (v) con("res run " + v);
+});
+$("resReload").addEventListener("click", () => con("res reload"));
+$("resInstall").addEventListener("click", () => {
+  const v = $("resPath").value.trim();
+  if (v) con("res install " + v);
+});
+$("resUninstall").addEventListener("click", () => {
+  const v = $("resName").value.trim();
+  if (v) con("res uninstall " + v);
+});
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -306,6 +459,10 @@ window.GameUI.push = function (json) {
   try { Object.assign(state, JSON.parse(json)); } catch (e) {}
   renderTop();
   renderWelcome();
+  renderBanner();
+  renderWorld();
+  renderResources();
+  renderChatFeed();
   if (openPanel === "chat") renderChat();
   if (openPanel === "console") renderCon();
   if (openPanel === "inventory") renderInv();

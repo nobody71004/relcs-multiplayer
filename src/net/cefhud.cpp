@@ -193,10 +193,29 @@ void CefHud_Mouse(int type, int x, int y, int btn, int mods)
 	if(s_ready && p_mouse) p_mouse(type, x, y, btn, mods);
 }
 
+// Destroy the overlay texture while RenderWare is still alive. The raster
+// behind s_texture lives in RW's memory pool: if ShutdownRenderWare() runs
+// first (rsRWTERMINATE precedes rsTERMINATE), the pool release already freed
+// it and a later RwTextureDestroy is a heap double-free. Called from
+// Terminate3D() before CGame::ShutdownRenderWare().
+static void CefHud_DestroyTexture(void)
+{
+	if(s_texture){ RwTextureDestroy(s_texture); s_texture = nil; s_raster = nil; }
+}
+
+void CefHud_ShutdownRW(void)
+{
+	CefHud_DestroyTexture();
+}
+
 void CefHud_Shutdown(void)
 {
+	// idempotent: NetGame_Shutdown may run after Terinate3D already released
+	// the RW-side texture, and a crash handler may call us a second time
+	if(!s_dll && !s_texture) return;
 	if(s_ready && p_shutdown) p_shutdown();
-	if(s_texture){ RwTextureDestroy(s_texture); s_texture = nil; s_raster = nil; }
+	CefHud_DestroyTexture();
 	if(s_dll){ FreeLibrary(s_dll); s_dll = nullptr; }
 	s_ready = false;
+	s_focused = false;
 }

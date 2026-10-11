@@ -37,6 +37,7 @@
     cursor: pointer; transition: all .12s ease;
   }
   .btn:hover { border-color: var(--gold); color: var(--gold); }
+  .btn.small { padding: 5px 11px; font-size: 12px; border-radius: 7px; }
   .btn.primary {
     background: linear-gradient(135deg, var(--gold), #d9a521); color: #141414;
     border: none; padding: 10px 26px; font-size: 14.5px;
@@ -47,7 +48,7 @@
   main { flex: 1; display: flex; gap: 18px; padding: 0 26px 18px; min-height: 0; }
 
   /* ---- left: profile + settings ---- */
-  .side { width: 290px; display: flex; flex-direction: column; gap: 14px; }
+  .side { width: 290px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; }
   .card {
     background: var(--panel); border: 1px solid var(--edge); border-radius: 14px;
     padding: 16px;
@@ -66,10 +67,14 @@
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .tip { font-size: 11px; color: var(--dim); margin-top: 6px; }
+  .state { font-size: 11.5px; margin-top: 8px; line-height: 1.45; }
+  .state.ok { color: var(--green); }
+  .state.warn { color: var(--gold); }
+  .state.err { color: var(--red); }
 
   /* ---- center: browser ---- */
   .browser { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; align-items: center; }
   .tab {
     padding: 8px 20px; border-radius: 9px 9px 0 0; cursor: pointer;
     color: var(--dim); font-weight: 600; font-size: 13px;
@@ -79,27 +84,55 @@
     color: var(--gold); background: var(--panel);
     border-color: var(--edge);
   }
+  .tabs .spacer { flex: 1; }
   .list {
     flex: 1; background: var(--panel); border: 1px solid var(--edge);
-    border-radius: 0 12px 12px 12px; overflow-y: auto;
+    border-radius: 0 12px 12px 12px; overflow-y: auto; position: relative;
   }
   table { width: 100%; border-collapse: collapse; }
   th {
     position: sticky; top: 0; background: var(--panel2); text-align: left;
     font-size: 10.5px; letter-spacing: 1.6px; text-transform: uppercase;
-    color: var(--dim); padding: 11px 14px;
+    color: var(--dim); padding: 11px 14px; z-index: 1;
   }
   td { padding: 11px 14px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 13px; }
   tr.server { cursor: pointer; }
   tr.server:hover { background: rgba(240, 193, 75, 0.06); }
   tr.server.sel { background: rgba(240, 193, 75, 0.13); }
+  tr.server.offline td { color: var(--dim); }
   td.name { font-weight: 600; }
   td.addr { color: var(--dim); font-family: Consolas, monospace; font-size: 12px; }
   .pill {
     display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 11px;
     background: rgba(88, 166, 255, 0.15); color: var(--blue);
   }
+  .pill.warn { background: rgba(240, 193, 75, 0.15); color: var(--gold); }
+  .pill.err { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+  .pill.off { background: rgba(255,255,255,0.08); color: var(--dim); }
   .empty { padding: 40px; text-align: center; color: var(--dim); }
+  .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+              background: var(--green); margin-right: 6px; vertical-align: middle; }
+  .live-dot.dead { background: var(--red); }
+
+  /* ---- server tooltip ---- */
+  #tooltip {
+    position: fixed; z-index: 40; display: none; width: 268px;
+    background: rgba(10, 13, 19, 0.97); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 12px 13px; pointer-events: none;
+    box-shadow: 0 14px 40px rgba(0,0,0,0.55);
+  }
+  #tooltip .t-name { font-weight: 700; font-size: 13.5px; margin-bottom: 3px; }
+  #tooltip .t-addr { font-family: Consolas, monospace; font-size: 11px; color: var(--dim); }
+  #tooltip .t-grid {
+    display: grid; grid-template-columns: auto 1fr; gap: 3px 10px;
+    font-size: 11.5px; margin: 9px 0 7px;
+  }
+  #tooltip .t-grid .k { color: var(--dim); }
+  #tooltip canvas { width: 100%; height: 46px; display: block; }
+  #tooltip .t-foot { font-size: 10.5px; color: var(--dim); margin-top: 6px; }
+  #tooltip .t-live { font-size: 11px; }
+  #tooltip .t-live.ok { color: var(--green); }
+  #tooltip .t-live.err { color: var(--red); }
 
   footer {
     display: flex; align-items: center; gap: 14px;
@@ -109,6 +142,7 @@
   #status { flex: 1; }
   #status.ok { color: var(--green); }
   #status.err { color: var(--red); }
+  #status.warn { color: var(--gold); }
 </style>
 </head>
 <body>
@@ -134,7 +168,8 @@
         </div>
         <label>Saved usernames</label>
         <select id="profiles"></select>
-        <div class="tip">3–20 characters: letters, digits and underscore. Saved to usernames.ini.</div>
+        <div class="tip">3–20 characters: letters, digits and underscore. Saved to usernames.ini.
+          Your <b>favorites</b> are stored on the master server under this name.</div>
       </div>
 
       <div class="card">
@@ -149,11 +184,15 @@
 
       <div class="card">
         <h2>Settings</h2>
-        <label>Game executable</label>
-        <input id="game" autocomplete="off">
+        <label>Game executable <span id="gameHint" class="tip" style="display:inline"></span></label>
+        <input id="game" autocomplete="off" placeholder="auto-detected">
+        <div class="row" style="margin-top:8px">
+          <button class="btn small" id="btnDetect" style="flex:0 0 auto">🔍 Auto-detect</button>
+        </div>
+        <div class="state" id="gameState">detecting…</div>
         <label>Master server</label>
         <input id="master" autocomplete="off">
-        <label>Server RCON password (enables admin panel: broadcast, give, …)</label>
+        <label>Server RCON password (enables admin panel: broadcast, give, spawncar, …)</label>
         <input id="rcon" type="password" placeholder="optional" autocomplete="off">
         <div class="row" style="margin-top:10px">
           <button class="btn" id="btnSaveCfg">Save Settings</button>
@@ -167,14 +206,17 @@
         <div class="tab active" data-tab="internet">INTERNET</div>
         <div class="tab" data-tab="lan">LAN</div>
         <div class="tab" data-tab="favorites">FAVORITES</div>
+        <div class="spacer"></div>
+        <button class="btn small" id="btnPingAll" title="Probe every listed server (map, mode, ping)">📶 Ping all</button>
       </div>
       <div class="list">
         <table>
           <thead>
-            <tr><th style="width:34%">Server</th><th>Players</th><th>Ping</th><th>Mode</th><th>Address</th></tr>
+            <tr><th style="width:26%">Server</th><th style="width:15%">Map</th><th>Players</th>
+                <th style="width:12%">Ping</th><th style="width:12%">Mode</th><th>Address</th></tr>
           </thead>
           <tbody id="rows">
-            <tr><td colspan="5" class="empty">Press ⟳ Refresh to find servers</td></tr>
+            <tr><td colspan="6" class="empty">Press ⟳ Refresh to find servers</td></tr>
           </tbody>
         </table>
       </div>
@@ -185,6 +227,20 @@
     <div id="status">ready</div>
     <div id="build">LCS Online Launcher · CEF</div>
   </footer>
+
+  <div id="tooltip">
+    <div class="t-name" id="tName">—</div>
+    <div class="t-addr" id="tAddr">—</div>
+    <div class="t-grid">
+      <div class="k">Map</div><div id="tMap">—</div>
+      <div class="k">Mode</div><div id="tMode">—</div>
+      <div class="k">Players</div><div id="tPlayers">—</div>
+      <div class="k">Ping</div><div id="tPing">—</div>
+    </div>
+    <canvas id="tGraph" width="268" height="46"></canvas>
+    <div class="t-live" id="tLive">sampling…</div>
+    <div class="t-foot" id="tFoot">double-click a row to join</div>
+  </div>
 
 <script>
 "use strict";
@@ -198,6 +254,12 @@ function jenc(s) { return encodeURIComponent(s); }
 let servers = [];
 let selected = -1;
 let tab = "internet";
+let lastSource = "";
+const samples = {};      // address -> [pingMs]  (feeds the tooltip graph)
+const live = {};         // address -> latest probed row
+let hoverAddr = null;
+let probeTimer = null;
+let expectedVersion = 0;
 
 function setStatus(text, cls) {
   const el = $("status");
@@ -205,39 +267,180 @@ function setStatus(text, cls) {
   el.className = cls || "";
 }
 
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function pingCellPing(addr) {
+  const r = live[addr];
+  return r && typeof r.pingMs === "number" ? r.pingMs : null;
+}
+
 function renderRows() {
   const tb = $("rows");
   if (!servers.length) {
-    tb.innerHTML = `<tr><td colspan="5" class="empty">No servers found — check your network or add a favorite</td></tr>`;
+    const msg = tab === "favorites"
+      ? "No favorites yet — select a server and press ★ Add Favorite (stored on the master server)"
+      : "No servers found — check your network or add a favorite";
+    tb.innerHTML = `<tr><td colspan="6" class="empty">${msg}</td></tr>`;
     selected = -1;
     return;
   }
-  tb.innerHTML = servers.map((s, i) => `
-    <tr class="server ${i === selected ? "sel" : ""}" data-i="${i}">
-      <td class="name">${esc(s.hostname)}</td>
-      <td><span class="pill">${s.players}/${s.maxPlayers}</span></td>
-      <td>${s.pingMs || "—"} ms</td>
-      <td>${esc(s.gameMode)}</td>
+  tb.innerHTML = servers.map((s, i) => {
+    const lv = live[s.address] || {};
+    const online = lv.online;
+    const ping = lv.pingMs;
+    const proto = lv.protocolVersion || s.protocolVersion || 0;
+    const stale = proto && expectedVersion && proto !== expectedVersion;
+    const pingTxt = (typeof ping === "number" && ping >= 0) ? ping + " ms" : (lv.live === false ? "—" : "…");
+    const players = (lv.players || lv.players === 0) && lv.live ? `${lv.players}/${lv.maxPlayers}` : `${s.players}/${s.maxPlayers}`;
+    const map = lv.map || s.map || "—";
+    const mode = lv.gameMode || s.gameMode || "—";
+    return `
+    <tr class="server ${i === selected ? "sel" : ""} ${lv.online === false ? "offline" : ""}" data-i="${i}" data-addr="${esc(s.address)}">
+      <td class="name">${online === true ? '<span class="live-dot"></span>' : online === false ? '<span class="live-dot dead"></span>' : ''}${esc(s.hostname)}
+        ${stale ? '<span class="pill warn" title="protocol mismatch">stale</span>' : ''}
+        ${tab === "favorites" ? `<button class="btn small" data-remove="${esc(s.address)}" title="remove from your favorites">✕</button>` : ''}</td>
+      <td>${esc(map)}</td>
+      <td><span class="pill">${players}</span></td>
+      <td>${pingTxt}</td>
+      <td>${esc(mode)}</td>
       <td class="addr">${esc(s.address)}</td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
   tb.querySelectorAll("tr.server").forEach(tr => {
+    const addr = tr.dataset.addr;
     tr.addEventListener("click", () => {
       selected = +tr.dataset.i;
       renderRows();
-      setStatus("selected: " + servers[selected].address);
+      setStatus("selected: " + addr);
     });
     tr.addEventListener("dblclick", () => joinSelected());
+    tr.addEventListener("mouseenter", () => startHover(addr));
+    tr.addEventListener("mouseleave", () => stopHover());
   });
-}
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  tb.querySelectorAll("button[data-remove]").forEach(b => {
+    b.addEventListener("click", e => {
+      e.stopPropagation();
+      const addr = b.dataset.remove;
+      setStatus("removing " + addr + " …");
+      send("favdel?address=" + jenc(addr));
+    });
+  });
 }
 
 function renderProfiles(list) {
   const sel = $("profiles");
   sel.innerHTML = (list || []).map(u => `<option>${esc(u)}</option>`).join("");
 }
+
+// ---- server info tooltip -------------------------------------------------
+function startHover(addr) {
+  hoverAddr = addr;
+  probeTimer = setInterval(() => send("probe?address=" + jenc(addr)), 2000);
+  updateTooltip(addr);
+  $("tooltip").style.display = "block";
+  send("probe?address=" + jenc(addr));
+}
+
+function stopHover() {
+  hoverAddr = null;
+  if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+  $("tooltip").style.display = "none";
+}
+
+function updateTooltip(addr) {
+  const el = $("tooltip");
+  el.style.display = "block";
+  const row = servers.find(s => s.address === addr) || { hostname: addr, address: addr };
+  const lv = live[addr];
+  $("tName").textContent = (lv && lv.hostname) || row.hostname;
+  $("tAddr").textContent = addr;
+  $("tMap").textContent = (lv && lv.map) || row.map || "—";
+  $("tMode").textContent = (lv && lv.gameMode) || row.gameMode || "—";
+  const players = (lv && lv.live) ? `${lv.players}/${lv.maxPlayers}` : `${row.players}/${row.maxPlayers}`;
+  $("tPlayers").textContent = players;
+  const hist = samples[addr] || [];
+  const pings = hist.filter(v => typeof v === "number" && v >= 0);
+  if (pings.length) {
+    const min = Math.min(...pings), max = Math.max(...pings), avg = Math.round(pings.reduce((a,b)=>a+b,0)/pings.length);
+    $("tPing").textContent = `${pings[pings.length-1]} ms  (min ${min} / avg ${avg} / max ${max})`;
+  } else {
+    $("tPing").textContent = lv === undefined ? "sampling…" : "no reply";
+  }
+  if (!lv) {
+    $("tLive").textContent = "probing…";
+    $("tLive").className = "t-live";
+  } else if (lv.online) {
+    $("tLive").textContent = "live probe ok";
+    $("tLive").className = "t-live ok";
+  } else {
+    $("tLive").textContent = "unreachable" + (lv.error ? ": " + lv.error : "");
+    $("tLive").className = "t-live err";
+  }
+  const proto = lv && lv.protocolVersion ? lv.protocolVersion : row.protocolVersion;
+  $("tFoot").textContent = proto && expectedVersion
+    ? (proto === expectedVersion ? `protocol v${proto} · double-click to join`
+                                 : `protocol v${proto}, launcher expects v${expectedVersion} — this server needs an update`)
+    : "double-click a row to join";
+  drawGraph(addr);
+}
+
+function drawGraph(addr) {
+  const c = $("tGraph");
+  const ctx = c.getContext("2d");
+  const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "rgba(255,255,255,0.04)";
+  ctx.fillRect(0, 0, w, h);
+  const hist = (samples[addr] || []).filter(v => typeof v === "number" && v >= 0);
+  if (hist.length < 1) return;
+  const max = Math.max(40, ...hist) * 1.1;
+  const step = hist.length > 1 ? w / (hist.length - 1) : w;
+  // grid
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 3; i++) {
+    const y = Math.round((h / 3) * i) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  // area + line
+  const last = hist[hist.length - 1];
+  const color = last < 80 ? "#56d364" : last < 160 ? "#f0c14b" : "#f85149";
+  ctx.beginPath();
+  hist.forEach((v, i) => {
+    const x = i * step;
+    const y = h - Math.min(h - 2, (v / max) * h);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.lineTo((hist.length - 1) * step, h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.fillStyle = color + "30";
+  ctx.fill();
+  // last sample marker
+  const lx = (hist.length - 1) * step, ly = h - Math.min(h - 2, (last / max) * h);
+  ctx.beginPath(); ctx.arc(lx, ly, 2.6, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+  // labels
+  ctx.fillStyle = "rgba(139,148,163,0.9)";
+  ctx.font = "9px Segoe UI, sans-serif";
+  ctx.fillText(Math.round(max) + " ms", 3, 10);
+  ctx.fillText(hist.length + " sample" + (hist.length === 1 ? "" : "s"), 3, h - 3);
+}
+
+document.addEventListener("mousemove", e => {
+  if (!hoverAddr) return;
+  const el = $("tooltip");
+  const r = el.getBoundingClientRect();
+  let x = e.clientX + 16, y = e.clientY + 12;
+  if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 16;
+  if (y + r.height > window.innerHeight - 8) y = Math.max(8, window.innerHeight - r.height - 8);
+  el.style.left = x + "px";
+  el.style.top = y + "px";
+});
 
 // ---- host replies ---------------------------------------------------------
 window.onCefReply = function (json) {
@@ -249,16 +452,82 @@ window.onCefReply = function (json) {
       $("game").value = msg.game || "";
       $("master").value = msg.master || "";
       $("rcon").value = msg.rcon || "";
+      expectedVersion = msg.version || 0;
       renderProfiles(msg.profiles);
-      setStatus("ready — signed in as " + (msg.nick || "Player"));
+      showGameState(msg);
+      setStatus("ready — signed in as " + (msg.nick || "Player") + " · protocol v" + (msg.version || "?"));
       refresh();
       break;
-    case "servers":
+    case "game":
+      if (msg.ok) $("game").value = msg.path;
+      showGameState(msg);
+      setStatus(msg.ok ? "game detected (" + (msg.how || "auto") + ")" : "game not found: " + (msg.error || ""),
+                msg.ok ? "ok" : "err");
+      break;
+    case "servers": {
       servers = msg.rows || [];
       selected = servers.length ? 0 : -1;
+      lastSource = msg.source || "";
       renderRows();
-      setStatus(`${servers.length} server(s) from ${msg.source}`, "ok");
+      const note = msg.note ? " · " + msg.note : "";
+      setStatus(`${servers.length} server(s) from ${msg.source}${note}` +
+                (tab === "favorites" ? "" : " — hover a row for map / mode / ping"),
+                msg.note ? "warn" : "ok");
+      // live-sample the listed servers so the Map/Ping columns fill in
+      if (servers.length) send("pingall");
       break;
+    }
+    case "ping": {
+      const row = msg.row || {};
+      if (row.address) {
+        live[row.address] = row;
+        if (msg.ok && typeof row.pingMs === "number" && row.pingMs >= 0) {
+          const h = samples[row.address] || (samples[row.address] = []);
+          h.push(row.pingMs);
+          if (h.length > 40) h.shift();
+        }
+        // fold live data back into the row so columns show it
+        const idx = servers.findIndex(s => s.address === row.address);
+        if (idx >= 0) servers[idx] = Object.assign({}, servers[idx], {
+          map: row.map || servers[idx].map, gameMode: row.gameMode || servers[idx].gameMode,
+          players: row.live ? row.players : servers[idx].players,
+          maxPlayers: row.live ? row.maxPlayers : servers[idx].maxPlayers,
+          protocolVersion: row.protocolVersion || servers[idx].protocolVersion,
+        });
+      }
+      renderRows();
+      if (hoverAddr) updateTooltip(hoverAddr);
+      break;
+    }
+    case "pingdone":
+      setStatus(`${msg.online}/${msg.probed} server(s) answered the probe`, msg.online ? "ok" : "warn");
+      break;
+    case "info": {
+      const row = msg.row || {};
+      if (row.address) {
+        live[row.address] = Object.assign({ online: !!msg.ok, error: msg.error || "" }, row);
+        if (msg.ok && typeof row.pingMs === "number" && row.pingMs >= 0) {
+          const h = samples[row.address] || (samples[row.address] = []);
+          h.push(row.pingMs);
+          if (h.length > 40) h.shift();
+        }
+      }
+      if (hoverAddr === msg.address) updateTooltip(msg.address);
+      renderRows();
+      break;
+    }
+    case "fav": {
+      if (msg.rows) {
+        servers = msg.rows;
+        renderRows();
+      }
+      setStatus(msg.ok
+        ? (msg.add ? "favorite saved on the master server" : "favorite removed")
+        : "favorite failed: " + (msg.error || "unknown error"),
+        msg.ok ? "ok" : "warn");
+      refresh();
+      break;
+    }
     case "join":
       setStatus(msg.ok ? "launched: " + msg.address : "join failed: " + (msg.error || ""),
                 msg.ok ? "ok" : "err");
@@ -272,13 +541,29 @@ window.onCefReply = function (json) {
       setStatus("settings saved", "ok");
       break;
     case "addfav":
-      setStatus(msg.ok ? "favorite saved" : "select a server first", msg.ok ? "ok" : "err");
+      setStatus(msg.ok ? "favorite saved (local cache)" : "select a server first", msg.ok ? "ok" : "err");
       break;
     case "selftest":
       setStatus("selftest: " + msg.detail, msg.ok ? "ok" : "err");
       break;
   }
 };
+
+function showGameState(msg) {
+  const el = $("gameState");
+  const hint = $("gameHint");
+  if (msg.ok) {
+    el.className = "state ok";
+    el.textContent = "detected via " + (msg.how || "auto").toLowerCase()
+      + (msg.data ? " · game data ok" : " · game data missing (models/gta3.img)")
+      + (msg.cef ? " · cefui.dll ok" : " · cefui.dll missing");
+    if (!msg.data || !msg.cef) el.className = "state warn";
+    hint.textContent = "";
+  } else {
+    el.className = "state err";
+    el.textContent = "not found: " + (msg.error || "set the path manually");
+  }
+}
 
 // ---- actions --------------------------------------------------------------
 function refresh() {
@@ -293,14 +578,28 @@ function joinSelected() {
   const s = servers[selected];
   send(`join?address=${jenc(s.address)}&nick=${jenc($("nick").value)}`);
 }
+function favForSelection() {
+  if (selected >= 0 && servers[selected]) return servers[selected];
+  return { address: $("direct").value, hostname: "favorite" };
+}
 
 $("btnRefresh").addEventListener("click", refresh);
 $("btnJoin").addEventListener("click", joinSelected);
 $("btnJoinDirect").addEventListener("click", () =>
   send(`join?address=${jenc($("direct").value)}&nick=${jenc($("nick").value)}`));
 $("btnAddFav").addEventListener("click", () => {
-  const s = selected >= 0 ? servers[selected] : { address: $("direct").value, hostname: "favorite" };
-  send(`addfav?address=${jenc(s.address)}&name=${jenc(s.hostname)}`);
+  const s = favForSelection();
+  send(`favadd?address=${jenc(s.address)}&name=${jenc(s.hostname)}`);
+});
+$("btnDetect").addEventListener("click", () => {
+  $("gameState").className = "state";
+  $("gameState").textContent = "scanning registry, common folders and your home directory…";
+  setStatus("detecting the game install…");
+  send("detectgame");
+});
+$("btnPingAll").addEventListener("click", () => {
+  setStatus("probing every listed server (map, mode, ping)…");
+  send("pingall");
 });
 $("btnSaveUser").addEventListener("click", () =>
   send(`saveuser?nick=${jenc($("nick").value)}`));

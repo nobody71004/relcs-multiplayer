@@ -234,13 +234,24 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			m_myId = wel.playerId;
 			m_hostname = wel.hostname;
 			m_gameMode = wel.gameMode;
-			fprintf(stderr, "[NET] WELCOME id=%d server='%s' mode=%s\n",
-			        (int)m_myId, wel.hostname, wel.gameMode);
+			m_mapName = wel.mapName;
+			m_players = wel.players;
+			m_maxPlayers = wel.maxPlayers;
+			fprintf(stderr, "[NET] WELCOME id=%d server='%s' mode=%s map=%s players=%d/%d\n",
+			        (int)m_myId, wel.hostname, wel.gameMode, wel.mapName,
+			        (int)wel.players, (int)wel.maxPlayers);
 			fflush(stderr);
 			Event e;
 			e.type = EV_CONNECTED;
 			e.id = m_myId;
 			m_events.push_back(e);
+			// initial world clock/weather from the welcome
+			Event w;
+			w.type = EV_WORLD;
+			w.kind = wel.hour;
+			w.arg = wel.minute;
+			w.amount = wel.weather;
+			m_events.push_back(w);
 		}
 		break;
 	}
@@ -450,6 +461,18 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		}
 		break;
 	}
+	case MSG_VEH_DESPAWN:{
+		MsgVehDespawn m;
+		if(ReadVehDespawn(r, m)){
+			fprintf(stderr, "[NET] VEH_DESPAWN veh=%d\n", (int)m.vehicleId);
+			fflush(stderr);
+			Event e;
+			e.type = EV_VEH_DESPAWN;
+			e.arg = m.vehicleId;
+			m_events.push_back(e);
+		}
+		break;
+	}
 	case MSG_KICK:
 	case MSG_DISCONNECT:{
 		MsgKick k;
@@ -475,9 +498,44 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		}
 		break;
 	}
-	case MSG_WORLD:
+	case MSG_WORLD:{
+		// authoritative server world clock / weather
+		MsgWorld wrld;
+		if(ReadWorld(r, wrld)){
+			Event e;
+			e.type = EV_WORLD;
+			e.kind = wrld.hour;
+			e.arg = wrld.minute;
+			e.amount = wrld.weather;
+			m_events.push_back(e);
+		}
+		break;
+	}
+	case MSG_RES_LIST:{
+		// mod/resource inventory for the admin panel
+		MsgResList list;
+		if(ReadResList(r, list)){
+			resList = list;
+			Event e;
+			e.type = EV_RES_LIST;
+			m_events.push_back(e);
+		}
+		break;
+	}
 	case MSG_SCORE_UPDATE:
-	case MSG_GAMEMODE_EVENT:
+		break;   // scores ride their own message; never parse as gamemode text
+	case MSG_GAMEMODE_EVENT:{
+		// server announcements (broadcast / round events) -> large banner
+		MsgGamemodeEvent ev;
+		if(ReadGamemodeEvent(r, ev) && ev.text[0] &&
+		   (ev.type == GMEV_TEXT || ev.type == GMEV_ROUND_START || ev.type == GMEV_ROUND_END)){
+			Event e;
+			e.type = EV_BANNER;
+			e.text = ev.text;
+			m_events.push_back(e);
+		}
+		break;
+	}
 	default:
 		break;
 	}

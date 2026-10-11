@@ -261,11 +261,83 @@ static std::string ModuleDir()
 	return slash == std::string::npos ? std::string(".") : dir.substr(0, slash);
 }
 
+// Keep this handler dependency-free: dbghelp is loaded dynamically (a link
+// dependency would complicate the cefui build) and the exception struct is
+// defined locally to avoid requiring dbghelp.h.
+typedef struct RelcsMiniDumpExcInfo {
+	unsigned long ThreadId;
+	EXCEPTION_POINTERS* ExceptionPointers;
+	int ClientPointers;
+} RelcsMiniDumpExcInfo;
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
-	fprintf(stderr, "[CEF] CRASH code=0x%08lx addr=%p\n",
-	        ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+	// The raw absolute address is useless after restart (ASLR) — also log the
+	// module name + base so the offset can be resolved against reLCS.map.
+	void* addr = ep->ExceptionRecord->ExceptionAddress;
+	HMODULE hm = nullptr;
+	char mod[MAX_PATH] = "?";
+	const char* modName = mod;
+	if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                      (LPCSTR)addr, &hm)){
+		GetModuleFileNameA(hm, mod, MAX_PATH);
+		const char* slash = strrchr(mod, '\\');
+		if(slash) modName = slash + 1;
+		fprintf(stderr, "[CEF] CRASH code=0x%08lx addr=%p in %s base=%p rva=0x%Ix",
+		        ep->ExceptionRecord->ExceptionCode, addr, modName,
+		        (void*)hm, (size_t)((char*)addr - (char*)hm));
+	}else
+		fprintf(stderr, "[CEF] CRASH code=0x%08lx addr=%p",
+		        ep->ExceptionRecord->ExceptionCode, addr);
+	// for access violations the interesting part is WHAT was dereferenced
+	if(ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+	   ep->ExceptionRecord->NumberParameters >= 2)
+		fprintf(stderr, " %s %p",
+		        ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+		        (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+	fprintf(stderr, "\n");
 	fflush(stderr);
+
+	// full minidump so the next crash arrives with a stack, not one address
+	HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+	if(dbghelp){
+		typedef BOOL (WINAPI *MiniDumpWriteDump_t)(HANDLE, DWORD, HANDLE, int,
+		                                           RelcsMiniDumpExcInfo*, void*, void*);
+		MiniDumpWriteDump_t pDump = (MiniDumpWriteDump_t)
+			GetProcAddress(dbghelp, "MiniDumpWriteDump");
+		if(pDump){
+			char path[MAX_PATH] = {};
+			// prefer the game folder (easy to find), fall back to %TEMP%
+			GetModuleFileNameA(nullptr, path, MAX_PATH);
+			char* slash = strrchr(path, '\\');
+			if(slash) *(slash + 1) = '\0';
+			size_t n = strlen(path);
+			snprintf(path + n, sizeof(path) - n, "relcs-crash-%lu.dmp", GetCurrentProcessId());
+			HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			                       FILE_ATTRIBUTE_NORMAL, nullptr);
+			if(f == INVALID_HANDLE_VALUE){
+				char tmp[MAX_PATH] = {};
+				GetTempPathA(MAX_PATH, tmp);
+				snprintf(path, sizeof path, "%srelcs-crash-%lu.dmp", tmp, GetCurrentProcessId());
+				f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+				               FILE_ATTRIBUTE_NORMAL, nullptr);
+			}
+			if(f != INVALID_HANDLE_VALUE){
+				RelcsMiniDumpExcInfo info;
+				info.ThreadId = GetCurrentThreadId();
+				info.ExceptionPointers = ep;
+				info.ClientPointers = 0;
+				if(pDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+				         1 /*MiniDumpNormal*/, &info, nullptr, nullptr))
+					fprintf(stderr, "[CEF] crash dump written: %s\n", path);
+				else
+					fprintf(stderr, "[CEF] crash dump failed: %lu\n", GetLastError());
+				fflush(stderr);
+				CloseHandle(f);
+			}
+		}
+	}
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 

@@ -15,5 +15,9 @@ void NetGame_FrontendTick(void);
 void NetGame_DrawHud(void);
 // True while a multiplayer session is active.
 bool NetGame_IsActive(void);
+// True while a multiplayer session is active or still connecting: game rules
+// that must hold for every client (no world NPCs/traffic, no missions, whole
+// map unlocked) gate on this, leaving single-player behavior untouched.
+bool NetGame_RulesActive(void);
 // Graceful teardown.
 void NetGame_Shutdown(void);

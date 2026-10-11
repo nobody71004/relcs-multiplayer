@@ -28,6 +28,9 @@
 #include "Sprite2d.h"
 #include "Timer.h"
 #include "Frontend.h"
+#include "CutsceneMgr.h"
+#include "Clock.h"
+#include "Weather.h"
 #include "Sprite.h"
 #include "skeleton.h"
 #include "Pickups.h"
@@ -35,6 +38,12 @@
 #include "Automobile.h"
 #include "Bike.h"
 #include "Boat.h"
+#include "CarCtrl.h"
+#include "RoadBlocks.h"
+#include "Darkel.h"
+#include "Script.h"
+#include "WeaponInfo.h"
+#include "Game.h"
 
 #include <windows.h>
 #include <cstdarg>
@@ -64,6 +73,28 @@ static double NowSec()
 {
 	using namespace std::chrono;
 	return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
+}
+
+// ---------------------------------------------------------------------------
+// puppet -> RenderWare frame sync
+//
+// Puppets are built with bUsesCollision=false so they can never shove real
+// players around (that is what tripped anti-cheat before). The side effect:
+// the engine only pushes a moving entity's CMatrix into its RenderWare frame
+// inside CPhysical::ProcessCollision / ProcessShift, and that path early-outs
+// for collisionless bodies (leaving bIsInSafePosition = true), so
+// CWorld::Process's sync loop skips them too. The clump then keeps whatever
+// matrix it had when the mesh was created — rendering at the origin or at a
+// stale spot and never moving. That is exactly the "the other player's model
+// is invisible / does not move" and "the i8 never shows up" report, so every
+// place that moves a puppet also has to push the matrix to RenderWare.
+// ---------------------------------------------------------------------------
+static void SyncPuppetToRw(CEntity* ent)
+{
+	if(!ent || !ent->m_rwObject)
+		return;
+	ent->GetMatrix().UpdateRW();
+	ent->UpdateRwFrame();
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +176,13 @@ static void SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
 	veh->RegisterReference((CEntity**)&ped->m_pMyVehicle);
 	ped->bInVehicle = true;
 	ped->SetPedState(PED_DRIVING);
-	ped->SetPedPositionInCar();
+	// trains seat through their own node alignment — the generic car path
+	// assumes car doors/seats that a train clump does not have
+	if(veh->IsTrain())
+		ped->SetPedPositionInTrain();
+	else
+		ped->SetPedPositionInCar();
+	SyncPuppetToRw(ped);
 	// hold the seated pose; the world loop keeps the ped in its seat from here
 	RpClump* clump = (RpClump*)ped->m_rwObject;
 	if(clump)
@@ -158,10 +195,60 @@ static bool ModelIsVehicle(int modelId)
 	return mi != nil && mi->GetModelType() == MITYPE_VEHICLE;
 }
 
+// The world is ±2000 m (WORLD_MIN/MAX in World.h); coordinates outside it have
+// no valid sector. A single corrupt state packet must never move a puppet
+// there — that is exactly how a net taxi ended up at y=-10880 and crashed the
+// client through CPhysical::RemoveAndAdd's sector recycle. NaN-safe range
+// test (all comparisons fail for NaN). The rejection log is power-of-two
+// throttled: enough to diagnose a generator, never a log flood.
+static bool NetPosSane(float x, float y, float z, const char* tag)
+{
+	if(x > -1900.0f && x < 1900.0f &&
+	   y > -1900.0f && y < 1900.0f &&
+	   z > -100.0f && z < 800.0f)
+		return true;
+	static int s_rejects = 0;
+	if((++s_rejects & (s_rejects - 1)) == 0){
+		fprintf(stderr, "[NET] rejected out-of-world %s position (%.1f, %.1f, %.1f) #%d\n",
+		        tag, x, y, z, s_rejects);
+		fflush(stderr);
+	}
+	return false;
+}
+
+// Game trains simulate themselves on their tracks (CTrain::UpdateTrains) and a
+// CAutomobile built from a train clump has no car nodes — that pairing is the
+// "step in train -> crash" regression. For train models adopt the world's
+// existing train (already created by CTrain::InitTrains) instead of ever
+// constructing a puppet. Returns nil while no matching train exists yet
+// (creation is retried from UpdateNetVehicles).
+static CVehicle* FindNetableTrain(uint16_t modelId, float x, float y, float z)
+{
+	CVehicle* best = nil;
+	float bestD = 0.0f;
+	for(int i = 0; i < CPools::GetVehiclePool()->GetSize(); i++){
+		CVehicle* v = CPools::GetVehiclePool()->GetSlot(i);
+		if(!v || !v->IsTrain() || v->GetModelIndex() != (int32)modelId)
+			continue;
+		CVector d = v->GetPosition() - CVector(x, y, z);
+		float dd = d.x * d.x + d.y * d.y + d.z * d.z;
+		if(!best || dd < bestD){ best = v; bestD = dd; }
+	}
+	return best;
+}
+
 static CVehicle* CreatePuppetVehicle(uint16_t modelId, float x, float y, float z, float heading)
 {
 	if(!ModelIsVehicle(modelId))
 		return nil; // callers mark the net vehicle rejected (logged once)
+	if(CModelInfo::IsTrainModel(modelId))
+		return FindNetableTrain(modelId, x, y, z); // never a constructed puppet
+	if(!NetPosSane(x, y, z, "vehicle spawn")){
+		// fall back to the local player: a spawn near us always streams in, and
+		// the first sane state update snaps the puppet to its real position
+		CVector me = FindPlayerCoors();
+		x = me.x; y = me.y; z = me.z;
+	}
 	if(CPools::GetVehiclePool()->GetNoOfFreeSpaces() == 0)
 		return nil; // retried from UpdateNetVehicles
 	CStreaming::RequestModel(modelId, 0);
@@ -180,6 +267,7 @@ static CVehicle* CreatePuppetVehicle(uint16_t modelId, float x, float y, float z
 	veh->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 	veh->SetTurnSpeed(0.0f, 0.0f, 0.0f);
 	CWorld::Add(veh);
+	SyncPuppetToRw(veh);
 	if(!veh->m_rwObject)
 		fprintf(stderr, "[NET] WARNING: net vehicle model %d has no rw object\n", (int)modelId);
 	fprintf(stderr, "[NET] net vehicle model=%d created at (%.1f, %.1f, %.1f)\n",
@@ -191,6 +279,10 @@ static CVehicle* CreatePuppetVehicle(uint16_t modelId, float x, float y, float z
 static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
                                 float x, float y, float z, float heading)
 {
+	if(!NetPosSane(x, y, z, "vehicle")){
+		CVector me = FindPlayerCoors();
+		x = me.x; y = me.y; z = me.z; // keep smooth* latch in-world too
+	}
 	NetVehicle& nv = s_vehicles[netId];
 	if(!nv.veh){
 		if(nv.modelId == 0){
@@ -205,7 +297,9 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 		}
 		if(!nv.rejected){
 			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
-			nv.puppet = nv.veh != nil;
+			// an adopted game train is owned by the game — only constructed
+			// puppets may be deleted by RemoveNetVehicle
+			nv.puppet = nv.veh != nil && nv.veh->VehicleCreatedBy == MISSION_VEHICLE;
 			if(nv.veh) s_vehByPtr[nv.veh] = netId;
 		}
 	}
@@ -226,6 +320,27 @@ static void AdoptNetVehicle(uint16_t netId, CVehicle* veh, uint16_t modelId)
 	veh->VehicleCreatedBy = MISSION_VEHICLE;
 }
 
+// cleanly detach the local player from any vehicle. Deleting a car under
+// the player flags them for deferred world-removal, and a dangling
+// PED_DRIVING state freezes the game: the character model is hidden (it
+// renders inside cars) and input steers a car that no longer exists.
+static void UnseatPlayerForWorld(CPlayerPed* me)
+{
+	if(!me) return;
+	if(me->EnteringCar())
+		me->QuitEnteringCar();
+	if(me->m_pMyVehicle){
+		CVehicle* v = me->m_pMyVehicle;
+		if(v->pDriver == me) v->pDriver = nil;
+		else v->RemovePassenger(me);
+		me->m_pMyVehicle = nil;
+	}
+	me->bInVehicle = false;
+	if(me->Driving() || me->EnteringCar())
+		me->SetPedState(PED_IDLE);
+	me->bRemoveFromWorld = false;
+}
+
 static void RemoveNetVehicle(uint16_t netId)
 {
 	auto it = s_vehicles.find(netId);
@@ -234,6 +349,11 @@ static void RemoveNetVehicle(uint16_t netId)
 	if(nv.veh){
 		s_vehByPtr.erase(nv.veh);
 		if(nv.puppet){
+			// ~CVehicle flags its occupants for deferred removal — never let
+			// that land on the local player
+			CPlayerPed* me = FindPlayerPed();
+			if(me && me->m_pMyVehicle == nv.veh)
+				UnseatPlayerForWorld(me);
 			CWorld::Remove(nv.veh);
 			delete nv.veh;
 		}else{
@@ -266,7 +386,7 @@ static void UpdateNetVehicles(float dt)
 			if(nv.rejected) continue;
 			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
 			if(!nv.veh) continue;
-			nv.puppet = true;
+			nv.puppet = nv.veh->VehicleCreatedBy == MISSION_VEHICLE; // trains adopted
 			s_vehByPtr[nv.veh] = kv.first;
 		}
 		CVehicle* veh = nv.veh;
@@ -275,6 +395,7 @@ static void UpdateNetVehicles(float dt)
 			CStreaming::RequestModel(nv.modelId, 0);
 			CStreaming::LoadAllRequestedModels(false);
 			veh->SetModelIndex(nv.modelId);
+			SyncPuppetToRw(veh);
 		}
 		if(kv.first == s_myVehNet && s_mySeat == 0){
 			// we drive: the local simulation is authoritative — real physics
@@ -305,6 +426,7 @@ static void UpdateNetVehicles(float dt)
 		veh->SetOrientation(0.0f, 0.0f, nv.smoothH);
 		veh->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 		veh->SetTurnSpeed(0.0f, 0.0f, 0.0f);
+		SyncPuppetToRw(veh);
 	}
 }
 
@@ -337,6 +459,8 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 {
 	if(!s_connected)
 		return;
+	if(!NetPosSane(x, y, z, "ped spawn"))
+		return; // ApplyRemote retries on the next sane state
 	RemoveRemote(id);
 	CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
 	CStreaming::LoadAllRequestedModels(false);
@@ -369,6 +493,7 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 	ped->SetPosition(pos);
 	ped->SetOrientation(0.0f, 0.0f, heading);
 	CWorld::Add(ped);
+	SyncPuppetToRw(ped);
 	if(!ped->m_rwObject)
 		fprintf(stderr, "[NET] WARNING: remote ped id=%d has no rw object (model %d not loaded?)\n",
 		        (int)id, (int)MI_MALE01);
@@ -383,10 +508,13 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 
 static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 {
+	float tx = st.xMm / 1000.0f, ty = st.yMm / 1000.0f, tz = st.zMm / 1000.0f;
+	// never move or materialize a puppet from an out-of-world position
+	if(!NetPosSane(tx, ty, tz, "ped"))
+		return;
 	RemotePed& rp = s_remotes[id];
 	if(!rp.ped || !rp.init){
-		SpawnRemote(id, st.xMm / 1000.0f, st.yMm / 1000.0f, st.zMm / 1000.0f,
-		            rnet::DequantAngle(st.heading));
+		SpawnRemote(id, tx, ty, tz, rnet::DequantAngle(st.heading));
 		return;
 	}
 	CPed* ped = rp.ped;
@@ -398,6 +526,7 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 		CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
 		CStreaming::LoadAllRequestedModels(false);
 		ped->SetModelIndex(MI_MALE01);
+		SyncPuppetToRw(ped);
 		rp.lastAnim = -1;
 		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt\n", (int)id);
 		fflush(stderr);
@@ -412,7 +541,6 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	}
 
 	// interpolate toward the relayed position
-	float tx = st.xMm / 1000.0f, ty = st.yMm / 1000.0f, tz = st.zMm / 1000.0f;
 	if(st.moveFlags & rnet::MOVEFLAG_TELEPORT){
 		// remote was relocated by its own game (respawn/warp): snap, don't glide
 		rp.smoothX = tx; rp.smoothY = ty; rp.smoothZ = tz;
@@ -429,6 +557,7 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	ped->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(st.heading));
 	ped->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 	ped->SetTurnSpeed(0.0f, 0.0f, 0.0f);
+	SyncPuppetToRw(ped);   // collisionless puppets are skipped by the engine's sync
 
 	// anim from relayed speed
 	float speed = std::sqrt(rnet::DequantVel(st.velX) * rnet::DequantVel(st.velX) +
@@ -450,7 +579,12 @@ static std::string s_rconPw;
 static bool s_god = false;
 static bool s_noclip = false;
 static CVector s_ncPos(0.0f, 0.0f, 0.0f);
+static float s_ncSpeed = 20.0f;   // noclip base speed m/s (nocspeed cmd, [ ] adjust)
 static double s_welcomeUntil = 0.0;
+static std::string s_bannerText;   // server broadcast / round announcement
+static double s_bannerUntil = 0.0;
+static int s_worldHour = 12, s_worldMinute = 0;   // server-synced world clock
+static int s_worldWeather = -1;
 static int s_fpsCap = 30;
 static bool s_panelOpen = false;
 static int s_panelRow = 0;
@@ -629,6 +763,10 @@ static void SendRconFmt(const char* fmt, ...)
 	snprintf(s_lastRcon, sizeof s_lastRcon, "%s", s_rconPw.empty() ? "no -rcon password" : buf);
 }
 
+// door-chime (implemented below, near NetGame_Frame)
+static void PlayDoorChime(void);
+static bool s_doorChime = true;
+
 static void ConsoleExec(const char* line)
 {
 	char cmd[32] = {}, rest[160] = {};
@@ -639,7 +777,7 @@ static void ConsoleExec(const char* line)
 	int myId = (int)s_net.MyId();
 	if(is("help")){
 		ConsolePrint("commands: help say broadcast(bc) give spawnbot spawnprop teleport(tp) ride");
-		ConsolePrint("          fps god noclip players status rcon keybinds clear quit");
+		ConsolePrint("          fps god noclip nocspeed players worldstats ground status settime setweather res doorchime rcon keybinds clear quit");
 	}else if(is("say")){
 		if(rest[0]) s_net.SendChat(rest);
 		else ConsolePrint("usage: say <text>");
@@ -647,8 +785,16 @@ static void ConsoleExec(const char* line)
 		if(rest[0]) SendRconFmt("broadcast %s", rest);
 		else ConsolePrint("usage: broadcast <text>");
 	}else if(is("give")){
-		if(rest[0]) SendRconFmt("give %d %s", myId, rest);
-		else ConsolePrint("usage: give money|weapon|god|health <value> [ammo]");
+		// accept both "give money 5000" (self) and "give <id|name> money 5000"
+		char first[24] = {};
+		sscanf(rest, "%23s", first);
+		bool kindFirst = !_stricmp(first, "money") || !_stricmp(first, "weapon") ||
+		                 !_stricmp(first, "god") || !_stricmp(first, "health");
+		if(rest[0]){
+			if(kindFirst) SendRconFmt("give %d %s", myId, rest);
+			else          SendRconFmt("give %s", rest);
+		}else
+			ConsolePrint("usage: give [id|name] money|weapon|god|health <value> [ammo]");
 	}else if(is("spawnbot")){
 		if(!rest[0]) snprintf(rest, sizeof rest, "NPC%03d roam", (int)(NowSec() * 1000.0) % 1000);
 		SendRconFmt("spawnbot %s", rest);
@@ -716,18 +862,92 @@ static void ConsoleExec(const char* line)
 			if(s_noclip){ s_ncPos = me->GetPosition(); me->bUsesCollision = false; }
 			else me->bUsesCollision = true;
 		}
-		ConsolePrint("noclip %s", s_noclip ? "ON" : "OFF");
+		ConsolePrint("noclip %s (speed %.0f m/s — nocspeed <n>, hold Ctrl=x4 Alt=x0.25, [ / ] adjust)",
+		             s_noclip ? "ON" : "OFF", s_ncSpeed);
+	}else if(is("nocspeed")){
+		float v = 0.0f;
+		if(sscanf(rest, "%f", &v) == 1 && v >= 1.0f && v <= 500.0f){
+			s_ncSpeed = v;
+			ConsolePrint("noclip speed -> %.0f m/s", s_ncSpeed);
+		}else
+			ConsolePrint("usage: nocspeed <1-500 m/s> (current %.0f)", s_ncSpeed);
+	}else if(is("worldstats")){
+		// read-only diagnostic: proves the multiplayer world rules are live
+		int pedTotal = 0, pedRandom = 0, vehTotal = 0, vehRandom = 0, vehNet = 0;
+		auto* pp = CPools::GetPedPool();
+		for(int i = pp->GetSize()-1; i >= 0; i--){
+			CPed* p = pp->GetSlot(i);
+			if(!p) continue;
+			pedTotal++;
+			if(p->CharCreatedBy == RANDOM_CHAR && !p->IsPlayer()) pedRandom++;
+		}
+		auto* vp = CPools::GetVehiclePool();
+		for(int i = vp->GetSize()-1; i >= 0; i--){
+			CVehicle* v = vp->GetSlot(i);
+			if(!v) continue;
+			vehTotal++;
+			if(v->VehicleCreatedBy == RANDOM_VEHICLE) vehRandom++;
+			if(NetIdOfVehicle(v) != rnet::VEHICLE_NONE) vehNet++;
+		}
+		int activeScripts = 0, missionScripts = 0;
+		for(CRunningScript* s = CTheScripts::pActiveScripts; s; s = s->next){
+			activeScripts++;
+			if(s->m_bIsMissionScript) missionScripts++;
+		}
+		int pickupActive = 0;
+		for(int i = 0; i < NUMPICKUPS; i++)
+			if(CPickups::aPickUps[i].m_eType != PICKUP_NONE) pickupActive++;
+		CVector pos = me ? me->GetPosition() : CVector(0, 0, 0);
+		ConsolePrint("worldstats pos=(%.0f,%.0f,%.0f) level=%d money=$%d pickups=%d time=%02d:%02d weather=%d",
+		             pos.x, pos.y, pos.z, (int)CGame::currLevel,
+		             CWorld::Players[CWorld::PlayerInFocus].m_nMoney, pickupActive,
+		             s_worldHour, s_worldMinute, s_worldWeather);
+		ConsolePrint("worldstats ped: state=%d inveh=%d removed=%d",
+		             me ? (int)me->GetPedState() : -1,
+		             me && me->bInVehicle ? 1 : 0,
+		             me && me->bRemoveFromWorld ? 1 : 0);
+		ConsolePrint("worldstats vis: model=%d rw=%d hp=%.0f cutscene=%d menu=%d",
+		             me ? me->GetModelIndex() : -1,
+		             me && me->m_rwObject ? 1 : 0,
+		             me ? (double)me->m_fHealth : 0.0,
+		             CCutsceneMgr::IsCutsceneProcessing() ? 1 : 0,
+		             FrontEndMenuManager.m_bMenuActive ? 1 : 0);
+		ConsolePrint("worldstats peds: total=%d world-npc=%d | cars: total=%d traffic=%d net=%d",
+		             pedTotal, pedRandom, vehTotal, vehRandom, vehNet);
+		ConsolePrint("worldstats scripts: active=%d mission=%d frenzy=%s rules=%s paused=%d",
+		             activeScripts, missionScripts,
+		             CDarkel::FrenzyOnGoing() ? "ON" : "off",
+		             NetGame_RulesActive() ? "ON" : "off",
+		             CTimer::GetIsPaused() ? 1 : 0);
+	}else if(is("ground")){
+		// collision probe: reports the ground Z under a point — a valid Z on a
+		// far island proves that island's collision is loaded and collidable
+		float x = 0, y = 0, z = 100.0f;
+		if(sscanf(rest, "%f %f %f", &x, &y, &z) >= 2){
+			bool found = false;
+			float gz = CWorld::FindGroundZFor3DCoord(x, y, z, &found);
+			ConsolePrint("ground (%.0f,%.0f,%.0f) -> %s z=%.1f", x, y, z,
+			             found ? "HIT" : "MISS", gz);
+		}else ConsolePrint("usage: ground <x> <y> [z]");
 	}else if(is("players")){
 		ConsolePrint("you (#%d) %s", myId, s_nick.c_str());
 		for(auto& kv : s_net.remotes)
 			ConsolePrint("#%d %s", (int)kv.first, kv.second.name.c_str());
 	}else if(is("status")){
 		SendRconFmt("status");
+	}else if(is("settime") || is("setweather") || is("res") || is("resources")){
+		// server-side commands forwarded verbatim (admin panel uses these)
+		if(rest[0]) SendRconFmt("%s %s", cmd, rest);
+		else        SendRconFmt("%s", cmd);
 	}else if(is("rcon")){
 		if(rest[0]) s_net.SendRconCmd(rest);
 		else ConsolePrint("usage: rcon <server command>");
 	}else if(is("clear")){
 		s_consoleLog.clear();
+	}else if(is("doorchime")){
+		if(rest[0] && !_stricmp(rest, "off")){ s_doorChime = false; ConsolePrint("doorchime off"); }
+		else if(rest[0] && !_stricmp(rest, "on")){ s_doorChime = true; ConsolePrint("doorchime on"); }
+		else { PlayDoorChime(); ConsolePrint("doorchime: playing (mods/doorchime.wav or SFX/doorchime.wav)"); }
 	}else if(is("keybinds")){
 		ConsolePrint("chat=admin=inventory=console=console2= — edit keybinds.ini");
 	}else if(is("quit")){
@@ -742,6 +962,32 @@ static void ConsoleExec(const char* line)
 // ---------------------------------------------------------------------------
 static std::string s_cefPanel; // which overlay panel is open ("" = none)
 
+// CEF query args arrive percent-encoded (JS encodeURIComponent); decode %XX
+static std::string UrlDecode(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for(size_t i = 0; i < s.size(); i++){
+		if(s[i] == '%' && i + 2 < s.size()){
+			auto hex = [](char c) -> int {
+				if(c >= '0' && c <= '9') return c - '0';
+				if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+				if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+				return -1;
+			};
+			int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+			if(hi >= 0 && lo >= 0){
+				out += (char)((hi << 4) | lo);
+				i += 2;
+				continue;
+			}
+		}
+		if(s[i] == '+'){ out += ' '; continue; }
+		out += s[i];
+	}
+	return out;
+}
+
 static void CefQueryHandler(const char* request, void*)
 {
 	if(!request) return;
@@ -752,7 +998,7 @@ static void CefQueryHandler(const char* request, void*)
 	auto arg = [&](const char* key) -> std::string {
 		std::string k = std::string(key) + "=";
 		if(args.rfind(k, 0) != 0) return "";
-		return args.substr(k.size());
+		return UrlDecode(args.substr(k.size()));
 	};
 	if(cmd == "chat"){
 		std::string text = arg("text");
@@ -826,18 +1072,47 @@ static void CefPushState(void)
 
 	const char* fpsName = "30";
 	for(int i = 0; i < kNumFps; i++) if(kFpsPresets[i] == s_fpsCap) fpsName = kFpsNames[i];
-	char buf[4608];
+	char modeBuf[32];
+	if(s_god) snprintf(modeBuf, sizeof modeBuf, "GOD");
+	else if(s_noclip) snprintf(modeBuf, sizeof modeBuf, "NOCLIP %.0fm/s", s_ncSpeed);
+	else modeBuf[0] = 0;
+	char buf[5120];
+	std::string banner = "\"\"";
+	if(NowSec() < s_bannerUntil && !s_bannerText.empty())
+		banner = "\"" + jesc(s_bannerText) + "\"";
+	char wtime[8];
+	snprintf(wtime, sizeof wtime, "%02d:%02d", s_worldHour, s_worldMinute);
+	// mod/resource inventory for the admin panel
+	std::string res = "[";
+	{
+		bool first = true;
+		const rnet::MsgResList& rl = s_net.resList;
+		for(int i = 0; i < rl.count && i < rnet::MAX_RES_ENTRIES; i++){
+			const rnet::MsgResEntry& e = rl.entries[i];
+			char ent[192];
+			snprintf(ent, sizeof ent,
+			         "%s{\"name\":\"%s\",\"ver\":\"%s\",\"type\":\"%s\","
+			         "\"on\":%d,\"ok\":%d}",
+			         first ? "" : ",", jesc(e.name).c_str(), jesc(e.version).c_str(),
+			         e.type ? "external" : "internal", (int)e.enabled, (int)e.valid);
+			res += ent;
+			first = false;
+		}
+	}
+	res += "]";
 	snprintf(buf, sizeof buf,
 	         "{\"server\":\"%s\",\"players\":%zu,\"fps\":\"%s\",\"mode\":\"%s\","
-	         "\"money\":%d,\"hp\":%d,\"armour\":%d,\"welcome\":%d,"
-	         "\"weapons\":%s,\"chat\":%s,\"console\":%s}",
+	         "\"money\":%d,\"hp\":%d,\"armour\":%d,\"welcome\":%d,\"banner\":%s,"
+	         "\"wtime\":\"%s\",\"wweather\":%d,"
+	         "\"weapons\":%s,\"chat\":%s,\"console\":%s,\"resources\":%s}",
 	         jesc(s_net.Hostname()).c_str(),
 	         s_net.remotes.size() + (s_net.Spawned() ? 1 : 0),
-	         fpsName, s_god ? "GOD" : (s_noclip ? "NOCLIP" : ""),
+	         fpsName, modeBuf,
 	         CWorld::Players[CWorld::PlayerInFocus].m_nMoney,
 	         me ? (int)me->m_fHealth : 0, me ? (int)me->m_fArmour : 0,
-	         (int)(NowSec() < s_welcomeUntil),
-	         weapons.c_str(), chat.c_str(), con.c_str());
+	         (int)(NowSec() < s_welcomeUntil), banner.c_str(),
+	         wtime, s_worldWeather,
+	         weapons.c_str(), chat.c_str(), con.c_str(), res.c_str());
 	CefHud_PushState(buf);
 }
 
@@ -893,8 +1168,8 @@ static void NetGame_PollUi(void)
 		CefHud_Show(s_cefPanel.c_str());
 	};
 
-	// CEF overlay takes all input while a panel is open
-	if(CefHud_Active() && CefHud_Focused()){
+	// CEF overlay takes all input while a panel is open (or CEF has focus)
+	if(CefHud_Active() && (CefHud_Focused() || !s_cefPanel.empty())){
 		if(kEsc){ s_cefPanel.clear(); CefHud_Show(""); return; }
 		// non-typeable keys still switch panels while typing
 		if(kConsole){ cefPanel("console"); return; }
@@ -1116,6 +1391,109 @@ bool NetGame_IsActive(void)
 	return s_connected;
 }
 
+bool NetGame_RulesActive(void)
+{
+	// cover the connect window too: the new-game pipeline starts spawning
+	// world actors before the handshake completes
+	return s_wantConnect || s_connected;
+}
+
+// ---------------------------------------------------------------------------
+// world rules — enforced for every multiplayer client, every frame:
+//   * no world NPCs and no traffic (population knobs zeroed, stock purged)
+//   * no missions, kill frenzies, cutscenes or script roadblocks (gated in
+//     the script VM) and the whole map stays unlocked (Streaming/ColStore)
+// ---------------------------------------------------------------------------
+
+// a traffic car someone is halfway through entering must survive this cycle
+static bool VehicleReferencedByAnyone(CVehicle* v)
+{
+	auto* pp = CPools::GetPedPool();
+	for(int i = pp->GetSize()-1; i >= 0; i--){
+		CPed* p = pp->GetSlot(i);
+		if(p && !p->bInVehicle && p->m_pMyVehicle == v)
+			return true;
+	}
+	return false;
+}
+
+static void PurgeWorldActors(void)
+{
+	CPlayerPed* me = FindPlayerPed();
+	CVehicle* meVeh = me ? me->m_pMyVehicle : nil;
+
+	// traffic vehicles first: ~CVehicle flags any occupants for deferred,
+	// engine-managed removal, so no occupant can be left dangling
+	auto* vp = CPools::GetVehiclePool();
+	for(int i = vp->GetSize()-1; i >= 0; i--){
+		CVehicle* v = vp->GetSlot(i);
+		if(!v || v->VehicleCreatedBy != RANDOM_VEHICLE)
+			continue;
+		// never touch multiplayer cars or the car we are using
+		if(v == meVeh || v == s_pendingVeh || NetIdOfVehicle(v) != rnet::VEHICLE_NONE)
+			continue;
+		// skip cars carrying anything other than plain world NPCs
+		bool skip = VehicleReferencedByAnyone(v);
+		for(int s = -1; !skip && s < v->m_nNumMaxPassengers; s++){
+			CPed* occ = s < 0 ? v->pDriver : v->pPassengers[s];
+			if(occ && (occ->IsPlayer() || occ->CharCreatedBy != RANDOM_CHAR))
+				skip = true;
+		}
+		if(skip)
+			continue;
+		CWorld::Remove(v);
+		delete v;
+	}
+
+	// world civilians/cops on foot (plus any occupant the dtors just detached)
+	auto* pp = CPools::GetPedPool();
+	for(int i = pp->GetSize()-1; i >= 0; i--){
+		CPed* p = pp->GetSlot(i);
+		if(!p || p->CharCreatedBy != RANDOM_CHAR || p->IsPlayer())
+			continue;
+		CPopulation::RemovePed(p);
+	}
+}
+
+static void NetGame_WorldRules(void)
+{
+	static bool s_logged = false;
+	if(!s_logged){
+		s_logged = true;
+		fprintf(stderr, "[NET] world rules active: no NPCs/traffic, no missions, full map\n");
+		fflush(stderr);
+	}
+
+	// hard-zero the population knobs every frame: mission cleanup resets them
+	CPopulation::PedDensityMultiplier = 0.0f;
+	CPopulation::MaxNumberOfPedsInUse = 0;
+	CPopulation::MaxNumberOfPedsInUseInterior = 0;
+	CCarCtrl::CarDensityMultiplier = 0.0f;
+	CCarCtrl::MaxNumberOfCarsInUse = 0;
+	// scripted roadblocks (bridge barriers) may never exist in multiplayer
+	CRoadBlocks::ClearScriptRoadBlocks();
+
+	// heal player states that silently freeze the game: a vanished car leaves
+	// PED_DRIVING with no m_pMyVehicle (invisible, unresponsive), and a stale
+	// deferred-removal flag must never survive a frame
+	{
+		CPlayerPed* me = FindPlayerPed();
+		if(me){
+			if(me->bRemoveFromWorld)
+				me->bRemoveFromWorld = false;
+			if((me->Driving() || me->EnteringCar()) && !me->m_pMyVehicle)
+				UnseatPlayerForWorld(me);
+		}
+	}
+
+	static double s_lastPurge = -100.0;
+	double now = NowSec();
+	if(now - s_lastPurge >= 1.0){
+		s_lastPurge = now;
+		PurgeWorldActors();
+	}
+}
+
 // ---------------------------------------------------------------------------
 // frontend auto-start: a -connect launch must never depend on menu navigation
 // ---------------------------------------------------------------------------
@@ -1165,6 +1543,13 @@ static rnet::MsgInventory s_invLast;
 static bool   s_invHave = false;
 static double s_invLastSend = -100.0;
 static bool   s_invForce = false;     // send on next frame regardless of throttle
+static rnet::MsgInventory s_pendingInv; // restore waiting for the player ped
+static bool   s_havePending = false;
+static rnet::MsgInventory s_restore;   // last server restore (re-apply after game wipes)
+static bool   s_haveRestore = false;
+static double s_restoreAt = 0.0;
+static int    s_restoreReapplies = 0;
+static CPlayerPed* s_restorePed = nullptr;
 
 static rnet::MsgInventory BuildInventory()
 {
@@ -1213,14 +1598,81 @@ static void ApplyInventory(const rnet::MsgInventory& m)
 	s_invLast = m;
 	s_invHave = true;
 	s_invForce = false;
+	// remember the restore: the game's own spawn pipeline (new-game init,
+	// cutscene relocations) re-initializes the loadout shortly after join and
+	// would otherwise wipe the restored weapons
+	s_restore = m;
+	s_haveRestore = true;
+	s_restoreAt = NowSec();
+	s_restorePed = me;
 	fprintf(stderr, "[NET] profile restored: $%d + %d weapons\n", (int)m.money, (int)m.count);
 	fflush(stderr);
 }
 static bool s_haveLastSent = false;
 static double s_lastTeleportLog = 0.0;
 
+// ---------------------------------------------------------------------------
+// vehicle door chime (BMW i8-style) — plays when the local player opens a car
+// door (enter/exit transition).  Sound file resolution:
+//   mods/doorchime.wav  — user-supplied recording (own the rights to it!)
+//   SFX/doorchime.wav   — generated original fallback (tools/gen_doorchime.js)
+// ---------------------------------------------------------------------------
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
+static int s_lastPedState = 0;   // s_doorChime is declared above (console needs it)
+static bool s_lastInVeh = false;
+static double s_lastChimeAt = -100.0;
+
+static void PlayDoorChime(void)
+{
+	if(!s_doorChime) return;
+	char path[MAX_PATH];
+	GetModuleFileNameA(NULL, path, MAX_PATH);
+	char* slash = strrchr(path, '\\');
+	if(slash) *slash = 0;
+	char full[MAX_PATH];
+	snprintf(full, sizeof full, "%s\\mods\\doorchime.wav", path);
+	DWORD attr = GetFileAttributesA(full);
+	if(attr == INVALID_FILE_ATTRIBUTES)
+		snprintf(full, sizeof full, "%s\\SFX\\doorchime.wav", path);
+	// SND_ASYNC: never block the game loop on audio
+	if(!PlaySoundA(full, NULL, SND_ASYNC | SND_FILENAME | SND_NODEFAULT))
+		fprintf(stderr, "[NET] doorchime: cannot play %s\n", full);
+}
+
+static void NetGame_DoorChimeTick(void)
+{
+	CPlayerPed* me = FindPlayerPed();
+	if(!me){ s_lastPedState = 0; s_lastInVeh = false; return; }
+	int st = me->m_nPedState;
+	// a car door opens when the ped starts entering or exiting (the literal
+	// door states) — the seat change (InVehicle edge) covers entry/exit paths
+	// that skip those states (teleport-in, MP unseat)
+	bool doorOpen = (st == PED_ENTER_CAR || st == PED_CARJACK || st == PED_EXIT_CAR ||
+	                 st == PED_OPEN_DOOR);
+	bool wasOpen = (s_lastPedState == PED_ENTER_CAR || s_lastPedState == PED_CARJACK ||
+	                s_lastPedState == PED_EXIT_CAR || s_lastPedState == PED_OPEN_DOOR);
+	bool inVeh = me->InVehicle();
+	bool seatChanged = (inVeh != s_lastInVeh);
+	if((doorOpen && !wasOpen) || seatChanged){
+		double t = NowSec();
+		if(t - s_lastChimeAt > 1.0){   // debounce: one chime per door action
+			s_lastChimeAt = t;
+			fprintf(stderr, "[NET] doorchime: door open (state=%d seat=%d)\n",
+			        st, (int)inVeh);
+			fflush(stderr);
+			PlayDoorChime();
+		}
+	}
+	s_lastPedState = st;
+	s_lastInVeh = inVeh;
+}
+
 void NetGame_Frame(void)
 {
+	NetGame_DoorChimeTick();
+
 	// chromium overlay: init on first frame, pump + push state every frame
 	CefHud_Ensure();
 	if(CefHud_Active()){
@@ -1229,6 +1681,10 @@ void NetGame_Frame(void)
 		CefHud_Tick();
 		CefPushState();
 	}
+
+	// enforce multiplayer world rules (also while still connecting)
+	if(NetGame_RulesActive())
+		NetGame_WorldRules();
 
 	// connect once the player exists (i.e. world loaded)
 	if(s_wantConnect && !s_connected && FindPlayerPed()){
@@ -1260,9 +1716,15 @@ void NetGame_Frame(void)
 			break;
 		case NetClient::EV_SPAWNED:{
 			CPlayerPed* me = FindPlayerPed();
-			if(me){
+			if(me && NetPosSane(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
+			                    ev.state.zMm / 1000.0f, "spawn")){
+				// a gamemode respawn can land mid-drive: detach from the car
+				// first or the ped stays hidden and steers a phantom vehicle
+				UnseatPlayerForWorld(me);
 				CVector pos(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f, ev.state.zMm / 1000.0f);
-				me->SetPosition(pos);
+				// Teleport (not SetPosition): it clears bIsStanding so the ped
+				// falls to the ground instead of hovering mid-air forever
+				me->Teleport(pos);
 				me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(ev.state.heading));
 				s_lastSentPos = pos;
 				s_haveLastSent = true;
@@ -1273,14 +1735,21 @@ void NetGame_Frame(void)
 			break;
 		}
 		case NetClient::EV_INVENTORY:
-			// profile restore from the server (sent once, after our spawn)
-			ApplyInventory(ev.inv);
+			// profile restore from the server (sent at hello) — apply as soon as
+			// the player ped exists
+			if(FindPlayerPed())
+				ApplyInventory(ev.inv);
+			else{
+				s_pendingInv = ev.inv;
+				s_havePending = true;
+			}
 			break;
 		case NetClient::EV_CORRECTION:{
 			CPlayerPed* me = FindPlayerPed();
-			if(me){
+			if(me && NetPosSane(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
+			                    ev.state.zMm / 1000.0f, "correction")){
 				CVector pos(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f, ev.state.zMm / 1000.0f);
-				me->SetPosition(pos);
+				me->Teleport(pos);   // clears bIsStanding — see EV_SPAWNED
 				me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(ev.state.heading));
 				me->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 				s_lastSentPos = pos;
@@ -1312,16 +1781,64 @@ void NetGame_Frame(void)
 			break;
 		}
 		case NetClient::EV_RCON_RESP:
+			// surface the server's answer in the admin panel console — a silent
+			// rcon failure looks exactly like a dead button otherwise
 			snprintf(s_lastRcon, sizeof s_lastRcon, "%s", ev.text.c_str());
-			fprintf(stderr, "[NET] rcon: %s\n", ev.text.c_str());
+			ConsolePrint("rcon: %s", ev.text.c_str());
 			break;
+		case NetClient::EV_BANNER:
+			s_bannerText = ev.text;
+			s_bannerUntil = NowSec() + 8.0;
+			fprintf(stderr, "[NET] banner: %s\n", ev.text.c_str());
+			fflush(stderr);
+			break;
+		case NetClient::EV_WORLD:{
+			// authoritative world clock: snap on drift so the local minute tick
+			// stays smooth; weather applies immediately when it changes
+			int h = ev.kind & 0xFF, m = ev.arg % 60, w = ev.amount;
+			int diff = (h * 60 + m) - ((int)CClock::ms_nGameClockHours * 60 + (int)CClock::ms_nGameClockMinutes);
+			if(diff > 720) diff -= 1440;
+			if(diff < -720) diff += 1440;
+			if(diff >= 2 || diff <= -2){
+				CClock::SetGameClock((uint8)h, (uint8)m);
+				if(diff >= 15 || diff <= -15){
+					fprintf(stderr, "[NET] time -> %02d:%02d\n", h, m);
+					fflush(stderr);
+				}
+			}
+			if(w >= 0 && w != s_worldWeather){
+				s_worldWeather = w;
+				CWeather::ForceWeatherNow((int16)w);
+				fprintf(stderr, "[NET] weather -> %d\n", w);
+				fflush(stderr);
+			}
+			s_worldHour = h; s_worldMinute = m;
+			break;
+		}
 		case NetClient::EV_PICKUP:{
+			if(!NetPosSane(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
+			               ev.state.zMm / 1000.0f, "pickup"))
+				break;
 			CVector pos(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f, ev.state.zMm / 1000.0f);
+			// stream the pickup's models in BEFORE the object is created — an
+			// unloaded model makes the prop invisible (or crashes SetModelIndex)
+			int32 model = ev.model != 0 ? (int32)ev.model
+			                          : CPickups::ModelForWeapon((eWeaponType)ev.arg);
+			if(model > 0 && CModelInfo::GetModelInfo(model)){
+				CStreaming::RequestModel(model, 0);
+				if(CModelInfo::GetModelInfo(model)->GetModelType() == MITYPE_WEAPON){
+					CWeaponInfo* wi = CWeaponInfo::GetWeaponInfo((eWeaponType)ev.arg);
+					if(wi && wi->m_nModel2Id > 0)
+						CStreaming::RequestModel(wi->m_nModel2Id, 0);
+				}
+				CStreaming::LoadAllRequestedModels(false);
+			}
 			if(ev.model != 0)
 				CPickups::GenerateNewOne(pos, ev.model, ev.kind, (uint32)ev.amount);
 			else
 				CPickups::GenerateNewOne_WeaponType(pos, (eWeaponType)ev.arg, ev.kind, (uint32)ev.amount);
-			fprintf(stderr, "[NET] prop spawned at (%.1f, %.1f, %.1f)\n", pos.x, pos.y, pos.z);
+			fprintf(stderr, "[NET] prop spawned at (%.1f, %.1f, %.1f) model=%d\n",
+			        pos.x, pos.y, pos.z, model);
 			fflush(stderr);
 			break;
 		}
@@ -1414,9 +1931,24 @@ void NetGame_Frame(void)
 				s_pendingSeat.erase(ev.id);
 			}
 			break;
+		case NetClient::EV_VEH_DESPAWN:{
+			// the server retired this vehicle (admin delcar, static spawn cleanup)
+			if(ev.arg == s_myVehNet){
+				s_myVehNet = rnet::VEHICLE_NONE;
+				s_mySeat = 0xFF;
+				s_pendingVeh = nil;
+			}
+			RemoveNetVehicle(ev.arg);
+			break;
+		}
 		case NetClient::EV_VEH_STATE:{
 			if(ev.arg == s_myVehNet && s_mySeat == 0)
 				break; // our own authoritative echo
+			// reject insane targets before they latch into smooth*/target —
+			// one bad packet must not teleport a puppet out of the world
+			if(!NetPosSane(ev.veh.xMm / 1000.0f, ev.veh.yMm / 1000.0f,
+			               ev.veh.zMm / 1000.0f, "veh state"))
+				break;
 			NetVehicle& nv = NetVehicleAt(ev.arg, ev.model,
 			                            ev.veh.xMm / 1000.0f, ev.veh.yMm / 1000.0f,
 			                            ev.veh.zMm / 1000.0f,
@@ -1514,7 +2046,13 @@ void NetGame_Frame(void)
 	if(s_noclip && me){
 		me->bUsesCollision = false;
 		me->SetMoveSpeed(0.0f, 0.0f, 0.0f);
-		float sp = 20.0f * dt;
+		float sp = s_ncSpeed * dt;
+		if(GetAsyncKeyState(VK_CONTROL) & 0x8000) sp *= 4.0f;      // speed boost
+		else if(GetAsyncKeyState(VK_MENU) & 0x8000) sp *= 0.25f;   // fine control
+		// [ / ] adjust the base speed — but never while typing in a UI
+		bool uiUp = !s_cefPanel.empty() || s_consoleOpen || s_chatOpen || s_panelOpen;
+		if(!uiUp && KeyEdge(VK_OEM_6)) s_ncSpeed = s_ncSpeed * 1.5f > 500.0f ? 500.0f : s_ncSpeed * 1.5f;
+		if(!uiUp && KeyEdge(VK_OEM_4)) s_ncSpeed = s_ncSpeed / 1.5f < 1.0f ? 1.0f : s_ncSpeed / 1.5f;
 		CVector fwd = me->GetForward();
 		CVector right = me->GetRight();
 		if(GetAsyncKeyState('W') & 0x8000) s_ncPos += fwd * sp;
@@ -1570,7 +2108,17 @@ void NetGame_Frame(void)
 		st.armour = (uint8_t)(me->m_fArmour > 100.0f ? 100 : me->m_fArmour);
 		st.weapon = (uint8_t)me->GetWeapon()->m_eWeaponType;
 		st.ammo = (uint16_t)me->GetWeapon()->m_nAmmoTotal;
-		st.money = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
+		// server-authoritative economy: report the wallet the server last agreed
+		// on, not whatever the game's own new-game / script pipeline wrote into
+		// the player struct.  That local re-init differs from the server ledger
+		// and used to be reported as a money edit on every tick, so the economy
+		// anti-cheat kicked the client seconds after it finished joining.
+		if(s_invHave){
+			CWorld::Players[CWorld::PlayerInFocus].m_nMoney = s_invLast.money;
+			st.money = s_invLast.money;
+		}else{
+			st.money = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
+		}
 		st.animId = 0;
 		st.animFlags = 0;
 		st.vehicleId = inVehicle ? (s_myVehNet != rnet::VEHICLE_NONE ? s_myVehNet : rnet::VEHICLE_UNSYNCED)
@@ -1580,9 +2128,30 @@ void NetGame_Frame(void)
 		s_haveLastSent = true;
 		s_net.SendState(st);
 
-		// persistent profile: report the wallet + weapon table when it changes
-		// (throttled — the server stores the latest snapshot in SQLite)
-		rnet::MsgInventory inv = BuildInventory();
+	// a restore that arrived before the ped existed: apply it now
+	if(s_havePending && FindPlayerPed()){
+		s_havePending = false;
+		ApplyInventory(s_pendingInv);
+	}
+
+	// the game re-initializing the player shortly after join (new-game /
+	// cutscene pipeline) wipes the restored loadout — re-apply it a few times
+	// inside a grace window instead of reporting the wipe back to the profile DB
+	if(s_haveRestore && s_restore.count > 0 && s_restoreReapplies < 4 &&
+	   now - s_restoreAt < 60.0){
+		CPlayerPed* cur = FindPlayerPed();
+		bool wiped = cur && (cur != s_restorePed || BuildInventory().count == 0);
+		if(wiped){
+			s_restoreReapplies++;
+			ApplyInventory(s_restore);
+			fprintf(stderr, "[NET] restore re-applied after game-side wipe (%d)\n", s_restoreReapplies);
+			fflush(stderr);
+		}
+	}
+
+	// persistent profile: report the wallet + weapon table when it changes
+	// (throttled — the server stores the latest snapshot in SQLite)
+	rnet::MsgInventory inv = BuildInventory();
 		if((s_invForce || now - s_invLastSend >= 0.5) && (!s_invHave || InvDiffers(s_invLast, inv))){
 			inv.playerId = s_net.MyId();
 			s_net.SendInventory(inv);
@@ -1706,6 +2275,15 @@ void NetGame_DrawHud(void)
 		HudText(SCREEN_SCALE_X(320.0f), SCREEN_SCALE_Y(150.0f), 0.6f,
 		        "Welcome to Liberty City Stories Online",
 		        CRGBA(255, 210, 80, (uint8)(fade * 255.0f)), true);
+	}
+
+	// server broadcast / round banner (large, center screen)
+	if(noww < s_bannerUntil && !s_bannerText.empty()){
+		float fade = (float)(s_bannerUntil - noww) / 1.5f;
+		if(fade > 1.0f) fade = 1.0f;
+		HudText(SCREEN_SCALE_X(320.0f), SCREEN_SCALE_Y(105.0f), 1.0f,
+		        s_bannerText.c_str(),
+		        CRGBA(255, 90, 60, (uint8)(fade * 255.0f)), true);
 	}
 
 	// server HUD (top center)
@@ -1850,5 +2428,7 @@ void NetGame_Shutdown(void)
 // ---------------------------------------------------------------------------
 bool NetGame_WantMouse(void)
 {
-	return (CefHud_Active() && CefHud_Focused()) || s_panelOpen;
+	// a CEF panel owns the mouse as soon as it is OPEN — waiting for CEF focus
+	// first was a chicken-and-egg (you cannot click to focus without a cursor)
+	return (CefHud_Active() && CefHud_Focused()) || s_panelOpen || !s_cefPanel.empty();
 }

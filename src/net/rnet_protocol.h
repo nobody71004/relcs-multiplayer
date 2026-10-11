@@ -129,6 +129,9 @@ inline void WriteWelcome(BitWriter& w, const MsgWelcome& m)
 	w.WriteU8(m.hour); w.WriteU8(m.minute); w.WriteU8(m.weather);
 	w.WriteString(m.gameMode, 31);
 	w.WriteString(m.hostname, MAX_HOSTNAME_LEN - 1);
+	// v5: live server info (launcher tooltip: map, players)
+	w.WriteU8(m.players); w.WriteU8(m.maxPlayers);
+	w.WriteString(m.mapName, MAX_MAP_LEN - 1);
 }
 inline bool ReadWelcome(BitReader& r, MsgWelcome& m)
 {
@@ -138,6 +141,17 @@ inline bool ReadWelcome(BitReader& r, MsgWelcome& m)
 	std::string hn = r.ReadString(MAX_HOSTNAME_LEN - 1);
 	CopyStr(m.gameMode, sizeof m.gameMode, gm.c_str());
 	CopyStr(m.hostname, sizeof m.hostname, hn.c_str());
+	// v5 tail: tolerate a v4 server that stops after the hostname
+	m.players = m.maxPlayers = 0;
+	m.mapName[0] = 0;
+	if(r.BitsLeft() >= 16 + 16){
+		m.players = r.ReadU8();
+		m.maxPlayers = r.ReadU8();
+		if(r.BitsLeft() >= 16){
+			std::string mp = r.ReadString(MAX_MAP_LEN - 1);
+			CopyStr(m.mapName, sizeof m.mapName, mp.c_str());
+		}
+	}
 	return r.Ok();
 }
 
@@ -248,6 +262,13 @@ inline bool ReadVehSpawn(BitReader& r, MsgVehSpawn& m)
 	return r.Ok();
 }
 
+inline void WriteVehDespawn(BitWriter& w, const MsgVehDespawn& m) { w.WriteU16(m.vehicleId); }
+inline bool ReadVehDespawn(BitReader& r, MsgVehDespawn& m)
+{
+	m.vehicleId = r.ReadU16();
+	return r.Ok();
+}
+
 inline void WritePickup(BitWriter& w, const MsgPickup& m)
 {
 	w.WriteU16(m.pickupId); w.WriteU16(m.modelIndex);
@@ -264,6 +285,34 @@ inline bool ReadPickup(BitReader& r, MsgPickup& m)
 
 inline void WriteWorld(BitWriter& w, const MsgWorld& m) { w.WriteU8(m.hour); w.WriteU8(m.minute); w.WriteU8(m.weather); }
 inline bool ReadWorld(BitReader& r, MsgWorld& m) { m.hour = r.ReadU8(); m.minute = r.ReadU8(); m.weather = r.ReadU8(); return r.Ok(); }
+
+inline void WriteResList(BitWriter& w, const MsgResList& m)
+{
+	w.WriteU8(m.count);
+	for(uint8_t i = 0; i < m.count && i < MAX_RES_ENTRIES; i++){
+		w.WriteString(m.entries[i].name, sizeof m.entries[i].name - 1);
+		w.WriteString(m.entries[i].version, sizeof m.entries[i].version - 1);
+		w.WriteU8(m.entries[i].type);
+		w.WriteU8(m.entries[i].enabled);
+		w.WriteU8(m.entries[i].valid);
+	}
+}
+inline bool ReadResList(BitReader& r, MsgResList& m)
+{
+	m = MsgResList();
+	m.count = r.ReadU8();
+	if(m.count > MAX_RES_ENTRIES) return false;
+	for(uint8_t i = 0; i < m.count; i++){
+		std::string n = r.ReadString(sizeof m.entries[i].name - 1);
+		std::string v = r.ReadString(sizeof m.entries[i].version - 1);
+		CopyStr(m.entries[i].name, sizeof m.entries[i].name, n.c_str());
+		CopyStr(m.entries[i].version, sizeof m.entries[i].version, v.c_str());
+		m.entries[i].type = r.ReadU8();
+		m.entries[i].enabled = r.ReadU8();
+		m.entries[i].valid = r.ReadU8();
+	}
+	return r.Ok();
+}
 
 inline void WriteScoreUpdate(BitWriter& w, const MsgScoreUpdate& m)
 {
@@ -317,6 +366,8 @@ inline void WriteMasterAnnounce(BitWriter& w, const MsgMasterAnnounce& m)
 	w.WriteU16(m.gamePort); w.WriteU8(m.players); w.WriteU8(m.maxPlayers); w.WriteU16(m.protocolVersion);
 	w.WriteString(m.hostname, MAX_HOSTNAME_LEN - 1);
 	w.WriteString(m.gameMode, 31);
+	w.WriteString(m.mapName, MAX_MAP_LEN - 1);   // v5
+	w.WriteU32(m.advertisedIp);
 }
 inline bool ReadMasterAnnounce(BitReader& r, MsgMasterAnnounce& m)
 {
@@ -325,6 +376,14 @@ inline bool ReadMasterAnnounce(BitReader& r, MsgMasterAnnounce& m)
 	std::string gm = r.ReadString(31);
 	CopyStr(m.hostname, sizeof m.hostname, hn.c_str());
 	CopyStr(m.gameMode, sizeof m.gameMode, gm.c_str());
+	// optional tails, oldest first: a v4 announce has only advertisedIp (32 bits)
+	// or nothing left, so the map is only read when a v5 tail actually fits
+	m.mapName[0] = 0;
+	if(r.Ok() && r.BitsLeft() >= 48){
+		std::string mp = r.ReadString(MAX_MAP_LEN - 1);
+		CopyStr(m.mapName, sizeof m.mapName, mp.c_str());
+	}
+	m.advertisedIp = (r.Ok() && r.BitsLeft() >= 32) ? r.ReadU32() : 0;
 	return r.Ok();
 }
 
@@ -334,6 +393,8 @@ inline void WriteMasterEntry(BitWriter& w, const MasterListEntry& e)
 	w.WriteU8(e.players); w.WriteU8(e.maxPlayers); w.WriteU16(e.pingMs);
 	w.WriteString(e.hostname, MAX_HOSTNAME_LEN - 1);
 	w.WriteString(e.gameMode, 31);
+	w.WriteString(e.mapName, MAX_MAP_LEN - 1);   // v5
+	w.WriteU16(e.protocolVersion);               // v5
 }
 inline bool ReadMasterEntry(BitReader& r, MasterListEntry& e)
 {
@@ -343,6 +404,70 @@ inline bool ReadMasterEntry(BitReader& r, MasterListEntry& e)
 	std::string gm = r.ReadString(31);
 	CopyStr(e.hostname, sizeof e.hostname, hn.c_str());
 	CopyStr(e.gameMode, sizeof e.gameMode, gm.c_str());
+	// v5 tails; a v4 entry ends right here
+	e.mapName[0] = 0;
+	e.protocolVersion = 0;
+	if(r.Ok() && r.BitsLeft() >= 16){
+		std::string mp = r.ReadString(MAX_MAP_LEN - 1);
+		CopyStr(e.mapName, sizeof e.mapName, mp.c_str());
+		if(r.Ok() && r.BitsLeft() >= 16) e.protocolVersion = r.ReadU16();
+	}
+	return r.Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Master favorites codecs
+// ---------------------------------------------------------------------------
+inline void WriteFavReq(BitWriter& w, const MsgFavReq& m) { w.WriteString(m.nick, MAX_NAME_LEN - 1); }
+inline bool ReadFavReq(BitReader& r, MsgFavReq& m)
+{
+	std::string n = r.ReadString(MAX_NAME_LEN - 1);
+	CopyStr(m.nick, sizeof m.nick, n.c_str());
+	return r.Ok();
+}
+
+inline void WriteFavAdd(BitWriter& w, const MsgFavAdd& m)
+{
+	w.WriteString(m.nick, MAX_NAME_LEN - 1);
+	w.WriteString(m.address, MAX_ADDR_LEN - 1);
+	w.WriteString(m.name, MAX_HOSTNAME_LEN - 1);
+}
+inline bool ReadFavAdd(BitReader& r, MsgFavAdd& m)
+{
+	std::string n = r.ReadString(MAX_NAME_LEN - 1);
+	std::string a = r.ReadString(MAX_ADDR_LEN - 1);
+	std::string h = r.ReadString(MAX_HOSTNAME_LEN - 1);
+	CopyStr(m.nick, sizeof m.nick, n.c_str());
+	CopyStr(m.address, sizeof m.address, a.c_str());
+	CopyStr(m.name, sizeof m.name, h.c_str());
+	return r.Ok();
+}
+
+inline void WriteFavResp(BitWriter& w, const MsgFavResp& m)
+{
+	w.WriteU8(m.ok);
+	w.WriteU8(m.count > MAX_FAV_ENTRIES ? (uint8_t)MAX_FAV_ENTRIES : m.count);
+	w.WriteString(m.error, sizeof m.error - 1);
+	uint8_t n = m.count > MAX_FAV_ENTRIES ? (uint8_t)MAX_FAV_ENTRIES : m.count;
+	for(uint8_t i = 0; i < n; i++){
+		w.WriteString(m.entries[i].address, MAX_ADDR_LEN - 1);
+		w.WriteString(m.entries[i].name, MAX_HOSTNAME_LEN - 1);
+	}
+}
+inline bool ReadFavResp(BitReader& r, MsgFavResp& m)
+{
+	m = MsgFavResp();
+	m.ok = r.ReadU8();
+	m.count = r.ReadU8();
+	std::string err = r.ReadString(sizeof m.error - 1);
+	CopyStr(m.error, sizeof m.error, err.c_str());
+	if(m.count > MAX_FAV_ENTRIES) m.count = (uint8_t)MAX_FAV_ENTRIES;
+	for(uint8_t i = 0; i < m.count; i++){
+		std::string a = r.ReadString(MAX_ADDR_LEN - 1);
+		std::string h = r.ReadString(MAX_HOSTNAME_LEN - 1);
+		CopyStr(m.entries[i].address, sizeof m.entries[i].address, a.c_str());
+		CopyStr(m.entries[i].name, sizeof m.entries[i].name, h.c_str());
+	}
 	return r.Ok();
 }
 

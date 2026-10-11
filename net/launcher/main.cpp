@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 
 #include <cstdio>
 #include <cstring>
@@ -36,8 +37,13 @@ using namespace rnet;
 // ---------------------------------------------------------------------------
 struct ServerRow {
 	std::string hostname, gameMode, address;
+	std::string mapName;              // live map (probe / announce / LAN)
 	int players = 0, maxPlayers = 0;
 	int pingMs = 0;
+	int protocolVersion = 0;          // 0 = unknown, else flag stale servers
+	bool favorite = false;            // came from the favorites list
+	bool live = false;                // answered a probe
+	bool online = false;              // reachable right now
 };
 
 static std::string g_gameExe = "reLCS.exe";
@@ -115,18 +121,18 @@ static bool LoadCefUi()
 // ---------------------------------------------------------------------------
 // queries (worker threads)
 // ---------------------------------------------------------------------------
-static std::vector<ServerRow> QueryMaster()
+static std::vector<ServerRow> QueryMaster(const std::string& host, uint16_t port)
 {
 	std::vector<ServerRow> rows;
 	ENetHost* client = enet_host_create(nullptr, 1, 2, 0, 0);
 	if(!client) return rows;
 
 	ENetAddress addr;
-	if(enet_address_set_host(&addr, g_masterHost.c_str()) < 0){
+	if(enet_address_set_host(&addr, host.c_str()) < 0){
 		enet_host_destroy(client);
 		return rows;
 	}
-	addr.port = g_masterPort;
+	addr.port = port;
 	ENetPeer* peer = enet_host_connect(client, &addr, 2, 0);
 	if(!peer){ enet_host_destroy(client); return rows; }
 
@@ -177,7 +183,13 @@ static std::vector<ServerRow> QueryMaster()
 	return rows;
 }
 
-static std::vector<ServerRow> QueryLan()
+static std::vector<ServerRow> QueryMasterDefault()
+{
+	return QueryMaster(g_masterHost, g_masterPort);
+}
+
+// masterHints (optional): "ip:port" of masters hinted by LAN responders
+static std::vector<ServerRow> QueryLan(std::vector<std::string>* masterHints = nullptr)
 {
 	std::vector<ServerRow> rows;
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -197,6 +209,39 @@ static std::vector<ServerRow> QueryLan()
 	inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
 	sendto(s, LAN_DISCOVER_MAGIC, (int)strlen(LAN_DISCOVER_MAGIC), 0,
 	       (sockaddr*)&dst, sizeof dst);
+	// subnet-directed broadcasts: the limited broadcast (255.255.255.255)
+	// often leaves through the wrong NIC on multi-homed machines
+	{
+		ULONG asz = 16 * 1024;
+		std::vector<uint8_t> abuf(asz);
+		IP_ADAPTER_ADDRESSES* addrs = (IP_ADAPTER_ADDRESSES*)abuf.data();
+		ULONG rc = GetAdaptersAddresses(AF_INET,
+		         GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+		         nullptr, addrs, &asz);
+		if(rc == ERROR_BUFFER_OVERFLOW){
+			abuf.resize(asz);
+			addrs = (IP_ADAPTER_ADDRESSES*)abuf.data();
+			rc = GetAdaptersAddresses(AF_INET,
+			         GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+			         nullptr, addrs, &asz);
+		}
+		if(rc == NO_ERROR){
+			for(IP_ADAPTER_ADDRESSES* a = addrs; a; a = a->Next){
+				if(a->OperStatus != IfOperStatusUp) continue;
+				for(IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u; u = u->Next){
+					if(u->Address.lpSockaddr->sa_family != AF_INET) continue;
+					uint32_t ip = ((sockaddr_in*)u->Address.lpSockaddr)->sin_addr.s_addr;
+					if((ip & 0xFF) == 127) continue;
+					uint8_t prefix = u->OnLinkPrefixLength ? u->OnLinkPrefixLength : 24;
+					// network-order-on-little-endian: the low `prefix` bits are network
+					uint32_t mask = prefix >= 32 ? 0xFFFFFFFFu : ((1u << prefix) - 1u);
+					dst.sin_addr.s_addr = ip | ~mask;
+					sendto(s, LAN_DISCOVER_MAGIC, (int)strlen(LAN_DISCOVER_MAGIC), 0,
+					       (sockaddr*)&dst, sizeof dst);
+				}
+			}
+		}
+	}
 
 	double t0 = GetTickCount64() / 1000.0;
 	while(GetTickCount64() / 1000.0 - t0 < 2.0){
@@ -205,7 +250,7 @@ static std::vector<ServerRow> QueryLan()
 		int n = recvfrom(s, buf, sizeof buf - 1, 0, (sockaddr*)&from, &flen);
 		if(n > 0){
 			buf[n] = '\0';
-			// RELCS_RESP_V1|hostname|players|max|gamemode|version|gameport
+			// RELCS_RESP_V1|hostname|players|max|gamemode|version|gameport|masterport|map
 			std::vector<std::string> parts;
 			std::string s2 = buf, cur;
 			for(char c : s2){
@@ -224,13 +269,255 @@ static std::vector<ServerRow> QueryLan()
 				char addrstr[48];
 				snprintf(addrstr, sizeof addrstr, "%s:%s", ipstr, parts[6].c_str());
 				row.address = addrstr;
+				// a LAN responder advertises its protocol version and map — the
+				// browser shows both without probing
+				row.protocolVersion = atoi(parts[5].c_str());
+				if(parts.size() >= 9) row.mapName = parts[8];
 				rows.push_back(row);
+				// optional tail: the responder's master port — lets the Internet
+				// tab find the list with zero configuration on other machines
+				if(masterHints && parts.size() >= 8 && !parts[7].empty()){
+					std::string hint = std::string(ipstr) + ":" + parts[7];
+					bool dup = false;
+					for(const std::string& h : *masterHints) if(h == hint){ dup = true; break; }
+					if(!dup) masterHints->push_back(hint);
+				}
 			}
 		}
 		Sleep(10);
 	}
 	closesocket(s);
-	return rows;
+	// the same server answers on several broadcast paths — one row each
+	std::vector<ServerRow> unique;
+	for(const ServerRow& r : rows){
+		bool dup = false;
+		for(const ServerRow& u : unique) if(u.address == r.address){ dup = true; break; }
+		if(!dup) unique.push_back(r);
+	}
+	return unique;
+}
+
+// ---------------------------------------------------------------------------
+// live server info: a HELLO_PROBE handshake
+// ---------------------------------------------------------------------------
+// The server answers MSG_WELCOME (hostname, mode, map, players) and allocates no
+// player slot, so the launcher can sample every listed server safely. The
+// HELLO -> WELCOME round trip is also a real ping sample for the graph.
+struct ServerInfo {
+	bool ok = false;
+	std::string error;
+	std::string hostname, gameMode, mapName;
+	int players = 0, maxPlayers = 0;
+	int pingMs = -1;
+	int protocolVersion = PROTOCOL_VERSION;
+	bool versionMismatch = false;
+};
+
+static bool SplitAddress(const std::string& address, std::string& host, uint16_t& port)
+{
+	size_t c = address.rfind(':');
+	if(c == std::string::npos) return false;
+	host = address.substr(0, c);
+	int p = atoi(address.c_str() + c + 1);
+	if(host.empty() || p <= 0 || p > 65535) return false;
+	port = (uint16_t)p;
+	return true;
+}
+
+static ServerInfo ProbeServer(const std::string& address, double budgetSec = 2.5)
+{
+	ServerInfo info;
+	std::string host;
+	uint16_t port = 0;
+	if(!SplitAddress(address, host, port)){ info.error = "bad address"; return info; }
+
+	ENetHost* client = enet_host_create(nullptr, 1, 2, 0, 0);
+	if(!client){ info.error = "enet host"; return info; }
+	ENetAddress addr;
+	if(enet_address_set_host(&addr, host.c_str()) < 0){
+		enet_host_destroy(client);
+		info.error = "cannot resolve host";
+		return info;
+	}
+	addr.port = port;
+	ENetPeer* peer = enet_host_connect(client, &addr, 2, 0);
+	if(!peer){ enet_host_destroy(client); info.error = "cannot connect"; return info; }
+
+	double t0 = GetTickCount64() / 1000.0, sentAt = 0.0;
+	bool connected = false, sentHello = false, gotWelcome = false;
+	while(GetTickCount64() / 1000.0 - t0 < budgetSec){
+		ENetEvent ev;
+		while(enet_host_service(client, &ev, 0) > 0){
+			switch(ev.type){
+			case ENET_EVENT_TYPE_CONNECT:
+				connected = true;
+				break;
+			case ENET_EVENT_TYPE_RECEIVE:{
+				BitReader r(ev.packet->data, ev.packet->dataLength);
+				MsgType type = (MsgType)r.ReadU8();
+				if(type == MSG_WELCOME){
+					MsgWelcome wel;
+					if(ReadWelcome(r, wel)){
+						gotWelcome = true;
+						info.hostname = wel.hostname;
+						info.gameMode = wel.gameMode;
+						info.mapName = wel.mapName;
+						info.players = wel.players;
+						info.maxPlayers = wel.maxPlayers;
+						if(sentAt > 0.0)
+							info.pingMs = (int)((GetTickCount64() / 1000.0 - sentAt) * 1000.0 + 0.5);
+					}
+				}else if(type == MSG_KICK || type == MSG_DISCONNECT){
+					MsgKick k;
+					if(ReadKick(r, k)){
+						info.error = k.reason;
+						if(strstr(k.reason, "protocol")) info.versionMismatch = true;
+					}
+				}
+				enet_packet_destroy(ev.packet);
+				break;
+			}
+			default: break;
+			}
+		}
+		if(connected && !sentHello){
+			sentHello = true;
+			BitWriter w;
+			BeginMsg(w, MSG_HELLO);
+			MsgHello h;
+			h.protocolVersion = PROTOCOL_VERSION;
+			h.flags = HELLO_PROBE;
+			h.gameVersion = GAME_VERSION_TAG;
+			CopyStr(h.name, sizeof h.name, "launcher");
+			WriteHello(w, h);
+			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+			enet_peer_send(peer, 0, pkt);
+			enet_host_flush(client);
+			sentAt = GetTickCount64() / 1000.0;
+		}
+		if(gotWelcome) break;
+		Sleep(5);
+	}
+
+	if(!gotWelcome && info.error.empty())
+		info.error = connected ? "no reply from the server" : "no route to the server";
+	info.ok = gotWelcome;
+	// ENet keeps its own estimate; fall back to it when timing was too coarse
+	if(info.ok && info.pingMs <= 0)
+		info.pingMs = (int)peer->roundTripTime;
+	if(peer) enet_peer_disconnect_now(peer, 0);
+	enet_host_destroy(client);
+	return info;
+}
+
+// refresh a row from a probe: live map/mode/players + a ping sample
+static bool ProbeIntoRow(const std::string& address, ServerRow& row, std::string& err,
+                         double budgetSec = 2.5)
+{
+	ServerInfo info = ProbeServer(address, budgetSec);
+	row.online = info.ok;
+	if(!info.ok){
+		err = info.error.empty() ? "unreachable" : info.error;
+		return false;
+	}
+	row.live = true;
+	if(!info.hostname.empty()) row.hostname = info.hostname;
+	if(!info.gameMode.empty()) row.gameMode = info.gameMode;
+	row.mapName = info.mapName;
+	row.players = info.players;
+	row.maxPlayers = info.maxPlayers;
+	row.pingMs = info.pingMs;
+	row.protocolVersion = info.protocolVersion;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// favorites: the master stores them (per username); favorites.ini is a cache
+// ---------------------------------------------------------------------------
+static std::mutex g_rowMutex;
+static std::vector<ServerRow> g_lastRows;   // the list the UI is showing
+
+static void SaveFavoritesCache(const std::vector<ServerRow>& rows)
+{
+	std::ofstream f("favorites.ini");
+	f << "# cached copy of the master-side favorites (server is authoritative)\n";
+	for(const auto& r : rows)
+		f << r.address << " " << (r.hostname.empty() ? r.address : r.hostname) << "\n";
+}
+
+// one request/response exchange with the master; op = FAV_LIST/ADD/DEL
+static bool MasterFavOp(MsgType op, const std::string& address, const std::string& name,
+                        std::vector<ServerRow>& out, std::string& err)
+{
+	out.clear();
+	ENetHost* client = enet_host_create(nullptr, 1, 2, 0, 0);
+	if(!client){ err = "enet host"; return false; }
+	ENetAddress addr;
+	if(enet_address_set_host(&addr, g_masterHost.c_str()) < 0){
+		enet_host_destroy(client);
+		err = "cannot resolve master";
+		return false;
+	}
+	addr.port = g_masterPort;
+	ENetPeer* peer = enet_host_connect(client, &addr, 2, 0);
+	if(!peer){ enet_host_destroy(client); err = "cannot reach master"; return false; }
+
+	double t0 = GetTickCount64() / 1000.0;
+	bool connected = false, sent = false, done = false;
+	while(GetTickCount64() / 1000.0 - t0 < 3.5 && !done){
+		ENetEvent ev;
+		while(enet_host_service(client, &ev, 0) > 0){
+			if(ev.type == ENET_EVENT_TYPE_CONNECT) connected = true;
+			else if(ev.type == ENET_EVENT_TYPE_RECEIVE){
+				BitReader r(ev.packet->data, ev.packet->dataLength);
+				if((MsgType)r.ReadU8() == MSG_MASTER_FAV_RESP){
+					MsgFavResp resp;
+					if(ReadFavResp(r, resp)){
+						done = true;
+						if(!resp.ok){
+							err = resp.error;
+							if(err.empty()) err = "master rejected the request";
+						}else{
+							for(uint8_t i = 0; i < resp.count; i++){
+								ServerRow row;
+								row.address = resp.entries[i].address;
+								row.hostname = resp.entries[i].name[0] ? resp.entries[i].name : row.address;
+								row.gameMode = "-";
+								row.favorite = true;
+								out.push_back(row);
+							}
+						}
+					}
+				}
+				enet_packet_destroy(ev.packet);
+			}
+		}
+		if(connected && !sent){
+			sent = true;
+			BitWriter w;
+			if(op == MSG_MASTER_FAV_LIST){
+				BeginMsg(w, MSG_MASTER_FAV_LIST);
+				MsgFavReq req;
+				CopyStr(req.nick, sizeof req.nick, g_nick.c_str());
+				WriteFavReq(w, req);
+			}else{
+				BeginMsg(w, op);
+				MsgFavAdd req;
+				CopyStr(req.nick, sizeof req.nick, g_nick.c_str());
+				CopyStr(req.address, sizeof req.address, address.c_str());
+				CopyStr(req.name, sizeof req.name, name.c_str());
+				WriteFavAdd(w, req);
+			}
+			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+			enet_peer_send(peer, 0, pkt);
+			enet_host_flush(client);
+		}
+		Sleep(5);
+	}
+	if(!done && err.empty()) err = connected ? "master did not answer" : "master unreachable";
+	if(peer) enet_peer_disconnect_now(peer, 0);
+	enet_host_destroy(client);
+	return done;
 }
 
 static std::vector<ServerRow> LoadFavorites()
@@ -343,28 +630,238 @@ static void SaveConfig()
 // ---------------------------------------------------------------------------
 static std::string g_lastJoinError;
 
+// ---------------------------------------------------------------------------
+// game install auto-detection
+// ---------------------------------------------------------------------------
+static bool FileExists(const std::string& p)
+{
+	DWORD a = GetFileAttributesA(p.c_str());
+	return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool DirExists(const std::string& p)
+{
+	DWORD a = GetFileAttributesA(p.c_str());
+	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string EnvDir(const char* name)
+{
+	char buf[MAX_PATH] = {};
+	DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
+	return (n > 0 && n < sizeof buf) ? std::string(buf) : std::string();
+}
+
+// a directory is a usable install when it holds the game data the engine needs;
+// cefui.dll is required for the in-game UI, so report it separately
+static bool GameDirOk(const std::string& dir, bool& dataOk, bool& cefOk)
+{
+	std::string exe = dir + "\\reLCS.exe";
+	if(!FileExists(exe)) return false;
+	dataOk = FileExists(dir + "\\models\\gta3.img") ||
+	         FileExists(dir + "\\data\\default.ide") ||
+	         FileExists(dir + "\\DATA\\DEFAULT.IDE");
+	cefOk = FileExists(dir + "\\cefui.dll");
+	return true;
+}
+
+static bool RegReadString(HKEY root, const char* sub, const char* value, std::string& out)
+{
+	HKEY key = nullptr;
+	if(RegOpenKeyExA(root, sub, 0, KEY_READ, &key) != ERROR_SUCCESS) return false;
+	char buf[1024] = {};
+	DWORD size = sizeof buf, type = 0;
+	LONG rc = RegQueryValueExA(key, value, nullptr, &type, (LPBYTE)buf, &size);
+	RegCloseKey(key);
+	if(rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return false;
+	out = buf;
+	return !out.empty();
+}
+
+// one level of uninstall entries: DisplayName -> InstallLocation
+static void RegUninstallDirs(std::vector<std::string>& out)
+{
+	const char* roots[] = {
+		"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+		"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+	};
+	HKEY hives[] = { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
+	for(HKEY hive : hives){
+		for(const char* r : roots){
+			HKEY key = nullptr;
+			if(RegOpenKeyExA(hive, r, 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
+			char sub[256];
+			DWORD idx = 0, subLen = sizeof sub;
+			while(RegEnumKeyExA(key, idx++, sub, &subLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS){
+				subLen = sizeof sub;
+				std::string display, loc;
+				std::string path = std::string(r) + "\\" + sub;
+				if(RegReadString(hive, path.c_str(), "DisplayName", display) &&
+				   (display.find("reLCS") != std::string::npos ||
+				    display.find("Liberty City Stories") != std::string::npos) &&
+				   RegReadString(hive, path.c_str(), "InstallLocation", loc) && !loc.empty())
+					out.push_back(loc);
+			}
+			RegCloseKey(key);
+		}
+	}
+}
+
+// bounded directory walk (depth 2, capped) for "somewhere in Downloads"
+static void ScanForGame(const std::string& root, int depth, std::vector<std::string>& out, int& budget)
+{
+	if(depth < 0 || budget <= 0) return;
+	std::string pattern = root + "\\*";
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+	if(h == INVALID_HANDLE_VALUE){
+		// the root itself may be the install
+		bool dataOk = false, cefOk = false;
+		if(GameDirOk(root, dataOk, cefOk)) out.push_back(root);
+		return;
+	}
+	do{
+		if(budget-- <= 0) break;
+		if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+		if(fd.cFileName[0] == '.') continue;
+		std::string sub = root + "\\" + fd.cFileName;
+		bool dataOk = false, cefOk = false;
+		if(GameDirOk(sub, dataOk, cefOk)){ out.push_back(sub); continue; }
+		if(depth > 0) ScanForGame(sub, depth - 1, out, budget);
+	}while(FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+// detection order: configured path, registry, common install dirs, next to the
+// launcher, a bounded scan of the usual download/game folders, then PATH.
+// Returns the exe path ("") when nothing looks like an install.
+static std::string DetectGameExe(std::string& how, bool& dataOk, std::string& err)
+{
+	how.clear();
+	err.clear();
+	dataOk = false;
+	std::vector<std::pair<std::string, const char*>> cands;   // path or dir + source
+
+	if(!g_gameExe.empty())
+		cands.push_back({ g_gameExe, "settings" });
+
+	// registry: launcher-written hints, App Paths, uninstall entries
+	const char* regKeys[] = { "SOFTWARE\\reLCS", "SOFTWARE\\WOW6432Node\\reLCS" };
+	HKEY hives[] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+	for(HKEY hive : hives)
+		for(const char* k : regKeys){
+			std::string dir;
+			if(RegReadString(hive, k, "InstallDir", dir)) cands.push_back({ dir + "\\reLCS.exe", "registry" });
+		}
+	{
+		std::string ap;
+		if(RegReadString(HKEY_LOCAL_MACHINE,
+		     "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\reLCS.exe", "", ap))
+			cands.push_back({ ap, "registry" });
+	}
+	{
+		std::vector<std::string> dirs;
+		RegUninstallDirs(dirs);
+		for(const auto& d : dirs) cands.push_back({ d + "\\reLCS.exe", "registry (uninstall entry)" });
+	}
+
+	// common install locations
+	char self[MAX_PATH] = {};
+	GetModuleFileNameA(nullptr, self, sizeof self);
+	std::string selfDir = self;
+	size_t selfSlash = selfDir.find_last_of('\\');
+	if(selfSlash != std::string::npos) selfDir.resize(selfSlash);
+
+	std::vector<std::string> commonDirs;
+	for(const char* env : { "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432" }){
+		std::string b = EnvDir(env);
+		if(!b.empty()) commonDirs.push_back(b + "\\reLCS");
+	}
+	for(const char* env : { "LOCALAPPDATA", "APPDATA" }){
+		std::string b = EnvDir(env);
+		if(!b.empty()) commonDirs.push_back(b + "\\reLCS");
+	}
+	std::string up = EnvDir("USERPROFILE");
+	if(!up.empty()){
+		commonDirs.push_back(up + "\\Downloads\\reLCS");
+		commonDirs.push_back(up + "\\Desktop\\reLCS");
+		commonDirs.push_back(up + "\\Documents\\reLCS");
+	}
+	commonDirs.push_back("C:\\Games\\reLCS");
+	for(const auto& d : commonDirs) cands.push_back({ d + "\\reLCS.exe", "common path" });
+
+	// next to the launcher (shipped builds) and the dev tree
+	cands.push_back({ selfDir + "\\reLCS.exe", "launcher directory" });
+	cands.push_back({ selfDir + "\\..\\..\\..\\..\\reLCS\\reLCS.exe", "dev tree" });
+	cands.push_back({ selfDir + "\\..\\..\\..\\..\\bin\\win-amd64-librw_d3d9-oal\\Release\\reLCS.exe", "dev build" });
+	cands.push_back({ "reLCS.exe", "PATH" });
+
+	for(auto& c : cands){
+		bool data = false, cef = false;
+		std::string dir = c.first;
+		char full[MAX_PATH * 2] = {};
+		if(dir.find('\\') != std::string::npos && dir.find(".exe") == std::string::npos){
+			GetFullPathNameA(dir.c_str(), sizeof full, full, nullptr);
+			dir = full;
+			if(GameDirOk(dir, data, cef)){
+				dir += "\\reLCS.exe";
+				how = c.second;
+				dataOk = data;
+				if(!data) err = "game data missing (models/gta3.img)";
+				return dir;
+			}
+			continue;
+		}
+		if(!FileExists(dir)) continue;
+		GetFullPathNameA(dir.c_str(), sizeof full, full, nullptr);
+		std::string exe = full, exeDir = exe;
+		size_t s = exeDir.find_last_of('\\');
+		exeDir = (s == std::string::npos) ? std::string() : exeDir.substr(0, s);
+		bool dirOk = !exeDir.empty() && GameDirOk(exeDir, data, cef);
+		how = c.second;
+		dataOk = data;
+		if(!dirOk) err = "found the exe but its data files are not next to it";
+		else if(!data) err = "game data missing (models/gta3.img)";
+		else if(!cef) err = "cefui.dll is missing (the in-game UI will not show)";
+		return exe;
+	}
+
+	// bounded scan of the folders games actually get extracted to
+	std::vector<std::string> roots;
+	if(!up.empty()){
+		roots.push_back(up + "\\Downloads");
+		roots.push_back(up + "\\Desktop");
+		roots.push_back(up + "\\Documents");
+		roots.push_back(up);
+	}
+	roots.push_back("C:\\Games");
+	std::vector<std::string> found;
+	for(const auto& r : roots){
+		if(!DirExists(r)) continue;
+		int budget = 300;
+		ScanForGame(r, 1, found, budget);
+		if(!found.empty()) break;
+	}
+	if(!found.empty()){
+		bool data = false, cef = false;
+		GameDirOk(found[0], data, cef);
+		how = "folder scan";
+		dataOk = data;
+		if(!data) err = "game data missing (models/gta3.img)";
+		else if(!cef) err = "cefui.dll is missing (the in-game UI will not show)";
+		return found[0] + "\\reLCS.exe";
+	}
+
+	if(err.empty()) err = "no game install found";
+	return "";
+}
+
 // find reLCS.exe: explicit config first, then well-known locations
 static std::string ResolveGameExe()
 {
-	std::vector<std::string> cands;
-	if(!g_gameExe.empty()) cands.push_back(g_gameExe);
-	char dir[320] = {};
-	GetModuleFileNameA(nullptr, dir, sizeof dir);
-	char* slash = strrchr(dir, '\\');
-	if(slash) *slash = 0;
-	std::string base = dir;
-	cands.push_back(base + "\\reLCS.exe");                            // next to launcher
-	cands.push_back(base + "\\..\\..\\..\\..\\reLCS\\reLCS.exe"); // dev layout
-	cands.push_back("reLCS.exe");                                     // PATH
-	for(const auto& c : cands){
-		DWORD a = GetFileAttributesA(c.c_str());
-		if(a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)){
-			char full[640] = {};
-			GetFullPathNameA(c.c_str(), sizeof full, full, nullptr);
-			return full;
-		}
-	}
-	return "";
+	std::string how, err;
+	bool dataOk = false;
+	return DetectGameExe(how, dataOk, err);
 }
 
 static bool JoinServer(const std::string& address, const std::string& nickIn)
@@ -379,13 +876,15 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 	RememberUser(g_nick);
 	SaveConfig();
 
-	std::string exe = ResolveGameExe();
+	std::string how, detErr;
+	bool dataOk = false;
+	std::string exe = DetectGameExe(how, dataOk, detErr);
 	if(exe.empty()){
-		g_lastJoinError = "game executable not found — set it in Settings";
-		Log("[JOIN] %s (looked for: %s, launcher dir, ../../../../reLCS, PATH)",
-		    g_lastJoinError.c_str(), g_gameExe.c_str());
+		g_lastJoinError = "game install not found (" + detErr + ") — set the path in Settings";
+		Log("[JOIN] %s", g_lastJoinError.c_str());
 		return false;
 	}
+	Log("[JOIN] game detected via %s: %s (data=%d)", how.c_str(), exe.c_str(), (int)dataOk);
 
 	// the game must run from its own directory (CEF runtime, gameui.html,
 	// AUDIO/ and the game files all resolve against the CWD)
@@ -438,17 +937,23 @@ static void Reply(const std::string& json)
 		g_exec(("window.onCefReply && onCefReply('" + json + "')").c_str());
 }
 
+static std::string RowToJson(const ServerRow& r)
+{
+	char buf[512];
+	snprintf(buf, sizeof buf, "{\"hostname\":\"%s\",\"gameMode\":\"%s\",\"address\":\"%s\","
+	         "\"map\":\"%s\",\"players\":%d,\"maxPlayers\":%d,\"pingMs\":%d,"
+	         "\"protocolVersion\":%d,\"favorite\":%s,\"live\":%s,\"online\":%s}",
+	         Jesc(r.hostname).c_str(), Jesc(r.gameMode).c_str(), Jesc(r.address).c_str(),
+	         Jesc(r.mapName).c_str(), r.players, r.maxPlayers, r.pingMs, r.protocolVersion,
+	         r.favorite ? "true" : "false", r.live ? "true" : "false", r.online ? "true" : "false");
+	return buf;
+}
+
 static std::string RowsToJson(const std::vector<ServerRow>& rows)
 {
 	std::string j = "[";
-	for(size_t i = 0; i < rows.size(); i++){
-		char head[128];
-		snprintf(head, sizeof head, "%s{\"hostname\":\"%s\",\"gameMode\":\"%s\",\"address\":\"%s\","
-		         "\"players\":%d,\"maxPlayers\":%d,\"pingMs\":%d}",
-		         i ? "," : "", Jesc(rows[i].hostname).c_str(), Jesc(rows[i].gameMode).c_str(),
-		         Jesc(rows[i].address).c_str(), rows[i].players, rows[i].maxPlayers, rows[i].pingMs);
-		j += head;
-	}
+	for(size_t i = 0; i < rows.size(); i++)
+		j += (i ? "," : "") + RowToJson(rows[i]);
 	j += "]";
 	return j;
 }
@@ -512,10 +1017,27 @@ static void HandleQuery(const char* request, void*)
 
 	if(cmd == "loaded"){
 		g_loaded = true;
-		std::string gameShown = ResolveGameExe();
+		std::string how, gErr;
+		bool dataOk = false;
+		std::string gameShown = DetectGameExe(how, dataOk, gErr);
 		if(gameShown.empty()) gameShown = g_gameExe;
+		bool cefOk = false;
+		if(!gameShown.empty()){
+			std::string d = gameShown;
+			size_t s = d.find_last_of('\\');
+			if(s != std::string::npos){
+				d.resize(s);
+				bool data2 = false;
+				GameDirOk(d, data2, cefOk);
+			}
+		}
 		Reply("{\"reply\":\"init\",\"nick\":\"" + Jesc(g_nick) +
 		      "\",\"game\":\"" + Jesc(gameShown) +
+		      "\",\"gameHow\":\"" + Jesc(how) +
+		      "\",\"gameData\":" + (dataOk ? "true" : "false") +
+		      "\",\"gameCef\":" + (cefOk ? "true" : "false") +
+		      "\",\"gameError\":\"" + Jesc(gErr) +
+		      "\",\"version\":" + std::to_string((int)PROTOCOL_VERSION) +
 		      "\",\"master\":\"" + Jesc(g_masterHost + ":" + std::to_string(g_masterPort)) +
 		      "\",\"rcon\":\"" + Jesc(g_rconPw) +
 		      "\",\"profiles\":" + ProfilesToJson() + "}");
@@ -525,12 +1047,50 @@ static void HandleQuery(const char* request, void*)
 		std::string which = arg("tab");
 		std::thread([which](){
 			std::vector<ServerRow> rows;
-			const char* source = "internet";
+			std::string source = "internet", note;
 			if(which == "lan"){ rows = QueryLan(); source = "lan"; }
-			else if(which == "favorites"){ rows = LoadFavorites(); source = "favorites"; }
-			else rows = QueryMaster();
-			Log("[QUERY] %s -> %zu servers", source, rows.size());
-			Reply("{\"reply\":\"servers\",\"source\":\"" + std::string(source) +
+			else if(which == "favorites"){
+				// favorites live on the master (per username); the local file is
+				// only a cache for when the master cannot be reached
+				std::vector<ServerRow> favs;
+				std::string err;
+				if(MasterFavOp(MSG_MASTER_FAV_LIST, "", "", favs, err)){
+					rows = favs;
+					source = "master";
+					SaveFavoritesCache(rows);
+				}else{
+					rows = LoadFavorites();
+					source = "local cache";
+					note = "master unavailable (" + err + ") — showing the cached list";
+					Log("[FAV] %s", note.c_str());
+				}
+			}
+			else {
+				rows = QueryMasterDefault();
+				if(rows.empty()){
+					// configured master unreachable (fresh machines default to
+					// 127.0.0.1) — fall back to a master discovered on the LAN
+					std::vector<std::string> hints;
+					QueryLan(&hints);
+					for(const std::string& h : hints){
+						size_t c = h.rfind(':');
+						if(c == std::string::npos) continue;
+						rows = QueryMaster(h.substr(0, c), (uint16_t)atoi(h.substr(c + 1).c_str()));
+						if(!rows.empty()){
+							Log("[QUERY] master fallback via %s", h.c_str());
+							break;
+						}
+					}
+				}
+			}
+			{
+				// remember what the UI is showing: probe/pingall address rows by index
+				std::lock_guard<std::mutex> lk(g_rowMutex);
+				g_lastRows = rows;
+			}
+			Log("[QUERY] %s -> %zu servers", source.c_str(), rows.size());
+			Reply("{\"reply\":\"servers\",\"source\":\"" + source +
+			      "\",\"note\":\"" + Jesc(note) +
 			      "\",\"rows\":" + RowsToJson(rows) + "}");
 		}).detach();
 	}else if(cmd == "join"){
@@ -540,6 +1100,15 @@ static void HandleQuery(const char* request, void*)
 		if(address.empty()) g_lastJoinError = "no server address";
 		Reply(std::string("{\"reply\":\"join\",\"ok\":") + (ok ? "true" : "false") +
 		      ",\"address\":\"" + Jesc(address) + "\",\"error\":\"" + Jesc(g_lastJoinError) + "\"}");
+	}else if(cmd == "addfav"){
+		// legacy local-only add (kept for older pages / offline use)
+		std::string address = arg("address"), name = arg("name");
+		bool ok = !address.empty();
+		if(ok){
+			std::ofstream f("favorites.ini", std::ios::app);
+			f << address << " " << (name.empty() ? address : name) << "\n";
+		}
+		Reply(std::string("{\"reply\":\"addfav\",\"ok\":") + (ok ? "true" : "false") + "}");
 	}else if(cmd == "saveuser"){
 		std::string nick = arg("nick");
 		bool ok = RememberUser(nick);
@@ -559,14 +1128,102 @@ static void HandleQuery(const char* request, void*)
 		}
 		SaveConfig();
 		Reply("{\"reply\":\"config\",\"ok\":true}");
-	}else if(cmd == "addfav"){
+	}else if(cmd == "favadd" || cmd == "favdel"){
 		std::string address = arg("address"), name = arg("name");
-		bool ok = !address.empty();
-		if(ok){
-			std::ofstream f("favorites.ini", std::ios::app);
-			f << address << " " << (name.empty() ? address : name) << "\n";
-		}
-		Reply(std::string("{\"reply\":\"addfav\",\"ok\":") + (ok ? "true" : "false") + "}");
+		bool add = (cmd == "favadd");
+		if(address.empty()){
+			Reply("{\"reply\":\"fav\",\"ok\":false,\"error\":\"select a server first\"}");
+		}else std::thread([add, address, name](){
+			std::vector<ServerRow> rows;
+			std::string err;
+			bool ok = MasterFavOp(add ? MSG_MASTER_FAV_ADD : MSG_MASTER_FAV_DEL, address, name, rows, err);
+			std::string note;
+			if(ok){
+				SaveFavoritesCache(rows);
+			}else{
+				// master unreachable: keep the local cache usable and say so
+				std::vector<ServerRow> local = LoadFavorites();
+				std::vector<ServerRow> kept;
+				bool have = false;
+				for(const auto& r : local){
+					if(r.address == address){
+						have = true;
+						if(!add) continue;   // delete locally
+					}
+					kept.push_back(r);
+				}
+				if(add && !have){
+					ServerRow nr;
+					nr.address = address;
+					nr.hostname = name.empty() ? address : name;
+					kept.push_back(nr);
+				}
+				SaveFavoritesCache(kept);
+				rows = kept;
+				note = "master unreachable (" + err + ") — kept in the local cache only";
+				Log("[FAV] %s", note.c_str());
+			}
+			Reply("{\"reply\":\"fav\",\"ok\":" + std::string(ok ? "true" : "false") +
+			      ",\"add\":" + (add ? "true" : "false") +
+			      ",\"address\":\"" + Jesc(address) +
+			      "\",\"error\":\"" + Jesc(note) +
+			      "\",\"rows\":" + RowsToJson(rows) + "}");
+		}).detach();
+	}else if(cmd == "detectgame"){
+		std::thread([](){
+			std::string how, err;
+			bool dataOk = false, cefOk = false;
+			std::string exe = DetectGameExe(how, dataOk, err);
+			if(!exe.empty()){
+				std::string d = exe;
+				size_t s = d.find_last_of('\\');
+				if(s != std::string::npos){
+					d.resize(s);
+					bool data2 = false;
+					GameDirOk(d, data2, cefOk);
+				}
+			}
+			Log("[DETECT] game=%s how=%s data=%d cef=%d (%s)",
+			    exe.empty() ? "-" : exe.c_str(), how.empty() ? "-" : how.c_str(),
+			    (int)dataOk, (int)cefOk, err.c_str());
+			Reply("{\"reply\":\"game\",\"ok\":" + std::string(exe.empty() ? "false" : "true") +
+			      ",\"path\":\"" + Jesc(exe) + "\",\"how\":\"" + Jesc(how) +
+			      "\",\"data\":" + (dataOk ? "true" : "false") +
+			      "\",\"cef\":" + (cefOk ? "true" : "false") +
+			      ",\"error\":\"" + Jesc(err) + "\"}");
+		}).detach();
+	}else if(cmd == "probe"){
+		std::string address = arg("address");
+		std::thread([address](){
+			ServerRow row;
+			row.address = address;
+			std::string err;
+			bool alive = !address.empty() && ProbeIntoRow(address, row, err);
+			Reply("{\"reply\":\"info\",\"address\":\"" + Jesc(address) +
+			      "\",\"ok\":" + (alive ? "true" : "false") +
+			      ",\"error\":\"" + Jesc(err) + "\",\"row\":" + RowToJson(row) + "}");
+		}).detach();
+	}else if(cmd == "pingall"){
+		std::thread([](){
+			std::vector<ServerRow> rows;
+			{
+				std::lock_guard<std::mutex> lk(g_rowMutex);
+				rows = g_lastRows;
+			}
+			// short budget per server: the point is to fill the table, not to be exact
+			int probed = 0, online = 0;
+			for(size_t i = 0; i < rows.size() && probed < 24; i++, probed++){
+				ServerRow row = rows[i];
+				std::string err;
+				bool alive = ProbeIntoRow(row.address, row, err, 1.0);
+				if(alive) online++;
+				Reply("{\"reply\":\"ping\",\"address\":\"" + Jesc(row.address) +
+				      "\",\"ok\":" + (alive ? "true" : "false") +
+				      ",\"error\":\"" + Jesc(err) + "\",\"row\":" + RowToJson(row) + "}");
+			}
+			Reply("{\"reply\":\"pingdone\",\"probed\":" + std::to_string(probed) +
+			      ",\"online\":" + std::to_string(online) + "}");
+		}).detach();
 	}else if(cmd == "selftest"){
 		Reply("{\"reply\":\"selftest\",\"ok\":true,\"detail\":\"bridge ok\"}");
 	}else if(cmd == "quit"){
@@ -635,7 +1292,18 @@ static std::string HtmlUrl()
 // ---------------------------------------------------------------------------
 static int SelfTest(bool cefLoaded)
 {
-	auto master = QueryMaster();
+	auto master = QueryMasterDefault();
+	if(master.empty()){
+		// same fallback as the Internet tab: a LAN-discovered master
+		std::vector<std::string> hints;
+		QueryLan(&hints);
+		for(const std::string& h : hints){
+			size_t c = h.rfind(':');
+			if(c == std::string::npos) continue;
+			master = QueryMaster(h.substr(0, c), (uint16_t)atoi(h.substr(c + 1).c_str()));
+			if(!master.empty()) break;
+		}
+	}
 	Log("[SELFTEST] master -> %zu servers", master.size());
 	for(auto& r : master)
 		Log("[SELFTEST] master: \"%s\" %s %d/%d mode=%s",
@@ -659,13 +1327,77 @@ static int SelfTest(bool cefLoaded)
 	    (int)(ValidUsername("Test_User_1") && !ValidUsername("has space")),
 	    (int)saved, (int)found, g_profiles.size());
 
+	// game install auto-detection
+	std::string how, gErr;
+	bool dataOk = false, cefOk = false;
+	std::string gamePath = DetectGameExe(how, dataOk, gErr);
+	if(!gamePath.empty()){
+		std::string d = gamePath;
+		size_t s = d.find_last_of('\\');
+		if(s != std::string::npos){
+			d.resize(s);
+			bool data2 = false;
+			GameDirOk(d, data2, cefOk);
+		}
+	}
+	Log("[SELFTEST] game: path=\"%s\" how=%s data=%d cef=%d (%s)",
+	    gamePath.c_str(), how.empty() ? "-" : how.c_str(), (int)dataOk, (int)cefOk, gErr.c_str());
+
+	// favorites: server-side persistence round trip on the master
+	bool favOk = true;
+	{
+		std::string favErr;
+		std::vector<ServerRow> rows;
+		const char* probeAddr = "127.0.0.1:65000";
+		bool added = MasterFavOp(MSG_MASTER_FAV_ADD, probeAddr, "E2E Favourite", rows, favErr);
+		bool found = false;
+		for(auto& r : rows) if(r.address == probeAddr) found = true;
+		bool delOk = MasterFavOp(MSG_MASTER_FAV_DEL, probeAddr, "", rows, favErr);
+		bool gone = true;
+		for(auto& r : rows) if(r.address == probeAddr) gone = false;
+		if(master.empty()){
+			Log("[SELFTEST] favorites: SKIPPED (no master reachable)");
+		}else{
+			Log("[SELFTEST] favorites: add=%d listed=%d found=%d removed=%d gone=%d total=%zu",
+			    (int)added, (int)rows.size(), (int)found, (int)delOk, (int)gone, rows.size());
+			favOk = added && found && delOk && gone;
+		}
+	}
+
+	// live probe: real map/mode/players/ping from a server we can see.
+	// probe a protocol-compatible server — probing an outdated one is expected to
+	// fail with "protocol version mismatch" (and the browser flags it as stale)
+	ServerInfo liveInfo;
+	std::string probeTarget;
+	bool haveCompatible = false;
+	for(const auto& r : lan)
+		if(r.protocolVersion == PROTOCOL_VERSION){ probeTarget = r.address; haveCompatible = true; break; }
+	if(!haveCompatible)
+		for(const auto& r : master)
+			if(r.protocolVersion == PROTOCOL_VERSION){ probeTarget = r.address; haveCompatible = true; break; }
+	if(probeTarget.empty() && !lan.empty()) probeTarget = lan[0].address;   // report why it fails
+	if(!probeTarget.empty()){
+		liveInfo = ProbeServer(probeTarget);
+		Log("[SELFTEST] probe %s -> ok=%d hostname=\"%s\" mode=%s map=%s players=%d/%d ping=%dms (%s)",
+		    probeTarget.c_str(), (int)liveInfo.ok, liveInfo.hostname.c_str(), liveInfo.gameMode.c_str(),
+		    liveInfo.mapName.c_str(), liveInfo.players, liveInfo.maxPlayers, liveInfo.pingMs,
+		    liveInfo.error.c_str());
+	}else{
+		Log("[SELFTEST] probe: SKIPPED (no server in the list)");
+	}
+	// a probe that correctly diagnoses an outdated server still proves the path
+	bool probeOk = probeTarget.empty() || liveInfo.ok || (!haveCompatible && liveInfo.versionMismatch);
+	if(!liveInfo.ok && liveInfo.versionMismatch && !haveCompatible)
+		Log("[SELFTEST] probe: only stale servers reachable — mismatch reported as expected");
+
 	// chromium UI: page loaded (JS->host) + title echo (host->JS->host)
 	bool uiLoaded = g_loaded.load();
 	bool uiEcho = g_gotTitle.load();
 	Log("[SELFTEST] cef: dll=%d page_loaded=%d host_js_host_roundtrip=%d",
 	    (int)cefLoaded, (int)uiLoaded, (int)uiEcho);
 
-	bool pass = !master.empty() && !lan.empty() && userOk && cefLoaded && uiLoaded && uiEcho;
+	bool pass = !master.empty() && !lan.empty() && userOk && cefLoaded && uiLoaded && uiEcho &&
+	            favOk && probeOk;
 	Log("[SELFTEST] RESULT: %s", pass ? "PASS" : "FAIL");
 	return pass ? 0 : 1;
 }
@@ -701,6 +1433,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 	// -query "join?address=127.0.0.1%3A7777&nick=X" exercises the GUI join path)
 	if(!rawQuery.empty()){
 		HandleQuery(rawQuery.c_str(), nullptr);
+		// the handlers that talk to the master run on worker threads: give them
+		// time to finish before this headless invocation exits
+		Sleep(4000);
 		if(g_log) fclose(g_log);
 		return 0;
 	}

@@ -42,6 +42,10 @@ public:
 		EV_VEH_ENTER,      // a player took a seat (kind = seat)
 		EV_VEH_EXIT,       // a player left a vehicle
 		EV_VEH_STATE,      // driver state update (veh)
+		EV_VEH_DESPAWN,    // server retired a vehicle: drop the puppet (arg = id)
+		EV_BANNER,         // large center-screen announcement (text)
+		EV_WORLD,          // server world clock/weather: kind=hour arg=minute amount=weather
+		EV_RES_LIST,       // mod/resource inventory updated (see resList)
 	};
 
 	struct Event {
@@ -75,12 +79,16 @@ public:
 	uint8_t MyId() const { return m_myId; }
 	const char* Hostname() const { return m_hostname.c_str(); }
 	const char* GameMode() const { return m_gameMode.c_str(); }
+	const char* MapName() const { return m_mapName.c_str(); }
+	uint8_t Players() const { return m_players; }
+	uint8_t MaxPlayers() const { return m_maxPlayers; }
 
 	bool PopEvent(Event& ev);
 
 	std::map<uint8_t, NetRemotePlayer> remotes;
 	std::deque<NetChatLine> chat;   // ring; game layer draws it
 	rnet::PlayerState myState;
+	rnet::MsgResList resList;       // server mod/resource inventory (admin panel)
 
 private:
 	void HandleMessage(const uint8_t* data, size_t size);
@@ -92,6 +100,7 @@ private:
 	bool m_spawned = false;
 	uint8_t m_myId = 0;
 	std::string m_nick;
-	std::string m_hostname, m_gameMode;
+	std::string m_hostname, m_gameMode, m_mapName;
+	uint8_t m_players = 0, m_maxPlayers = 0;
 	std::deque<Event> m_events;
 };

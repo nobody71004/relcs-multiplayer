@@ -20,3 +20,4 @@ void CefHud_SetQueryHandler(void (*fn)(const char* request, void* user));
 void CefHud_Key(int down, int vk, int ch, int mods);
 void CefHud_Mouse(int type, int x, int y, int btn, int mods);
 void CefHud_Shutdown(void);
+void CefHud_ShutdownRW(void);   // release the overlay texture before RW teardown

@@ -10,7 +10,7 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 4;  // v4: MSG_INVENTORY profile sync
+constexpr uint16_t PROTOCOL_VERSION   = 5;  // v5: server map + static vehicles + master favorites
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
 constexpr uint16_t DEFAULT_MASTER_PORT= 7800;  // ENet master server
@@ -25,6 +25,9 @@ constexpr int MAX_NAME_LEN  = 24;
 constexpr int MAX_CHAT_LEN  = 160;
 constexpr int MAX_REASON_LEN= 96;
 constexpr int MAX_HOSTNAME_LEN = 48;
+constexpr int MAX_MAP_LEN   = 32;
+constexpr int MAX_ADDR_LEN  = 64;
+constexpr int MAX_FAV_ENTRIES = 64;
 constexpr int TICK_RATE     = 20;    // state broadcast Hz
 constexpr float TICK_DT     = 1.0f / (float)TICK_RATE;
 
@@ -67,6 +70,7 @@ enum MsgType : uint8_t {
 	MSG_VEH_ENTER       = 30,
 	MSG_VEH_EXIT        = 31,
 	MSG_VEH_SPAWN       = 32,
+	MSG_VEH_DESPAWN     = 33, // server removed a vehicle (static spawn cleanup)
 	MSG_INVENTORY       = 34, // profile sync: full money+weapon snapshot (both ways)
 	// world / gamemode
 	MSG_WORLD           = 40,
@@ -74,6 +78,7 @@ enum MsgType : uint8_t {
 	MSG_GAMEMODE_EVENT  = 42,
 	MSG_PICKUP_SPAWN    = 43,
 	MSG_PICKUP_COLLECT  = 44,
+	MSG_RES_LIST        = 45, // mod/resource inventory for the admin panel
 	// admin
 	MSG_RCON_AUTH       = 50,
 	MSG_RCON_OK         = 51,
@@ -83,6 +88,10 @@ enum MsgType : uint8_t {
 	MSG_MASTER_ANNOUNCE = 80,
 	MSG_MASTER_LIST_REQ = 81,
 	MSG_MASTER_LIST_RESP= 82,
+	MSG_MASTER_FAV_LIST = 83, // launcher -> master: send my favorites (MsgFavReq)
+	MSG_MASTER_FAV_ADD  = 84, // launcher -> master: add/update one favorite (MsgFavAdd)
+	MSG_MASTER_FAV_DEL  = 85, // launcher -> master: forget one favorite (MsgFavAdd, name unused)
+	MSG_MASTER_FAV_RESP = 86, // master -> launcher: the current list
 };
 
 // LAN discovery (raw UDP, human-readable magic strings)
@@ -184,6 +193,10 @@ struct MsgWelcome {
 	uint8_t  hour = 12, minute = 0, weather = 0;
 	char     gameMode[32] = {};
 	char     hostname[MAX_HOSTNAME_LEN] = {};
+	// v5: live server info — the launcher's browser tooltip reads these
+	// straight off a probe handshake (no master round trip needed)
+	uint8_t  players = 0, maxPlayers = 0;
+	char     mapName[MAX_MAP_LEN] = {};
 };
 
 struct MsgPlayerJoin {
@@ -255,8 +268,28 @@ struct MsgVehSpawn {
 	float    x = 0, y = 0, z = 0, heading = 0;
 };
 
+// MSG_VEH_DESPAWN — the server retired a vehicle (admin delcar, static spawn
+// cleanup): clients drop the puppet everywhere.
+struct MsgVehDespawn {
+	uint16_t vehicleId = 0;
+};
+
 struct MsgWorld {
 	uint8_t hour = 12, minute = 0, weather = 0;
+};
+
+// MSG_RES_LIST — mod/resource inventory snapshot (server -> client, on change)
+struct MsgResEntry {
+	char    name[24] = {};      // resource dir name
+	char    version[8] = {};
+	uint8_t type = 0;           // 0 = internal, 1 = external
+	uint8_t enabled = 0;
+	uint8_t valid = 0;          // 0 = parse error
+};
+constexpr int MAX_RES_ENTRIES = 32;
+struct MsgResList {
+	uint8_t count = 0;
+	MsgResEntry entries[MAX_RES_ENTRIES] = {};
 };
 
 // MSG_PICKUP_SPAWN — admin "spawn prop": a synced pickup marker (weapon crate,
@@ -307,6 +340,11 @@ struct MsgMasterAnnounce {
 	uint16_t protocolVersion = PROTOCOL_VERSION;
 	char     hostname[MAX_HOSTNAME_LEN] = {};
 	char     gameMode[32] = {};
+	char     mapName[MAX_MAP_LEN] = {};
+	// LAN address the game is reachable on (network byte order), for masters
+	// that observe a loopback source (server + master on the same machine);
+	// 0 = fall back to the observed address
+	uint32_t advertisedIp = 0;
 };
 
 struct MasterListEntry {
@@ -316,6 +354,36 @@ struct MasterListEntry {
 	uint16_t pingMs = 0;
 	char     hostname[MAX_HOSTNAME_LEN] = {};
 	char     gameMode[32] = {};
+	char     mapName[MAX_MAP_LEN] = {};
+	uint16_t protocolVersion = 0;   // v5: lets the launcher flag stale servers
+};
+
+// ---------------------------------------------------------------------------
+// Master favorites (server-side persistence, one list per username)
+// ---------------------------------------------------------------------------
+struct MsgFavEntry {
+	char address[MAX_ADDR_LEN] = {};   // "host:port"
+	char name[MAX_HOSTNAME_LEN] = {};  // last known hostname
+};
+
+// launcher -> master: fetch my list
+struct MsgFavReq {
+	char nick[MAX_NAME_LEN] = {};
+};
+
+// launcher -> master: remember / forget one server
+struct MsgFavAdd {
+	char nick[MAX_NAME_LEN] = {};
+	char address[MAX_ADDR_LEN] = {};
+	char name[MAX_HOSTNAME_LEN] = {};
+};
+
+// master -> launcher: the full current list (sent after every list/add/del)
+struct MsgFavResp {
+	uint8_t ok = 1;                 // 0 = the request was rejected
+	uint8_t count = 0;
+	char    error[64] = {};
+	MsgFavEntry entries[MAX_FAV_ENTRIES] = {};
 };
 
 constexpr int MAX_MASTER_ENTRIES = 256;
