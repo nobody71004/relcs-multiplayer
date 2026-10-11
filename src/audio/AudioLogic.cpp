@@ -1024,6 +1024,12 @@ cAudioManager::ProcessVehicle(CVehicle* veh)
 	params.m_fDistance = GetDistanceSquared(m_sQueueSample.m_vecPos);
 	params.m_pTransmission = veh->pHandling != nil ? &veh->pHandling->Transmission : nil;
 	params.m_nIndex = veh->m_modelIndex - MI_FIRST_VEHICLE;
+	// Add-on vehicles (e.g. the i8road at model id 295) sit outside the stock
+	// model range, so this index lands past aVehicleSettings[MAX_CARS] and every
+	// sound reads garbage sample ids (assert in GetSampleLoopStartOffset as soon
+	// as someone starts the engine). Give them the default (spider) profile.
+	if (params.m_nIndex >= MAX_CARS)
+		params.m_nIndex = 0;
 	if (veh->GetStatus() == STATUS_SIMPLE)
 		params.m_fVelocityChange = veh->AutoPilot.m_fMaxTrafficSpeed * 0.02f;
 	else

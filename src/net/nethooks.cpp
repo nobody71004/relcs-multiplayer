@@ -12,6 +12,7 @@
 #include "common.h"
 #include "Lists.h"
 #include "PlayerInfo.h"
+#include "Pad.h"
 #include "PlayerPed.h"
 #include "Ped.h"
 #include "CivilianPed.h"
@@ -135,6 +136,10 @@ static void UnseatNetPed(CPed* ped)
 	if(!ped) return;
 	CVehicle* veh = ped->m_pMyVehicle;
 	if(!veh) return;
+	fprintf(stderr, "[NET] UNSEAT-NETPED ped=%p veh=%p model=%d state=%d\n",
+	        (void*)ped, (void*)veh, veh ? (int)veh->GetModelIndex() : -1,
+	        (int)ped->m_nPedState);
+	fflush(stderr);
 	if(veh->pDriver == ped){
 		veh->pDriver = nil;
 		ped->CleanUpOldReference((CEntity**)&veh->pDriver);
@@ -237,6 +242,39 @@ static CVehicle* FindNetableTrain(uint16_t modelId, float x, float y, float z)
 	return best;
 }
 
+// "vehdiag" console probe: the render state of a vehicle's clump. A model that
+// spawns but never shows up on screen almost always reads as renderOn=0 (atomics
+// hidden), trisOn=0 (bad geometry) or nilRaster>0 (TXD missing/unsupported).
+struct VehDiagStats {
+	int atomics = 0, renderOn = 0, tris = 0, trisOn = 0;
+	int mats = 0, textured = 0, nilRaster = 0;
+};
+static RpAtomic* VehDiagAtomicCB(RpAtomic* atomic, void* data)
+{
+	VehDiagStats* s = (VehDiagStats*)data;
+	s->atomics++;
+	uint32 fl = RpAtomicGetFlags(atomic);
+	bool on = (fl & rpATOMICRENDER) != 0;
+	if(on) s->renderOn++;
+	RpGeometry* g = RpAtomicGetGeometry(atomic);
+	if(g){
+		int32 t = RpGeometryGetNumTriangles(g);
+		s->tris += t;
+		if(on) s->trisOn += t;
+		int32 nm = g->matList.numMaterials;
+		s->mats += nm;
+		for(int32 i = 0; i < nm; i++){
+			RpMaterial* m = g->matList.materials[i];
+			RwTexture* tex = m ? RpMaterialGetTexture(m) : nil;
+			if(tex){
+				s->textured++;
+				if(!RwTextureGetRaster(tex)) s->nilRaster++;
+			}
+		}
+	}
+	return atomic;
+}
+
 static CVehicle* CreatePuppetVehicle(uint16_t modelId, float x, float y, float z, float heading)
 {
 	if(!ModelIsVehicle(modelId))
@@ -327,6 +365,11 @@ static void AdoptNetVehicle(uint16_t netId, CVehicle* veh, uint16_t modelId)
 static void UnseatPlayerForWorld(CPlayerPed* me)
 {
 	if(!me) return;
+	fprintf(stderr, "[NET] UNSEAT-FOR-WORLD veh=%p model=%d state=%d\n",
+	        (void*)me->m_pMyVehicle,
+	        me->m_pMyVehicle ? (int)me->m_pMyVehicle->GetModelIndex() : -1,
+	        (int)me->m_nPedState);
+	fflush(stderr);
 	if(me->EnteringCar())
 		me->QuitEnteringCar();
 	if(me->m_pMyVehicle){
@@ -343,6 +386,8 @@ static void UnseatPlayerForWorld(CPlayerPed* me)
 
 static void RemoveNetVehicle(uint16_t netId)
 {
+	fprintf(stderr, "[NET] REMOVE-NETVEHICLE id=%d\n", (int)netId);
+	fflush(stderr);
 	auto it = s_vehicles.find(netId);
 	if(it == s_vehicles.end()) return;
 	NetVehicle& nv = it->second;
@@ -765,6 +810,7 @@ static void SendRconFmt(const char* fmt, ...)
 
 // door-chime (implemented below, near NetGame_Frame)
 static void PlayDoorChime(void);
+static void StopDoorChime(void);
 static bool s_doorChime = true;
 
 static void ConsoleExec(const char* line)
@@ -844,8 +890,43 @@ static void ConsoleExec(const char* line)
 				car->SetStatus(STATUS_PLAYER);
 				car->bEngineOn = true;
 				me->SetPedPositionInCar();
+				// a stale enter-car objective (left behind by a failed enter
+				// attempt) makes the ped AI call SetExitCar the moment the player
+				// sits in a car that is not m_carInObjective — "spawn the car and
+				// the character gets out". Drop the objective cleanly; for a
+				// seated driver ClearObjective is otherwise a no-op.
+				me->ClearObjective();
 				ConsolePrint("ride: spawned model %d at (%.1f, %.1f, %.1f)", model, p.x, p.y, p.z);
 			}
+		}
+	}else if(is("vehdiag")){
+		// render-state probe: the car we sit in, else the nearest net vehicle
+		CVehicle* v = nil;
+		if(me && me->m_pMyVehicle) v = me->m_pMyVehicle;
+		if(!v){
+			CVector ref = me ? me->GetPosition() : FindPlayerCoors();
+			float bestD = 0.0f;
+			for(auto& kv : s_vehicles){
+				CVehicle* cand = kv.second.veh;
+				if(!cand) continue;
+				CVector d = cand->GetPosition() - ref;
+				float dd = d.MagnitudeSqr();
+				if(!v || dd < bestD){ v = cand; bestD = dd; }
+			}
+		}
+		if(!v)
+			ConsolePrint("vehdiag: no vehicle around");
+		else if(!v->m_rwObject)
+			ConsolePrint("vehdiag model=%d has NO rw object", v->GetModelIndex());
+		else if(RwObjectGetType(v->m_rwObject) != rpCLUMP)
+			ConsolePrint("vehdiag model=%d rw object is not a clump", v->GetModelIndex());
+		else{
+			VehDiagStats st;
+			RpClumpForAllAtomics((RpClump*)v->m_rwObject, VehDiagAtomicCB, &st);
+			CVector p = v->GetPosition();
+			ConsolePrint("vehdiag model=%d pos=(%.1f,%.1f,%.1f) atomics=%d renderOn=%d tris=%d trisOn=%d mats=%d textured=%d nilRaster=%d",
+			             v->GetModelIndex(), p.x, p.y, p.z, st.atomics, st.renderOn,
+			             st.tris, st.trisOn, st.mats, st.textured, st.nilRaster);
 		}
 	}else if(is("fps")){
 		int n = 30;
@@ -945,7 +1026,7 @@ static void ConsoleExec(const char* line)
 	}else if(is("clear")){
 		s_consoleLog.clear();
 	}else if(is("doorchime")){
-		if(rest[0] && !_stricmp(rest, "off")){ s_doorChime = false; ConsolePrint("doorchime off"); }
+		if(rest[0] && !_stricmp(rest, "off")){ s_doorChime = false; StopDoorChime(); ConsolePrint("doorchime off"); }
 		else if(rest[0] && !_stricmp(rest, "on")){ s_doorChime = true; ConsolePrint("doorchime on"); }
 		else { PlayDoorChime(); ConsolePrint("doorchime: playing (mods/doorchime.wav or SFX/doorchime.wav)"); }
 	}else if(is("keybinds")){
@@ -1137,6 +1218,22 @@ static void NetGame_PollUi(void)
 			ShowCursor(want ? TRUE : FALSE);
 			SetCursor(LoadCursor(nullptr, want ? IDC_ARROW : IDC_CROSS));
 		}
+	}
+
+	// The engine reads its own pad state, so swallowing keys in this handler is
+	// not enough: Enter (console submit) and Space leaked into the game as
+	// enter/exit-vehicle and jump, ejecting the driver right after `ride`.
+	// While any UI owns the keyboard, disable gameplay pad input.
+	{
+		static bool s_uiLockedPad = false;
+		bool uiOwnsKeys = s_consoleOpen || s_chatOpen || s_invOpen || s_panelOpen || !s_cefPanel.empty();
+		// CPad resets DisablePlayerControls in its own Clear() path, so the lock
+		// is re-asserted every frame while a UI panel owns the keyboard.
+		if(uiOwnsKeys)
+			CPad::GetPad(0)->SetDisablePlayerControls(PLAYERCONTROL_UNK8);
+		else if(s_uiLockedPad)
+			CPad::GetPad(0)->SetEnablePlayerControls(PLAYERCONTROL_UNK8);
+		s_uiLockedPad = uiOwnsKeys;
 	}
 
 	// poll every handled key first so edge state stays coherent
@@ -1611,6 +1708,32 @@ static void ApplyInventory(const rnet::MsgInventory& m)
 static bool s_haveLastSent = false;
 static double s_lastTeleportLog = 0.0;
 
+// The server's spawn arrives right after the hello handshake — often while the
+// game is still loading and FindPlayerPed() is still nil. Dropping it strands
+// the player at the single-player start position (far from the showroom i8s)
+// until someone types teleport, so hold the spawn and apply it as soon as the
+// ped exists — same pattern as the inventory restore (s_pendingInv).
+static rnet::PlayerState s_pendingSpawn;
+static bool s_havePendingSpawn = false;
+
+static void ApplySpawnState(const rnet::PlayerState& st)
+{
+	CPlayerPed* me = FindPlayerPed();
+	if(!me || !NetPosSane(st.xMm / 1000.0f, st.yMm / 1000.0f,
+	                      st.zMm / 1000.0f, "spawn"))
+		return;
+	// a gamemode respawn can land mid-drive: detach from the car
+	// first or the ped stays hidden and steers a phantom vehicle
+	UnseatPlayerForWorld(me);
+	CVector pos(st.xMm / 1000.0f, st.yMm / 1000.0f, st.zMm / 1000.0f);
+	// Teleport (not SetPosition): it clears bIsStanding so the ped
+	// falls to the ground instead of hovering mid-air forever
+	me->Teleport(pos);
+	me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(st.heading));
+	s_lastSentPos = pos;
+	s_haveLastSent = true;
+}
+
 // ---------------------------------------------------------------------------
 // vehicle door chime (BMW i8-style) — plays when the local player opens a car
 // door (enter/exit transition).  Sound file resolution:
@@ -1624,49 +1747,74 @@ static int s_lastPedState = 0;   // s_doorChime is declared above (console needs
 static bool s_lastInVeh = false;
 static double s_lastChimeAt = -100.0;
 
-static void PlayDoorChime(void)
+static void DoorChimeFile(char* full)
 {
-	if(!s_doorChime) return;
 	char path[MAX_PATH];
 	GetModuleFileNameA(NULL, path, MAX_PATH);
 	char* slash = strrchr(path, '\\');
 	if(slash) *slash = 0;
-	char full[MAX_PATH];
-	snprintf(full, sizeof full, "%s\\mods\\doorchime.wav", path);
+	snprintf(full, MAX_PATH, "%s\\mods\\doorchime.wav", path);
 	DWORD attr = GetFileAttributesA(full);
 	if(attr == INVALID_FILE_ATTRIBUTES)
-		snprintf(full, sizeof full, "%s\\SFX\\doorchime.wav", path);
+		snprintf(full, MAX_PATH, "%s\\SFX\\doorchime.wav", path);
+}
+
+static bool s_chimeRinging = false;
+
+// one-shot play (console test)
+static void PlayDoorChime(void)
+{
+	if(!s_doorChime) return;
+	char full[MAX_PATH];
+	DoorChimeFile(full);
 	// SND_ASYNC: never block the game loop on audio
 	if(!PlaySoundA(full, NULL, SND_ASYNC | SND_FILENAME | SND_NODEFAULT))
 		fprintf(stderr, "[NET] doorchime: cannot play %s\n", full);
 }
 
+// loop while the door stands open; StopDoorChime silences it the moment the
+// door is shut (SND_ASYNC playback is process-global, so PlaySound(NULL) ends
+// whichever chime instance is running)
+static void StartDoorChimeLoop(void)
+{
+	if(!s_doorChime) return;
+	char full[MAX_PATH];
+	DoorChimeFile(full);
+	if(!PlaySoundA(full, NULL, SND_ASYNC | SND_FILENAME | SND_NODEFAULT | SND_LOOP))
+		fprintf(stderr, "[NET] doorchime: cannot play %s\n", full);
+	s_chimeRinging = true;
+}
+
+static void StopDoorChime(void)
+{
+	if(!s_chimeRinging) return;
+	PlaySoundA(NULL, NULL, 0);
+	s_chimeRinging = false;
+}
+
 static void NetGame_DoorChimeTick(void)
 {
 	CPlayerPed* me = FindPlayerPed();
-	if(!me){ s_lastPedState = 0; s_lastInVeh = false; return; }
+	if(!me){ StopDoorChime(); s_lastPedState = 0; s_lastInVeh = false; return; }
 	int st = me->m_nPedState;
-	// a car door opens when the ped starts entering or exiting (the literal
-	// door states) — the seat change (InVehicle edge) covers entry/exit paths
-	// that skip those states (teleport-in, MP unseat)
+	// the car door stands open exactly while the ped is in a door state
+	// (enter / exit / jacking) — the chime must track that edge-to-edge:
+	// ring while the door is open, stop the moment it is shut (driving or
+	// back on foot), never keep ringing over the drive
 	bool doorOpen = (st == PED_ENTER_CAR || st == PED_CARJACK || st == PED_EXIT_CAR ||
 	                 st == PED_OPEN_DOOR);
-	bool wasOpen = (s_lastPedState == PED_ENTER_CAR || s_lastPedState == PED_CARJACK ||
-	                s_lastPedState == PED_EXIT_CAR || s_lastPedState == PED_OPEN_DOOR);
-	bool inVeh = me->InVehicle();
-	bool seatChanged = (inVeh != s_lastInVeh);
-	if((doorOpen && !wasOpen) || seatChanged){
-		double t = NowSec();
-		if(t - s_lastChimeAt > 1.0){   // debounce: one chime per door action
-			s_lastChimeAt = t;
-			fprintf(stderr, "[NET] doorchime: door open (state=%d seat=%d)\n",
-			        st, (int)inVeh);
-			fflush(stderr);
-			PlayDoorChime();
-		}
+	if(doorOpen && !s_chimeRinging){
+		fprintf(stderr, "[NET] doorchime: door open (state=%d)\n", st);
+		fflush(stderr);
+		StartDoorChimeLoop();
+	}else if(!doorOpen && s_chimeRinging){
+		fprintf(stderr, "[NET] doorchime: door shut (state=%d)\n", st);
+		fflush(stderr);
+		StopDoorChime();
 	}
+	if(!s_doorChime && s_chimeRinging) StopDoorChime();
 	s_lastPedState = st;
-	s_lastInVeh = inVeh;
+	s_lastInVeh = me->InVehicle();
 }
 
 void NetGame_Frame(void)
@@ -1715,19 +1863,12 @@ void NetGame_Frame(void)
 				s_net.SendRconAuth(s_rconPw.c_str());
 			break;
 		case NetClient::EV_SPAWNED:{
-			CPlayerPed* me = FindPlayerPed();
-			if(me && NetPosSane(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
-			                    ev.state.zMm / 1000.0f, "spawn")){
-				// a gamemode respawn can land mid-drive: detach from the car
-				// first or the ped stays hidden and steers a phantom vehicle
-				UnseatPlayerForWorld(me);
-				CVector pos(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f, ev.state.zMm / 1000.0f);
-				// Teleport (not SetPosition): it clears bIsStanding so the ped
-				// falls to the ground instead of hovering mid-air forever
-				me->Teleport(pos);
-				me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(ev.state.heading));
-				s_lastSentPos = pos;
-				s_haveLastSent = true;
+			if(FindPlayerPed())
+				ApplySpawnState(ev.state);
+			else{
+				// still loading — apply from the pump loop once the ped exists
+				s_pendingSpawn = ev.state;
+				s_havePendingSpawn = true;
 			}
 			s_welcomeUntil = NowSec() + 6.0;
 			// push the first inventory snapshot right after spawning
@@ -1999,6 +2140,14 @@ void NetGame_Frame(void)
 
 	// local vehicle enter/exit streaming
 	if(me){
+		static int s_lastLoggedPedState = -1;
+		if((int)me->m_nPedState != s_lastLoggedPedState){
+			fprintf(stderr, "[NET] pedstate %d -> %d (inVeh=%d veh=%p)\n",
+			        s_lastLoggedPedState, (int)me->m_nPedState,
+			        (int)me->bInVehicle, (void*)me->m_pMyVehicle);
+			fflush(stderr);
+			s_lastLoggedPedState = (int)me->m_nPedState;
+		}
 		CVehicle* cur = (me->bInVehicle && me->m_pMyVehicle != nil) ? me->m_pMyVehicle : nil;
 		if(cur != s_lastMyVeh){
 			if(s_lastMyVeh){
@@ -2128,7 +2277,11 @@ void NetGame_Frame(void)
 		s_haveLastSent = true;
 		s_net.SendState(st);
 
-	// a restore that arrived before the ped existed: apply it now
+	// a spawn/restore that arrived before the ped existed: apply it now
+	if(s_havePendingSpawn && FindPlayerPed()){
+		s_havePendingSpawn = false;
+		ApplySpawnState(s_pendingSpawn);
+	}
 	if(s_havePending && FindPlayerPed()){
 		s_havePending = false;
 		ApplyInventory(s_pendingInv);

@@ -266,7 +266,16 @@ cHandlingDataMgr::LoadHandlingData(void)
 					case  8: handling->fTractionMultiplier = atof(word); break;
 					case  9: handling->fTractionLoss = atof(word); break;
 					case 10: handling->fTractionBias = atof(word); break;
-					case 11: handling->Transmission.nNumberOfGears = atoi(word); break;
+					case 11: {
+						// cTransmission::Gears[] only holds reverse + 5 forward gears;
+						// a row claiming more (the stock MINI row says 6) makes
+						// InitGearRatios write past the array and smash
+						// nNumberOfGears itself -> the gear assertion in
+						// CalculateDriveAcceleration on the first drive
+						int g = atoi(word);
+						handling->Transmission.nNumberOfGears = g < 1 ? 1 : (g > 5 ? 5 : g);
+						break;
+					}
 					case 12: handling->Transmission.fMaxVelocity = atof(word); break;
 					case 13: handling->Transmission.fEngineAcceleration = atof(word) * 0.4; break;
 					case 14: handling->Transmission.fEngineInertia = atof(word); break;
