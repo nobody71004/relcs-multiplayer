@@ -360,6 +360,14 @@ project "reLCS"
 		defines { "AUDIO_OPUS" }
 	end
 
+	-- proximity voice (src/net/rnet_voice.h) always needs libopus on Windows;
+	-- the music streamer (AUDIO_OPUS above) additionally needs ogg/opusfile
+	filter "platforms:win*"
+		includedirs { "vendor/opus/include" }
+		libdirs { "vendor/opus/win32/VS2015/x64/%{cfg.buildcfg}" }
+		links { "opus" }
+	filter {}
+
 	filter "platforms:*oal"
 		defines { "AUDIO_OAL" }
 

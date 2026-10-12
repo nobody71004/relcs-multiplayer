@@ -41,6 +41,13 @@ function netCommon()
 	links { "enet", "ws2_32", "winmm" }
 end
 
+-- proximity voice codec (src/net/rnet_voice.h): vendor/opus, built as x64 Release
+function netOpus()
+	includedirs { "../vendor/opus/include" }
+	libdirs { "../vendor/opus/win32/VS2015/x64/Release" }
+	links { "opus" }
+end
+
 project "net-tests"
 	kind "ConsoleApp"
 	language "C++"
@@ -50,6 +57,7 @@ project "net-tests"
 	includedirs { "server", "../vendor/sqlite" }
 	links { "sqlite" }
 	netCommon()
+	netOpus()
 
 project "net-server"
 	kind "ConsoleApp"
@@ -68,6 +76,7 @@ project "net-bot"
 	targetname "relcs-netbot"
 	files { "bot/*.cpp", "bot/*.h" }
 	netCommon()
+	netOpus()
 
 project "net-master"
 	kind "ConsoleApp"

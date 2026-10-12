@@ -392,7 +392,7 @@ int CefUi_InitOsr(void* hwnd, int w, int h, const std::string& url)
 	CefWindowInfo wi;
 	wi.SetAsWindowless((CefWindowHandle)hwnd);
 	CefBrowserSettings bs;
-	bs.windowless_frame_rate = 60;
+	bs.windowless_frame_rate = 30; // the HUD is mostly static; 60 fps doubled the per-frame paint and texture copy
 	if(!CefBrowserHost::CreateBrowser(wi, g_client, url, bs, nullptr, nullptr))
 		return 0;
 	return 1;

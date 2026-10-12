@@ -35,6 +35,13 @@ constexpr float TICK_DT     = 1.0f / (float)TICK_RATE;
 constexpr uint8_t CHAN_RELIABLE = 0; // RPCs / handshake / chat / gamemode
 constexpr uint8_t CHAN_STATE    = 1; // unreliable-sequenced snapshots
 
+// Proximity voice: 8 kHz mono, 20 ms frames, Opus (variable-length packets)
+constexpr int   VOICE_SAMPLE_RATE   = 8000;
+constexpr int   VOICE_FRAME_SAMPLES = 160;             // 20 ms
+constexpr int   VOICE_MAX_PACKET    = 160;             // largest Opus packet accepted on the wire
+constexpr int   VOICE_BITRATE       = 20000;           // bit/s target (mu-law used 64 kbit/s)
+constexpr float VOICE_RANGE_M       = 40.0f;           // server relays and clients hear within this radius
+
 // Validation limits (generous — server-authoritative-lite)
 constexpr float MAX_SPEED_ONFOOT   = 15.0f;  // m/s
 constexpr float MAX_SPEED_FALL     = 40.0f;  // m/s downward; drops/ragdolls are legit physics
@@ -79,6 +86,8 @@ enum MsgType : uint8_t {
 	MSG_PICKUP_SPAWN    = 43,
 	MSG_PICKUP_COLLECT  = 44,
 	MSG_RES_LIST        = 45, // mod/resource inventory for the admin panel
+	MSG_VOICE           = 46, // proximity voice frame (client->server: [u8 unused][u8 len][len x Opus]; server->client: [u8 fromId][u8 len][len x Opus])
+	MSG_PLAYER_PING     = 47, // server->client ~1 Hz: top players with ping/score (scoreboard + player list)
 	// admin
 	MSG_RCON_AUTH       = 50,
 	MSG_RCON_OK         = 51,
@@ -231,9 +240,22 @@ struct MsgDamage {
 	uint16_t damage = 0;
 };
 
+// Why a HELLO was refused or a player was kicked. 0 = generic (reason text
+// only, what a pre-code client/server sends).
+enum JoinRefused : uint8_t {
+	REFUSE_NONE     = 0,
+	REFUSE_PROTOCOL = 1, // protocolVersion mismatch
+	REFUSE_BANNED   = 2, // IP banned
+	REFUSE_FULL     = 3, // server at maxPlayers
+	REFUSE_NAME     = 4, // name rejected
+	REFUSE_AUTH     = 5, // name is claimed and the password was wrong/missing
+	REFUSE_PASSWORD = 6, // password rejected (e.g. too short to claim)
+};
+
 struct MsgKick {
 	uint16_t len = 0;
 	char     reason[MAX_REASON_LEN] = {};
+	uint8_t  code = 0;   // JoinRefused (0 for legacy peers)
 };
 
 // MSG_GIVE kinds (admin effects, server -> target client only)
@@ -313,6 +335,20 @@ constexpr int MAX_SCORE_ENTRIES = 32;
 struct MsgScoreUpdate {
 	uint8_t count = 0;
 	ScoreEntry entries[MAX_SCORE_ENTRIES] = {};
+};
+
+// one row of the player list: ping is the ENet round trip in ms (0 for NPCs)
+struct PingEntry {
+	uint8_t  playerId = 0;
+	uint16_t pingMs = 0;
+	int32_t  score = 0;
+	uint16_t kills = 0, deaths = 0;
+};
+
+constexpr int MAX_PING_ENTRIES = 32;
+struct MsgPlayerPing {
+	uint8_t count = 0;
+	PingEntry entries[MAX_PING_ENTRIES] = {};
 };
 
 // gamemode event types

@@ -5,228 +5,323 @@
 <title>Liberty City Stories Online — Launcher</title>
 <style>
   :root {
-    --bg: #0b0e13; --panel: #12161f; --panel2: #171c27; --edge: rgba(255,255,255,0.10);
-    --text: #e8edf4; --dim: #8b94a3; --gold: #f0c14b; --green: #56d364;
-    --red: #f85149; --blue: #58a6ff;
+    --bg: #0e1116; --surface: #161a21; --surface-2: #1c2129; --line: #272d37;
+    --text: #e6e9ee; --muted: #8a919e; --accent: #d9a441; --accent-ink: #15110a;
+    --ok: #4fb477; --warn: #d9a441; --bad: #e0645c; --info: #6ea8e0;
+    --radius: 6px; --mono: Consolas, "Cascadia Mono", monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
   body {
-    background: radial-gradient(1200px 500px at 70% -10%, #1b2333 0%, var(--bg) 55%);
-    color: var(--text); font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
-    display: flex; flex-direction: column; overflow: hidden; user-select: none;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+    display: flex; overflow: hidden; user-select: none;
   }
+  button, input, select { font: inherit; }
 
-  header {
-    display: flex; align-items: center; gap: 18px;
-    padding: 20px 26px 16px;
+  /* ---- navigation rail ---- */
+  nav {
+    width: 188px; flex: none; display: flex; flex-direction: column;
+    background: var(--surface); border-right: 1px solid var(--line);
   }
-  .logo {
-    width: 46px; height: 46px; border-radius: 12px; flex: none;
-    background: linear-gradient(135deg, var(--gold), #b8860b);
-    display: grid; place-items: center; font-size: 22px; font-weight: 800; color: #141414;
-    box-shadow: 0 6px 18px rgba(240, 193, 75, 0.25);
+  .brand { padding: 20px 18px 18px; border-bottom: 1px solid var(--line); }
+  .brand .name { font-size: 13px; font-weight: 700; letter-spacing: 0.4px; }
+  .brand .name em { font-style: normal; color: var(--accent); }
+  .brand .ver { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .nav-list { padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; flex: 1; }
+  .nav-item {
+    text-align: left; padding: 9px 12px; border: none; border-radius: var(--radius);
+    background: transparent; color: var(--muted); cursor: pointer; font-weight: 600;
   }
-  header h1 { font-size: 21px; letter-spacing: 1.2px; font-weight: 700; }
-  header h1 span { color: var(--gold); }
-  header .sub { color: var(--dim); font-size: 12.5px; letter-spacing: 0.6px; }
-  header .spacer { flex: 1; }
+  .nav-item:hover { color: var(--text); background: var(--surface-2); }
+  .nav-item.active { color: var(--text); background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
+  .nav-foot { padding: 12px 8px; border-top: 1px solid var(--line); }
+
+  /* ---- content ---- */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .topbar {
+    height: 56px; flex: none; display: flex; align-items: center; gap: 12px;
+    padding: 0 24px; border-bottom: 1px solid var(--line);
+  }
+  .topbar h1 { font-size: 16px; font-weight: 650; }
+  .topbar .spacer { flex: 1; }
+  .chip {
+    font-size: 12px; color: var(--muted); padding: 4px 10px;
+    border: 1px solid var(--line); border-radius: 20px;
+  }
+  .chip b { color: var(--text); font-weight: 600; }
+
+  .page { display: none; flex: 1; min-height: 0; padding: 20px 24px; flex-direction: column; gap: 14px; overflow: hidden; }
+  .page.active { display: flex; }
+
+  /* ---- shared controls ---- */
   .btn {
-    padding: 9px 18px; border-radius: 9px; border: 1px solid var(--edge);
-    background: var(--panel2); color: var(--text); font-size: 13.5px; font-weight: 600;
-    cursor: pointer; transition: all .12s ease;
+    padding: 7px 14px; border-radius: var(--radius); border: 1px solid var(--line);
+    background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
   }
-  .btn:hover { border-color: var(--gold); color: var(--gold); }
-  .btn.small { padding: 5px 11px; font-size: 12px; border-radius: 7px; }
-  .btn.primary {
-    background: linear-gradient(135deg, var(--gold), #d9a521); color: #141414;
-    border: none; padding: 10px 26px; font-size: 14.5px;
-    box-shadow: 0 6px 18px rgba(240, 193, 75, 0.3);
-  }
-  .btn.primary:hover { filter: brightness(1.08); }
+  .btn:hover { border-color: #3a424f; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.small { padding: 4px 10px; font-size: 12px; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .btn.primary:hover { filter: brightness(1.06); border-color: var(--accent); }
+  .btn.danger:hover { color: var(--bad); border-color: var(--bad); }
 
-  main { flex: 1; display: flex; gap: 18px; padding: 0 26px 18px; min-height: 0; }
-
-  /* ---- left: profile + settings ---- */
-  .side { width: 290px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; }
-  .card {
-    background: var(--panel); border: 1px solid var(--edge); border-radius: 14px;
-    padding: 16px;
-  }
-  .card h2 {
-    font-size: 10.5px; letter-spacing: 2.2px; color: var(--dim);
-    text-transform: uppercase; margin-bottom: 12px;
-  }
-  label { display: block; font-size: 11.5px; color: var(--dim); margin: 10px 0 5px; }
   input, select {
-    width: 100%; padding: 9px 11px; font-size: 13.5px;
-    background: rgba(255,255,255,0.06); color: var(--text);
-    border: 1px solid var(--edge); border-radius: 8px; outline: none;
+    width: 100%; padding: 8px 10px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--radius); outline: none; font-size: 13px;
   }
-  input:focus, select:focus { border-color: var(--gold); }
-  .row { display: flex; gap: 8px; }
-  .row > * { flex: 1; }
-  .tip { font-size: 11px; color: var(--dim); margin-top: 6px; }
-  .state { font-size: 11.5px; margin-top: 8px; line-height: 1.45; }
-  .state.ok { color: var(--green); }
-  .state.warn { color: var(--gold); }
-  .state.err { color: var(--red); }
+  input:focus, select:focus { border-color: var(--accent); }
+  input.mono { font-family: var(--mono); font-size: 12.5px; }
 
-  /* ---- center: browser ---- */
-  .browser { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 10px; align-items: center; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+  .panel-head {
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--muted);
+  }
+  .panel-body { padding: 16px; }
+
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .field:last-child { margin-bottom: 0; }
+  .field > label { font-size: 12px; font-weight: 600; color: var(--text); }
+  .field .help { font-size: 11.5px; color: var(--muted); }
+  .inline { display: flex; gap: 8px; align-items: center; }
+  .inline > input, .inline > select { flex: 1; }
+
+  .notice { font-size: 12.5px; padding: 10px 12px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--bg); }
+  .notice.ok { border-color: rgba(79,180,119,.35); color: var(--ok); }
+  .notice.warn { border-color: rgba(217,164,65,.35); color: var(--warn); }
+  .notice.err { border-color: rgba(224,100,92,.4); color: var(--bad); }
+  .notice .sub { color: var(--muted); display: block; margin-top: 2px; font-size: 12px; }
+
+  /* ---- play page ---- */
+  .toolbar { display: flex; align-items: center; gap: 8px; }
+  .seg { display: flex; gap: 2px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 3px; }
   .tab {
-    padding: 8px 20px; border-radius: 9px 9px 0 0; cursor: pointer;
-    color: var(--dim); font-weight: 600; font-size: 13px;
-    border: 1px solid transparent; border-bottom: none;
+    padding: 5px 14px; border-radius: 4px; cursor: pointer; color: var(--muted); font-weight: 600; font-size: 12.5px;
   }
-  .tab.active {
-    color: var(--gold); background: var(--panel);
-    border-color: var(--edge);
-  }
-  .tabs .spacer { flex: 1; }
-  .list {
-    flex: 1; background: var(--panel); border: 1px solid var(--edge);
-    border-radius: 0 12px 12px 12px; overflow-y: auto; position: relative;
-  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--surface-2); color: var(--text); }
+  .toolbar .spacer { flex: 1; }
+
+  .list { flex: 1; min-height: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-y: auto; }
   table { width: 100%; border-collapse: collapse; }
   th {
-    position: sticky; top: 0; background: var(--panel2); text-align: left;
-    font-size: 10.5px; letter-spacing: 1.6px; text-transform: uppercase;
-    color: var(--dim); padding: 11px 14px; z-index: 1;
+    position: sticky; top: 0; z-index: 1; background: var(--surface); text-align: left;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: var(--muted);
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
   }
-  td { padding: 11px 14px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 13px; }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 13px; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
   tr.server { cursor: pointer; }
-  tr.server:hover { background: rgba(240, 193, 75, 0.06); }
-  tr.server.sel { background: rgba(240, 193, 75, 0.13); }
-  tr.server.offline td { color: var(--dim); }
+  tr.server:hover td { background: var(--surface-2); }
+  tr.server.sel td { background: rgba(217,164,65,.09); }
+  tr.server.offline td { color: var(--muted); }
   td.name { font-weight: 600; }
-  td.addr { color: var(--dim); font-family: Consolas, monospace; font-size: 12px; }
-  .pill {
-    display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 11px;
-    background: rgba(88, 166, 255, 0.15); color: var(--blue);
+  td.addr { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 12px; background: var(--surface-2); color: var(--text); }
+  .pill.warn { color: var(--warn); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 8px; vertical-align: middle; }
+  .dot.dead { background: var(--bad); }
+  .empty { padding: 48px 20px; text-align: center; color: var(--muted); white-space: normal; }
+
+  .actionbar {
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
   }
-  .pill.warn { background: rgba(240, 193, 75, 0.15); color: var(--gold); }
-  .pill.err { background: rgba(248, 81, 73, 0.15); color: var(--red); }
-  .pill.off { background: rgba(255,255,255,0.08); color: var(--dim); }
-  .empty { padding: 40px; text-align: center; color: var(--dim); }
-  .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-              background: var(--green); margin-right: 6px; vertical-align: middle; }
-  .live-dot.dead { background: var(--red); }
+  .actionbar .sel { flex: 1; min-width: 0; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actionbar .sel b { color: var(--text); font-weight: 600; }
+  .actionbar .direct { width: 210px; flex: none; }
+
+  /* ---- profile / settings ---- */
+  .narrow { max-width: 640px; display: flex; flex-direction: column; gap: 14px; }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; }
 
   /* ---- server tooltip ---- */
   #tooltip {
     position: fixed; z-index: 40; display: none; width: 268px;
-    background: rgba(10, 13, 19, 0.97); border: 1px solid var(--edge);
-    border-radius: 12px; padding: 12px 13px; pointer-events: none;
-    box-shadow: 0 14px 40px rgba(0,0,0,0.55);
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 13px; pointer-events: none; box-shadow: 0 12px 32px rgba(0,0,0,.5);
   }
-  #tooltip .t-name { font-weight: 700; font-size: 13.5px; margin-bottom: 3px; }
-  #tooltip .t-addr { font-family: Consolas, monospace; font-size: 11px; color: var(--dim); }
-  #tooltip .t-grid {
-    display: grid; grid-template-columns: auto 1fr; gap: 3px 10px;
-    font-size: 11.5px; margin: 9px 0 7px;
-  }
-  #tooltip .t-grid .k { color: var(--dim); }
+  #tooltip .t-name { font-weight: 650; font-size: 13.5px; }
+  #tooltip .t-addr { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  #tooltip .t-grid { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; margin: 9px 0 7px; }
+  #tooltip .k { color: var(--muted); }
   #tooltip canvas { width: 100%; height: 46px; display: block; }
-  #tooltip .t-foot { font-size: 10.5px; color: var(--dim); margin-top: 6px; }
-  #tooltip .t-live { font-size: 11px; }
-  #tooltip .t-live.ok { color: var(--green); }
-  #tooltip .t-live.err { color: var(--red); }
+  #tooltip .t-foot { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  #tooltip .t-live { font-size: 11.5px; }
+  #tooltip .t-live.ok { color: var(--ok); }
+  #tooltip .t-live.err { color: var(--bad); }
 
+  /* ---- status bar ---- */
   footer {
-    display: flex; align-items: center; gap: 14px;
-    padding: 12px 26px; border-top: 1px solid var(--edge); background: var(--panel);
-    font-size: 12.5px; color: var(--dim);
+    height: 32px; flex: none; display: flex; align-items: center; gap: 12px;
+    padding: 0 24px; border-top: 1px solid var(--line); background: var(--surface);
+    font-size: 12px; color: var(--muted);
   }
-  #status { flex: 1; }
-  #status.ok { color: var(--green); }
-  #status.err { color: var(--red); }
-  #status.warn { color: var(--gold); }
+  #status { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--bad); }
+  #status.warn { color: var(--warn); }
 </style>
 </head>
 <body>
-  <header>
-    <div class="logo">L</div>
-    <div>
-      <h1>LIBERTY CITY STORIES <span>ONLINE</span></h1>
-      <div class="sub">MULTIPLAYER LAUNCHER — CHROMIUM EDITION</div>
+  <nav>
+    <div class="brand">
+      <div class="name">LIBERTY CITY <em>STORIES</em></div>
+      <div class="ver">Online launcher</div>
     </div>
-    <div class="spacer"></div>
-    <button class="btn" id="btnRefresh">⟳ Refresh</button>
-    <button class="btn primary" id="btnJoin">▶ JOIN SERVER</button>
-  </header>
+    <div class="nav-list">
+      <button class="nav-item active" data-page="play">Play</button>
+      <button class="nav-item" data-page="profile">Profile</button>
+      <button class="nav-item" data-page="settings">Settings</button>
+    </div>
+    <div class="nav-foot">
+      <button class="btn small danger" id="btnQuit" style="width:100%">Quit launcher</button>
+    </div>
+  </nav>
 
-  <main>
-    <div class="side">
-      <div class="card">
-        <h2>Player Profile</h2>
-        <label>Username</label>
-        <div class="row">
-          <input id="nick" maxlength="20" placeholder="Toni" autocomplete="off">
-          <button class="btn" id="btnSaveUser" style="flex:0 0 auto">Save</button>
-        </div>
-        <label>Saved usernames</label>
-        <select id="profiles"></select>
-        <div class="tip">3–20 characters: letters, digits and underscore. Saved to usernames.ini.
-          Your <b>favorites</b> are stored on the master server under this name.</div>
-      </div>
-
-      <div class="card">
-        <h2>Connection</h2>
-        <label>Direct address (ip:port)</label>
-        <input id="direct" value="127.0.0.1:7777" autocomplete="off">
-        <div class="row" style="margin-top:10px">
-          <button class="btn" id="btnJoinDirect">Join Direct</button>
-          <button class="btn" id="btnAddFav">★ Add Favorite</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Settings</h2>
-        <label>Game executable <span id="gameHint" class="tip" style="display:inline"></span></label>
-        <input id="game" autocomplete="off" placeholder="auto-detected">
-        <div class="row" style="margin-top:8px">
-          <button class="btn small" id="btnDetect" style="flex:0 0 auto">🔍 Auto-detect</button>
-        </div>
-        <div class="state" id="gameState">detecting…</div>
-        <label>Master server</label>
-        <input id="master" autocomplete="off">
-        <label>Server RCON password (enables admin panel: broadcast, give, spawncar, …)</label>
-        <input id="rcon" type="password" placeholder="optional" autocomplete="off">
-        <div class="row" style="margin-top:10px">
-          <button class="btn" id="btnSaveCfg">Save Settings</button>
-          <button class="btn" id="btnQuit">Quit</button>
-        </div>
-      </div>
+  <div class="main">
+    <div class="topbar">
+      <h1 id="pageTitle">Play</h1>
+      <div class="spacer"></div>
+      <span class="chip">Player <b id="whoami">—</b></span>
+      <span class="chip">Game <b id="gameChip">detecting…</b></span>
     </div>
 
-    <div class="browser">
-      <div class="tabs" id="tabs">
-        <div class="tab active" data-tab="internet">INTERNET</div>
-        <div class="tab" data-tab="lan">LAN</div>
-        <div class="tab" data-tab="favorites">FAVORITES</div>
+    <!-- ===================== PLAY ===================== -->
+    <section class="page active" id="page-play">
+      <div class="toolbar">
+        <div class="seg" id="tabs">
+          <div class="tab active" data-tab="internet">Internet</div>
+          <div class="tab" data-tab="lan">LAN</div>
+          <div class="tab" data-tab="favorites">Favorites</div>
+        </div>
         <div class="spacer"></div>
-        <button class="btn small" id="btnPingAll" title="Probe every listed server (map, mode, ping)">📶 Ping all</button>
+        <button class="btn small" id="btnPingAll" title="Probe every listed server (map, mode, ping)">Ping all</button>
+        <button class="btn small" id="btnRefresh">Refresh</button>
       </div>
+
       <div class="list">
         <table>
           <thead>
-            <tr><th style="width:26%">Server</th><th style="width:15%">Map</th><th>Players</th>
-                <th style="width:12%">Ping</th><th style="width:12%">Mode</th><th>Address</th></tr>
+            <tr><th style="width:30%">Server</th><th style="width:16%">Map</th><th style="width:10%">Players</th>
+                <th style="width:10%">Ping</th><th style="width:12%">Mode</th><th>Address</th></tr>
           </thead>
           <tbody id="rows">
-            <tr><td colspan="6" class="empty">Press ⟳ Refresh to find servers</td></tr>
+            <tr><td colspan="6" class="empty">Press Refresh to find servers</td></tr>
           </tbody>
         </table>
       </div>
-    </div>
-  </main>
 
-  <footer>
-    <div id="status">ready</div>
-    <div id="build">LCS Online Launcher · CEF</div>
-  </footer>
+      <div class="actionbar">
+        <div class="sel" id="selLabel">No server selected</div>
+        <input class="direct mono" id="direct" value="127.0.0.1:7777" autocomplete="off" title="Direct address (ip:port)">
+        <button class="btn" id="btnJoinDirect">Join direct</button>
+        <button class="btn" id="btnAddFav">Add favorite</button>
+        <button class="btn primary" id="btnJoin">Join server</button>
+      </div>
+    </section>
+
+    <!-- ===================== PROFILE ===================== -->
+    <section class="page" id="page-profile">
+      <div class="narrow">
+        <div class="panel">
+          <div class="panel-head">Username</div>
+          <div class="panel-body">
+            <div class="field">
+              <label for="nick">Display name</label>
+              <div class="inline">
+                <input id="nick" maxlength="20" placeholder="Toni" autocomplete="off">
+                <button class="btn" id="btnSaveUser">Save</button>
+              </div>
+              <div class="help">3–20 characters: letters, digits and underscore. Your favorites are stored on the master server under this name.</div>
+            </div>
+            <div class="field">
+              <label for="profiles">Saved usernames</label>
+              <select id="profiles"></select>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">Account</div>
+          <div class="panel-body">
+            <div class="field">
+              <label for="pass">Profile password</label>
+              <input id="pass" type="password" placeholder="set once to claim your name" autocomplete="off">
+              <div class="help">Claims your name on the server. Required to restore your wallet and weapons after a reconnect.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== SETTINGS ===================== -->
+    <section class="page" id="page-settings">
+      <div class="narrow">
+        <div class="panel">
+          <div class="panel-head">Game install</div>
+          <div class="panel-body">
+            <div class="field">
+              <div class="notice" id="gameState">Detecting the game install…</div>
+            </div>
+            <div class="field">
+              <label for="game">Game executable</label>
+              <div class="inline">
+                <input id="game" class="mono" autocomplete="off" placeholder="auto-detected">
+                <button class="btn" id="btnDetect">Re-scan</button>
+              </div>
+              <div class="help" id="gameHint">Leave this empty to let the launcher find the install automatically (registry, common folders, next to the launcher).</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">Network</div>
+          <div class="panel-body">
+            <div class="field">
+              <label for="master">Master server</label>
+              <input id="master" class="mono" autocomplete="off">
+              <div class="help">Source of the Internet tab and your favorites. The LAN tab works without it.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">Diagnostics</div>
+          <div class="panel-body">
+            <div class="field">
+              <div class="notice" id="diagMaster">Master server: not checked yet</div>
+              <div class="notice" id="diagGame">Game install: not checked yet</div>
+              <div class="notice" id="diagJoin">Last join: not checked yet</div>
+            </div>
+            <div class="actions">
+              <button class="btn" id="btnDiag">Run checks</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">Administration</div>
+          <div class="panel-body">
+            <div class="field">
+              <label for="rcon">Server RCON password</label>
+              <input id="rcon" type="password" placeholder="optional" autocomplete="off">
+              <div class="help">Enables the in-game admin panel (broadcast, give, spawn vehicle and more) on servers that accept it.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn primary" id="btnSaveCfg">Save settings</button>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div id="status">ready</div>
+      <div id="build">LCS Online Launcher</div>
+    </footer>
+  </div>
 
   <div id="tooltip">
     <div class="t-name" id="tName">—</div>
@@ -261,6 +356,15 @@ let hoverAddr = null;
 let probeTimer = null;
 let expectedVersion = 0;
 
+const PAGE_TITLES = { play: "Play", profile: "Profile", settings: "Settings" };
+
+function showPage(name) {
+  document.querySelectorAll(".page").forEach(p => p.classList.toggle("active", p.id === "page-" + name));
+  document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === name));
+  $("pageTitle").textContent = PAGE_TITLES[name] || name;
+  if (name === "settings") runDiag();
+}
+
 function setStatus(text, cls) {
   const el = $("status");
   el.textContent = text;
@@ -271,19 +375,22 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-function pingCellPing(addr) {
-  const r = live[addr];
-  return r && typeof r.pingMs === "number" ? r.pingMs : null;
+function updateSelLabel() {
+  const s = servers[selected];
+  $("selLabel").innerHTML = s
+    ? "Selected: <b>" + esc(s.hostname) + "</b> · " + esc(s.address)
+    : "No server selected";
 }
 
 function renderRows() {
   const tb = $("rows");
   if (!servers.length) {
     const msg = tab === "favorites"
-      ? "No favorites yet — select a server and press ★ Add Favorite (stored on the master server)"
-      : "No servers found — check your network or add a favorite";
+      ? "No favorites yet. Select a server and press Add favorite. Favorites are stored on the master server."
+      : "No servers found. Check your network, or join a server directly below.";
     tb.innerHTML = `<tr><td colspan="6" class="empty">${msg}</td></tr>`;
     selected = -1;
+    updateSelLabel();
     return;
   }
   tb.innerHTML = servers.map((s, i) => {
@@ -298,9 +405,9 @@ function renderRows() {
     const mode = lv.gameMode || s.gameMode || "—";
     return `
     <tr class="server ${i === selected ? "sel" : ""} ${lv.online === false ? "offline" : ""}" data-i="${i}" data-addr="${esc(s.address)}">
-      <td class="name">${online === true ? '<span class="live-dot"></span>' : online === false ? '<span class="live-dot dead"></span>' : ''}${esc(s.hostname)}
+      <td class="name">${online === true ? '<span class="dot"></span>' : online === false ? '<span class="dot dead"></span>' : ''}${esc(s.hostname)}
         ${stale ? '<span class="pill warn" title="protocol mismatch">stale</span>' : ''}
-        ${tab === "favorites" ? `<button class="btn small" data-remove="${esc(s.address)}" title="remove from your favorites">✕</button>` : ''}</td>
+        ${tab === "favorites" ? `<button class="btn small danger" data-remove="${esc(s.address)}" title="remove from your favorites">Remove</button>` : ''}</td>
       <td>${esc(map)}</td>
       <td><span class="pill">${players}</span></td>
       <td>${pingTxt}</td>
@@ -327,6 +434,7 @@ function renderRows() {
       send("favdel?address=" + jenc(addr));
     });
   });
+  updateSelLabel();
 }
 
 function renderProfiles(list) {
@@ -363,8 +471,8 @@ function updateTooltip(addr) {
   const hist = samples[addr] || [];
   const pings = hist.filter(v => typeof v === "number" && v >= 0);
   if (pings.length) {
-    const min = Math.min(...pings), max = Math.max(...pings), avg = Math.round(pings.reduce((a,b)=>a+b,0)/pings.length);
-    $("tPing").textContent = `${pings[pings.length-1]} ms  (min ${min} / avg ${avg} / max ${max})`;
+    const min = Math.min(...pings), max = Math.max(...pings), avg = Math.round(pings.reduce((a, b) => a + b, 0) / pings.length);
+    $("tPing").textContent = `${pings[pings.length - 1]} ms  (min ${min} / avg ${avg} / max ${max})`;
   } else {
     $("tPing").textContent = lv === undefined ? "sampling…" : "no reply";
   }
@@ -397,16 +505,14 @@ function drawGraph(addr) {
   if (hist.length < 1) return;
   const max = Math.max(40, ...hist) * 1.1;
   const step = hist.length > 1 ? w / (hist.length - 1) : w;
-  // grid
   ctx.strokeStyle = "rgba(255,255,255,0.08)";
   ctx.lineWidth = 1;
   for (let i = 1; i < 3; i++) {
     const y = Math.round((h / 3) * i) + 0.5;
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
   }
-  // area + line
   const last = hist[hist.length - 1];
-  const color = last < 80 ? "#56d364" : last < 160 ? "#f0c14b" : "#f85149";
+  const color = last < 80 ? "#4fb477" : last < 160 ? "#d9a441" : "#e0645c";
   ctx.beginPath();
   hist.forEach((v, i) => {
     const x = i * step;
@@ -421,11 +527,9 @@ function drawGraph(addr) {
   ctx.closePath();
   ctx.fillStyle = color + "30";
   ctx.fill();
-  // last sample marker
   const lx = (hist.length - 1) * step, ly = h - Math.min(h - 2, (last / max) * h);
   ctx.beginPath(); ctx.arc(lx, ly, 2.6, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
-  // labels
-  ctx.fillStyle = "rgba(139,148,163,0.9)";
+  ctx.fillStyle = "rgba(138,145,158,0.95)";
   ctx.font = "9px Segoe UI, sans-serif";
   ctx.fillText(Math.round(max) + " ms", 3, 10);
   ctx.fillText(hist.length + " sample" + (hist.length === 1 ? "" : "s"), 3, h - 3);
@@ -449,13 +553,15 @@ window.onCefReply = function (json) {
   switch (msg.reply) {
     case "init":
       $("nick").value = msg.nick || "";
+      $("whoami").textContent = msg.nick || "Player";
       $("game").value = msg.game || "";
       $("master").value = msg.master || "";
       $("rcon").value = msg.rcon || "";
+      $("pass").value = msg.pass || "";
       expectedVersion = msg.version || 0;
       renderProfiles(msg.profiles);
       showGameState(msg);
-      setStatus("ready — signed in as " + (msg.nick || "Player") + " · protocol v" + (msg.version || "?"));
+      setStatus("ready · protocol v" + (msg.version || "?"));
       refresh();
       break;
     case "game":
@@ -471,9 +577,8 @@ window.onCefReply = function (json) {
       renderRows();
       const note = msg.note ? " · " + msg.note : "";
       setStatus(`${servers.length} server(s) from ${msg.source}${note}` +
-                (tab === "favorites" ? "" : " — hover a row for map / mode / ping"),
+                (tab === "favorites" ? "" : " — hover a row for map, mode and ping"),
                 msg.note ? "warn" : "ok");
-      // live-sample the listed servers so the Map/Ping columns fill in
       if (servers.length) send("pingall");
       break;
     }
@@ -486,7 +591,6 @@ window.onCefReply = function (json) {
           h.push(row.pingMs);
           if (h.length > 40) h.shift();
         }
-        // fold live data back into the row so columns show it
         const idx = servers.findIndex(s => s.address === row.address);
         if (idx >= 0) servers[idx] = Object.assign({}, servers[idx], {
           map: row.map || servers[idx].map, gameMode: row.gameMode || servers[idx].gameMode,
@@ -534,6 +638,7 @@ window.onCefReply = function (json) {
       break;
     case "saveuser":
       renderProfiles(msg.profiles);
+      if (msg.ok) $("whoami").textContent = msg.nick;
       setStatus(msg.ok ? "username saved: " + msg.nick : "invalid username (3-20 chars: letters, digits, _)",
                 msg.ok ? "ok" : "err");
       break;
@@ -543,26 +648,86 @@ window.onCefReply = function (json) {
     case "addfav":
       setStatus(msg.ok ? "favorite saved (local cache)" : "select a server first", msg.ok ? "ok" : "err");
       break;
+    case "diag":
+      renderDiag(msg);
+      setStatus("diagnostics: master " + (msg.masterOk ? "reachable" : "unreachable") +
+                " · game " + (msg.gameOk ? "found" : "not found"),
+                (msg.masterOk && msg.gameOk) ? "ok" : "warn");
+      break;
     case "selftest":
       setStatus("selftest: " + msg.detail, msg.ok ? "ok" : "err");
       break;
   }
 };
 
-function showGameState(msg) {
+// the init reply carries the detection fields with a "game" prefix; the
+// "game" reply (detectgame) uses the plain names — normalise to one shape
+function gameInfo(msg) {
+  if (msg.reply !== "init") return msg;
+  return {
+    ok: !!msg.gameHow,
+    path: msg.game,
+    how: msg.gameHow,
+    data: msg.gameData,
+    cef: msg.gameCef,
+    error: msg.gameError,
+  };
+}
+
+function showGameState(raw) {
+  const msg = gameInfo(raw);
   const el = $("gameState");
-  const hint = $("gameHint");
+  const chip = $("gameChip");
   if (msg.ok) {
-    el.className = "state ok";
-    el.textContent = "detected via " + (msg.how || "auto").toLowerCase()
-      + (msg.data ? " · game data ok" : " · game data missing (models/gta3.img)")
-      + (msg.cef ? " · cefui.dll ok" : " · cefui.dll missing");
-    if (!msg.data || !msg.cef) el.className = "state warn";
-    hint.textContent = "";
+    const parts = ["Found via " + (msg.how || "auto").toLowerCase()];
+    parts.push(msg.data ? "game data ok" : "game data missing (models/gta3.img)");
+    parts.push(msg.cef ? "in-game UI ok" : "cefui.dll missing");
+    el.className = "notice " + ((msg.data && msg.cef) ? "ok" : "warn");
+    el.innerHTML = esc(parts.join(" · ")) + (msg.path ? '<span class="sub">' + esc(msg.path) + "</span>" : "");
+    chip.textContent = "ready";
   } else {
-    el.className = "state err";
-    el.textContent = "not found: " + (msg.error || "set the path manually");
+    el.className = "notice err";
+    el.innerHTML = "Game not found" + (msg.error ? '<span class="sub">' + esc(msg.error) + "</span>" : "");
+    chip.textContent = "not found";
   }
+}
+
+// ---- diagnostics -----------------------------------------------------------
+function renderDiag(msg) {
+  const m = $("diagMaster");
+  m.className = "notice " + (msg.masterOk ? "ok" : "err");
+  m.innerHTML = msg.masterOk
+    ? "Master " + esc(msg.master) + " reachable · " + esc(msg.masterMs) + " ms"
+    : "Master " + esc(msg.master) + " unreachable" +
+      '<span class="sub">' + esc(msg.masterError || "no answer") + "</span>";
+
+  const g = $("diagGame");
+  if (msg.gameOk) {
+    const parts = ["Game found via " + (msg.gameHow || "auto").toLowerCase()];
+    if (!msg.gameData) parts.push("game data missing (models/gta3.img)");
+    if (!msg.gameCef) parts.push("cefui.dll missing");
+    g.className = "notice " + ((msg.gameData && msg.gameCef) ? "ok" : "warn");
+    g.innerHTML = esc(parts.join(" · ")) + '<span class="sub">' + esc(msg.game) + "</span>";
+  } else {
+    g.className = "notice err";
+    g.innerHTML = "Game not found" + '<span class="sub">' + esc(msg.gameError || "no install detected") + "</span>";
+  }
+
+  const j = $("diagJoin");
+  j.className = "notice " + (msg.lastJoinError ? "warn" : "ok");
+  j.innerHTML = msg.lastJoinError
+    ? "Last join failed" + '<span class="sub">' + esc(msg.lastJoinError) + "</span>"
+    : "Last join: no error this session";
+}
+
+function runDiag() {
+  $("diagMaster").className = "notice";
+  $("diagMaster").textContent = "Checking the master server…";
+  $("diagGame").className = "notice";
+  $("diagGame").textContent = "Checking the game install…";
+  $("diagJoin").className = "notice";
+  $("diagJoin").textContent = "Last join: checking…";
+  send("diag");
 }
 
 // ---- actions --------------------------------------------------------------
@@ -572,28 +737,29 @@ function refresh() {
 }
 function joinSelected() {
   if (selected < 0 || !servers[selected]) {
-    setStatus("select a server first (or use Join Direct)", "err");
+    setStatus("select a server first, or use Join direct", "err");
     return;
   }
   const s = servers[selected];
-  send(`join?address=${jenc(s.address)}&nick=${jenc($("nick").value)}`);
+  send(`join?address=${jenc(s.address)}&nick=${jenc($("nick").value)}&pass=${jenc($("pass").value)}`);
 }
 function favForSelection() {
   if (selected >= 0 && servers[selected]) return servers[selected];
   return { address: $("direct").value, hostname: "favorite" };
 }
 
+document.querySelectorAll(".nav-item").forEach(b => b.addEventListener("click", () => showPage(b.dataset.page)));
 $("btnRefresh").addEventListener("click", refresh);
 $("btnJoin").addEventListener("click", joinSelected);
 $("btnJoinDirect").addEventListener("click", () =>
-  send(`join?address=${jenc($("direct").value)}&nick=${jenc($("nick").value)}`));
+  send(`join?address=${jenc($("direct").value)}&nick=${jenc($("nick").value)}&pass=${jenc($("pass").value)}`));
 $("btnAddFav").addEventListener("click", () => {
   const s = favForSelection();
   send(`favadd?address=${jenc(s.address)}&name=${jenc(s.hostname)}`);
 });
 $("btnDetect").addEventListener("click", () => {
-  $("gameState").className = "state";
-  $("gameState").textContent = "scanning registry, common folders and your home directory…";
+  $("gameState").className = "notice";
+  $("gameState").textContent = "Scanning the registry, common folders and your home directory…";
   setStatus("detecting the game install…");
   send("detectgame");
 });
@@ -604,8 +770,9 @@ $("btnPingAll").addEventListener("click", () => {
 $("btnSaveUser").addEventListener("click", () =>
   send(`saveuser?nick=${jenc($("nick").value)}`));
 $("btnSaveCfg").addEventListener("click", () =>
-  send(`config?game=${jenc($("game").value)}&master=${jenc($("master").value)}&nick=${jenc($("nick").value)}&rcon=${jenc($("rcon").value)}`));
+  send(`config?game=${jenc($("game").value)}&master=${jenc($("master").value)}&nick=${jenc($("nick").value)}&pass=${jenc($("pass").value)}&rcon=${jenc($("rcon").value)}`));
 $("btnQuit").addEventListener("click", () => send("quit"));
+$("btnDiag").addEventListener("click", runDiag);
 
 $("profiles").addEventListener("change", () => {
   $("nick").value = $("profiles").value;

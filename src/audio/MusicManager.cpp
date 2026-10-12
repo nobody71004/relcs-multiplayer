@@ -452,6 +452,7 @@ cMusicManager::ServiceFrontEndMode()
 		m_nNextLoopFlag = m_FrontendLoopFlag;
 	}
 
+	static uint32 s_trackStartRequestTime = 0;
 	if (m_nNextTrack == m_nPlayingTrack) {
 		if (SampleManager.IsStreamPlaying()) {
 			if (m_nVolumeLatency > 0) m_nVolumeLatency--;
@@ -474,6 +475,14 @@ cMusicManager::ServiceFrontEndMode()
 				m_nPlayingTrack = m_nNextTrack;
 				m_bVerifyNextTrackStartedToPlay = FALSE;
 				m_bTrackChangeStarted = FALSE;
+			} else if (m_bVerifyNextTrackStartedToPlay) {
+				// a start is already pending: give it a second, then drop the track.
+				// Reopening a missing track file every frame floods stderr and stalls the game.
+				if (CTimer::GetTimeInMillisecondsPauseMode() - s_trackStartRequestTime > 1000) {
+					m_nNextTrack = m_nPlayingTrack;
+					m_bVerifyNextTrackStartedToPlay = FALSE;
+					m_bTrackChangeStarted = FALSE;
+				}
 			} else {
 				uint32 trackStartPos = (m_nNextTrack > STREAMED_SOUND_RADIO_POLICE) ? 0 : GetTrackStartPos(m_nNextTrack);
 				if (m_nNextTrack != NO_TRACK) {
@@ -486,6 +495,7 @@ cMusicManager::ServiceFrontEndMode()
 					if (m_nNextTrack < STREAMED_SOUND_CITY_AMBIENT)
 						m_nLastTrackServiceTime = CTimer::GetTimeInMillisecondsPauseMode();
 					m_bVerifyNextTrackStartedToPlay = TRUE;
+					s_trackStartRequestTime = CTimer::GetTimeInMillisecondsPauseMode();
 				}
 			}
 		} else {

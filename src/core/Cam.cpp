@@ -1801,6 +1801,15 @@ CCam::Process_Cam_On_A_String(const CVector &CameraTarget, float TargetOrientati
 
 	FOV = DefaultFOV;
 
+	// mouse orbit state: held until the player looks behind / looks sideways or re-enters the car
+	static bool s_camOrbitHeld = false;
+	if(ResetStatics)
+		s_camOrbitHeld = false;
+	CPad *orbitPad = CPad::GetPad(0);
+	bool orbitLookingAway = orbitPad->GetLookBehindForCar() || orbitPad->GetLookBehindForPed() || orbitPad->GetLookLeft() || orbitPad->GetLookRight();
+	if(orbitLookingAway)
+		s_camOrbitHeld = false;
+
 	if(ResetStatics){
 		AlphaSpeed = 0.0f;
 		m_fTilt = 0.0f;
@@ -1840,7 +1849,29 @@ CCam::Process_Cam_On_A_String(const CVector &CameraTarget, float TargetOrientati
 
 	Cam_On_A_String_Unobscured(TargetCoors, BaseDist);
 	WorkOutCamHeight(TargetCoors, TargetOrientation, Dimensions.z);
-	RotCamIfInFrontCar(TargetCoors, TargetOrientation);
+
+	// Mouse orbit while driving. Without this the view is swung back behind the car every frame
+	// (RotCamIfInFrontCar). The angle the player picks is held until they look behind or re-enter.
+	// Bikes still steer with the mouse when that option is on, so the orbit yields to it there.
+	bool orbitAllowed = CCamera::m_bUseMouse3rdPerson && !orbitPad->ArePlayerControlsDisabled() && !orbitLookingAway &&
+		(!((CVehicle*)CamTargetEntity)->IsBike() || CVehicle::m_bDisableMouseSteering);
+	if (orbitAllowed) {
+		float orbitMouseX = orbitPad->GetMouseX() * -2.0f;
+		if (orbitMouseX != 0.0f) {
+			float orbitDist = (Source - TargetCoors).Magnitude2D();
+			float orbitBeta = CGeneral::GetATanOfXY(Source.x - TargetCoors.x, Source.y - TargetCoors.y);
+			orbitBeta += orbitMouseX * FOV / 80.0f * TheCamera.m_fMouseAccelHorzntl;
+			Source.x = TargetCoors.x + Cos(orbitBeta) * orbitDist;
+			Source.y = TargetCoors.y + Sin(orbitBeta) * orbitDist;
+			s_camOrbitHeld = true;
+		}
+	}
+	if (orbitAllowed && s_camOrbitHeld) {
+		TheCamera.m_bCamDirectlyBehind = false;
+		TheCamera.m_bCamDirectlyInFront = false;
+	} else {
+		RotCamIfInFrontCar(TargetCoors, TargetOrientation);
+	}
 	FixCamWhenObscuredByVehicle(TargetCoors);
 
 	m_cvecTargetCoorsForFudgeInter = TargetCoors;
@@ -4791,6 +4822,7 @@ CCam::Process_FollowCar_SA(const CVector& CameraTarget, float TargetOrientation,
 	static float lastBeta = -9999.0f;
 	static float lastAlpha = -9999.0f;
 	static float stepsLeftToChangeBetaByMouse;
+	static bool mouseOrbitHeld; // player orbited with the mouse: keep that angle, don't pull behind the car
 	static float dontCollideWithCars;
 	static bool alphaCorrected;
 	static float heightIncreaseMult;
@@ -4940,6 +4972,7 @@ CCam::Process_FollowCar_SA(const CVector& CameraTarget, float TargetOrientation,
 
 	// Called when we just entered the car, just started to look behind or returned back from looking left, right or behind
 	if (ResetStatics || TheCamera.m_bCamDirectlyBehind || TheCamera.m_bCamDirectlyInFront) {
+		mouseOrbitHeld = false; // look-behind / re-entry recentres the camera behind the car
 		ResetStatics = false;
 		Rotating = false;
 		m_bCollisionChecksOn = true;
@@ -5006,6 +5039,9 @@ CCam::Process_FollowCar_SA(const CVector& CameraTarget, float TargetOrientation,
 		targetBeta += TWOPI;
 	else if (targetBeta > Beta + PI)
 		targetBeta -= TWOPI;
+
+	if (mouseOrbitHeld)
+		targetBeta = Beta; // hold the mouse-chosen heading instead of drifting back behind the car
 
 	float carPosChange = (TargetCoors - m_aTargetHistoryPosTwo).Magnitude();
 	if (carPosChange < newDistance && newDistance > minDistForThisCar) {
@@ -5119,13 +5155,16 @@ CCam::Process_FollowCar_SA(const CVector& CameraTarget, float TargetOrientation,
 		// If you want an ability to toggle free cam while steering with mouse, you can add an OR after DisableMouseSteering.
 		// There was a pad->NewState.m_bVehicleMouseLook in SA, which doesn't exists in III.
 
-		if ((mouseX != 0.0 || mouseY != 0.0) && (CVehicle::m_bDisableMouseSteering)) {
+		// Cars never steer with the mouse (see Automobile.cpp), so the orbit always works for them.
+		// Bikes still steer with the mouse when that option is on, so the orbit yields to it there.
+		if ((mouseX != 0.0 || mouseY != 0.0) && (CVehicle::m_bDisableMouseSteering || !isBike)) {
 			yMovement = mouseY * FOV / 80.0f * TheCamera.m_fMouseAccelHorzntl; // Same as SA, horizontal sensitivity.
 			BetaSpeed = 0.0;
 			AlphaSpeed = 0.0;
 			xMovement = mouseX * FOV / 80.0f * TheCamera.m_fMouseAccelHorzntl;
 			targetAlpha = Alpha;
 			stepsLeftToChangeBetaByMouse = 1.0f * 50.0f;
+			mouseOrbitHeld = true;
 			mouseChangesBeta = true;
 		} else if (stepsLeftToChangeBetaByMouse > 0.0f) {
 			// Finish rotation by decreasing speed when we stopped moving mouse

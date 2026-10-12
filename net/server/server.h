@@ -60,6 +60,7 @@ struct ServerPlayer {
 	// tough validator state (rnet_validator.h)
 	rnet::RateLimiter msgRate;        // every packet — flood defence
 	rnet::RateLimiter chatRate;       // chat lines — spam defence
+	rnet::RateLimiter voiceRate;      // voice frames (~50/s while talking), own budget
 	rnet::RateLimiter damageRate;     // damage claims
 	int32_t moneySeen = 0;            // last server-accepted wallet
 	int32_t moneyGranted = 0;         // wallet growth the server has granted
@@ -69,10 +70,12 @@ struct ServerPlayer {
 	double invTime = 0;               // last accepted client inventory report
 	PlayerProfile savedProfile;       // loaded at join, kept for restore
 	bool hasProfile = false;          // a DB row existed for this name
+	bool profileStranger = false;     // name owned by another account — never save through
 	bool profileSent = false;         // restore already sent this session
 	bool moneyInit = false;           // wallet baseline established
 	int32_t savedMoney = 0;           // last wallet value written to the DB
 	bool profileDirty = false;        // needs a save
+	bool resumePos = false;           // first spawn uses the saved last position
 	int floodStrikes = 0;
 	uint64_t bytesInAtLastSample = 0, bytesOutAtLastSample = 0;
 };
@@ -121,6 +124,7 @@ public:
 	void RemoveVehicle(uint16_t vehicleId);
 	void SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour);
 	void BroadcastScores();
+	void BroadcastPlayerPing();   // MSG_PLAYER_PING: ping/score rows for the scoreboard
 	void KickPlayer(uint8_t playerId, const char* reason);
 	void RestartGameMode();
 	void SaveProfile(ServerPlayer* p);      // write wallet + inventory to the DB
@@ -133,6 +137,7 @@ public:
 
 private:
 	void PumpNetwork();
+	void SendRefusal(ENetPeer* peer, uint8_t code, const char* reason); // MSG_DISCONNECT + JoinRefused code
 	void OnConnect(ENetPeer* peer);
 	void HandleInventory(ServerPlayer* p, rnet::BitReader& r);
 	void SendInventory(ServerPlayer* p);    // restore the persisted profile
@@ -146,6 +151,7 @@ private:
 	void SendGive(uint8_t targetId, uint8_t kind, int32_t amount, uint16_t arg);
 	void HandleVehicleState(ServerPlayer* p, rnet::BitReader& r);
 	void HandleChat(ServerPlayer* p, rnet::BitReader& r);
+	void HandleVoice(ServerPlayer* p, rnet::BitReader& r);
 	void HandleSpawnReq(ServerPlayer* p);
 	void HandleDamage(ServerPlayer* p, rnet::BitReader& r);
 	void HandleVehEnter(ServerPlayer* p, rnet::BitReader& r);
@@ -187,6 +193,7 @@ private:
 	double m_lastTick = 0.0;
 	double m_lastNetStats = 0.0;
 	double m_lastWorldUpdate = 0.0;
+	double m_lastPingBroadcast = 0.0;
 	uint64_t m_totalBytesIn = 0, m_totalBytesOut = 0;
 
 	friend class GameMode;

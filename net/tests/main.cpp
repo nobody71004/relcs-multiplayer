@@ -1,7 +1,9 @@
 // net/tests/main.cpp — unit tests for the rnet protocol layer.
 #include "rnet_protocol.h"
 #include "rnet_validator.h"
+#include "rnet_voice.h"
 #include "profiles.h"
+#include "passhash.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -216,6 +218,30 @@ static void TestMessageCodecs()
 	BitReader r4(trunc, 2);
 	MsgScoreUpdate s3;
 	CHECK(!ReadScoreUpdate(r4, s3));
+
+	{  // player list (MSG_PLAYER_PING): round trip keeps ping/score/kills/deaths
+	MsgPlayerPing pp; pp.count = 2;
+	pp.entries[0].playerId = 4; pp.entries[0].pingMs = 65000; pp.entries[0].score = -12;
+	pp.entries[0].kills = 3; pp.entries[0].deaths = 9;
+	pp.entries[1].playerId = 7; pp.entries[1].pingMs = 0; pp.entries[1].score = 500;
+	BitWriter wp; WritePlayerPing(wp, pp);
+	BitReader rp(wp.Data(), wp.ByteSize());
+	MsgPlayerPing pp2; CHECK(ReadPlayerPing(rp, pp2));
+	CHECK(rp.Ok() && pp2.count == 2);
+	CHECK(pp2.entries[0].playerId == 4 && pp2.entries[0].pingMs == 65000 && pp2.entries[0].score == -12);
+	CHECK(pp2.entries[0].kills == 3 && pp2.entries[0].deaths == 9);
+	CHECK(pp2.entries[1].playerId == 7 && pp2.entries[1].pingMs == 0 && pp2.entries[1].score == 500);
+
+	// a count above the cap is rejected
+	uint8_t pbad[1] = { 33 };
+	BitReader rpb(pbad, 1); MsgPlayerPing pp3;
+	CHECK(!ReadPlayerPing(rpb, pp3));
+
+	// a truncated row fails cleanly
+	uint8_t ptrunc[4] = { 2, 4, 0, 0 };
+	BitReader rpt(ptrunc, 4); MsgPlayerPing pp4;
+	CHECK(!ReadPlayerPing(rpt, pp4));
+	}
 
 	// admin give
 	MsgGive gv; gv.targetId = 9; gv.kind = GIVE_WEAPON; gv.amount = 250; gv.arg = 16;
@@ -564,6 +590,133 @@ static void TestProfileStore()
 	PlayerProfile e;
 	CHECK(db.Load("mattb", e));
 	CHECK(e.money == 60000 && e.currentWeapon == 4 && e.weapons.size() == 1);
+
+	// match stats + last position round-trip, and reach the disk too
+	PlayerProfile s;
+	s.money = 60000;
+	s.score = 7;
+	s.kills = 7;
+	s.deaths = 3;
+	s.hasPos = true;
+	s.x = 1133.5f; s.y = -660.25f; s.z = 23.0f; s.heading = 1.5f;
+	CHECK(db.Save("mattb", s));
+	db.Close();
+	CHECK(db.Open(path));
+	PlayerProfile f;
+	CHECK(db.Load("mattb", f));
+	CHECK(f.score == 7 && f.kills == 7 && f.deaths == 3);
+	CHECK(f.hasPos && f.x == 1133.5f && f.y == -660.25f && f.z == 23.0f && f.heading == 1.5f);
+
+	// a profile saved without a position reads back as no position
+	PlayerProfile g;
+	g.money = 1;
+	CHECK(db.Save("nopos", g));
+	PlayerProfile h;
+	CHECK(db.Load("nopos", h));
+	CHECK(!h.hasPos && h.score == 0 && h.kills == 0 && h.deaths == 0);
+
+	db.Close();
+	std::remove(path);
+}
+
+// name+password auth: PBKDF2 determinism, claim once, restore by owner only
+static void TestProfileAuth()
+{
+	// hashing is deterministic for a fixed salt, and any change flips the hash
+	uint8_t salt[16];
+	for(int i = 0; i < 16; i++) salt[i] = (uint8_t)(i * 7 + 1);
+	uint8_t k1[32], k2[32], k3[32];
+	passhash::DeriveKey("hunter2", salt, k1);
+	passhash::DeriveKey("hunter2", salt, k2);
+	passhash::DeriveKey("hunter3", salt, k3);
+	CHECK(memcmp(k1, k2, 32) == 0);              // same pass+salt -> same key
+	CHECK(memcmp(k1, k3, 32) != 0);              // different pass -> different key
+	CHECK(passhash::SecureEqual(k1, k2, 32));
+	CHECK(!passhash::SecureEqual(k1, k3, 32));
+	// a different salt also changes the key
+	uint8_t salt2[16];
+	for(int i = 0; i < 16; i++) salt2[i] = (uint8_t)(i * 13 + 5);
+	passhash::DeriveKey("hunter2", salt2, k2);
+	CHECK(memcmp(k1, k2, 32) != 0);
+
+	const char* path = "test-auth.db";
+	std::remove(path);
+	ProfileStore db;
+	CHECK(db.Open(path));
+
+	// unknown name is unclaimed; no profile yet
+	CHECK(db.Auth("toni", "whatever") == AuthResult::UNCLAIMED);
+	PlayerProfile p;
+	CHECK(!db.Load("toni", p));
+
+	// claim: set a password, name becomes owned
+	CHECK(db.SetPassword("toni", "swordfish"));
+	CHECK(db.Auth("toni", "swordfish") == AuthResult::OK);
+	CHECK(db.Auth("toni", "wrongpass") == AuthResult::WRONG_PASSWORD);
+	CHECK(db.Auth("toni", "") == AuthResult::WRONG_PASSWORD);
+	// case-insensitive name match still resolves to the same credential
+	CHECK(db.Auth("TONI", "swordfish") == AuthResult::OK);
+
+	// owner restores their saved wallet + weapons
+	PlayerProfile a;
+	a.money = 12345;
+	a.currentWeapon = 26;
+	a.weapons.push_back({ 26, 40 });
+	CHECK(db.Save("toni", a));
+	CHECK(db.Load("toni", a));
+	CHECK(a.money == 12345 && a.weapons.size() == 1);
+
+	// changing the password invalidates the old one
+	CHECK(db.SetPassword("toni", "newpass99"));
+	CHECK(db.Auth("toni", "newpass99") == AuthResult::OK);
+	CHECK(db.Auth("toni", "swordfish") == AuthResult::WRONG_PASSWORD);
+
+	// survives reopen (really stored), and short passwords are refused
+	db.Close();
+	CHECK(db.Open(path));
+	CHECK(db.Auth("toni", "newpass99") == AuthResult::OK);
+	CHECK(!db.SetPassword("toni", "ab"));   // below MIN_PASSWORD_LEN
+	CHECK(db.Auth("toni", "ab") == AuthResult::WRONG_PASSWORD);
+	CHECK(db.Auth("toni", "newpass99") == AuthResult::OK); // unchanged
+	db.Close();
+	std::remove(path);
+}
+
+// a profile row created before credentials existed reads as unclaimed
+static void TestProfileLegacyMigration()
+{
+	const char* path = "test-legacy.db";
+	std::remove(path);
+
+	// build an old-shape DB by hand: no pass_hash / pass_salt columns
+	{
+		std::ofstream f(path, std::ios::binary);
+		CHECK(f.good());
+	}
+	std::remove(path);
+	ProfileStore old;
+	CHECK(old.Open(path));
+	PlayerProfile p;
+	p.money = 777;
+	p.currentWeapon = 18;
+	p.weapons.push_back({ 18, 12 });
+	CHECK(old.Save("claude", p));
+	old.Close();
+
+	// reopen through ProfileStore: EnsureCredentialColumns migrates the row
+	ProfileStore db;
+	CHECK(db.Open(path));
+	CHECK(db.Auth("claude", "anything") == AuthResult::UNCLAIMED); // pre-password row
+	PlayerProfile q;
+	CHECK(db.Load("claude", q));
+	CHECK(q.money == 777 && q.weapons.size() == 1);                 // data intact
+	// claiming it now keeps the wallet and locks out strangers
+	CHECK(db.SetPassword("claude", "mypassword"));
+	CHECK(db.Auth("claude", "mypassword") == AuthResult::OK);
+	CHECK(db.Auth("claude", "anything") == AuthResult::WRONG_PASSWORD);
+	PlayerProfile r;
+	CHECK(db.Load("claude", r));
+	CHECK(r.money == 777 && r.weapons.size() == 1);
 	db.Close();
 	std::remove(path);
 }
@@ -963,9 +1116,85 @@ static void TestMasterEntryLiveInfo()
 	CHECK(a4.protocolVersion == 4);
 }
 
+// proximity voice: Opus round trip and the MSG_VOICE packet codec
+static void TestVoiceCodec()
+{
+	rnet::VoiceEncoder enc;
+	rnet::VoiceDecoder dec;
+	CHECK(enc.Ok() && dec.Ok());
+
+	// a 440 Hz tone: the codec is lossy, so check that every packet fits, the
+	// decoder keeps the frame size, and the tone keeps its level after warm-up
+	const float kPi = 3.14159265f;
+	float phase = 0.0f;
+	int16_t pcm[VOICE_FRAME_SAMPLES], out[VOICE_FRAME_SAMPLES];
+	uint8_t packet[VOICE_MAX_PACKET];
+	bool framesOk = true;
+	double inEnergy = 0.0, outEnergy = 0.0;
+	for(int f = 0; f < 50; f++){
+		for(int k = 0; k < VOICE_FRAME_SAMPLES; k++){
+			pcm[k] = (int16_t)(8000.0f * std::sin(phase));
+			phase += 2.0f * kPi * 440.0f / VOICE_SAMPLE_RATE;
+		}
+		int len = enc.Encode(pcm, packet);
+		if(len <= 0 || len > VOICE_MAX_PACKET){ framesOk = false; break; }
+		int n = dec.Decode(packet, len, out);
+		if(n != VOICE_FRAME_SAMPLES){ framesOk = false; break; }
+		if(f >= 25){   // skip the codec's warm-up frames
+			for(int k = 0; k < VOICE_FRAME_SAMPLES; k++){
+				inEnergy += (double)pcm[k] * pcm[k];
+				outEnergy += (double)out[k] * out[k];
+			}
+		}
+	}
+	CHECK(framesOk);
+	CHECK(inEnergy > 0.0);
+	CHECK(outEnergy > 0.5 * inEnergy && outEnergy < 2.0 * inEnergy);
+
+	// silence decodes to (near) silence
+	for(int k = 0; k < VOICE_FRAME_SAMPLES; k++) pcm[k] = 0;
+	for(int f = 0; f < 5; f++){
+		int len = enc.Encode(pcm, packet);
+		CHECK(len > 0 && len <= VOICE_MAX_PACKET);
+		CHECK(dec.Decode(packet, len, out) == VOICE_FRAME_SAMPLES);
+	}
+	int peak = 0;
+	for(int k = 0; k < VOICE_FRAME_SAMPLES; k++) if(std::abs((int)out[k]) > peak) peak = std::abs((int)out[k]);
+	CHECK(peak <= 64);
+
+	// packet codec: fromId, length, then the packet, exact size on the wire
+	uint8_t body[VOICE_MAX_PACKET];
+	for(int i = 0; i < 37; i++) body[i] = (uint8_t)(i * 7 + 3);
+	BitWriter w;
+	WriteVoice(w, 7, body, 37);
+	CHECK(w.ByteSize() == (size_t)(37 + 2));
+	BitReader r(w.Data(), w.ByteSize());
+	uint8_t fromId = 0, back[VOICE_MAX_PACKET] = {}, backLen = 0;
+	CHECK(ReadVoice(r, fromId, back, backLen));
+	CHECK(fromId == 7 && backLen == 37);
+	CHECK(std::memcmp(body, back, 37) == 0);
+	CHECK(r.BitsLeft() == 0);
+
+	// a zero length or one past the maximum is malformed, and so is a short body
+	BitWriter zero;
+	zero.WriteU8(7); zero.WriteU8(0);
+	BitReader rZero(zero.Data(), zero.ByteSize());
+	CHECK(!ReadVoice(rZero, fromId, back, backLen));
+	BitWriter big;
+	big.WriteU8(7); big.WriteU8((uint8_t)(VOICE_MAX_PACKET + 1));
+	for(int i = 0; i < VOICE_MAX_PACKET + 1; i++) big.WriteU8(1);
+	BitReader rBig(big.Data(), big.ByteSize());
+	CHECK(!ReadVoice(rBig, fromId, back, backLen));
+	BitWriter shortBody;
+	shortBody.WriteU8(7); shortBody.WriteU8(10); shortBody.WriteU8(1);
+	BitReader rShort(shortBody.Data(), shortBody.ByteSize());
+	CHECK(!ReadVoice(rShort, fromId, back, backLen));
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
+	TestVoiceCodec();
 	TestWelcomeLiveInfo();
 	TestVehDespawnCodec();
 	TestFavoritesCodec();
@@ -984,6 +1213,8 @@ int main()
 	TestVehicleMessages();
 	TestInventoryMessages();
 	TestProfileStore();
+	TestProfileAuth();
+	TestProfileLegacyMigration();
 	std::printf("%d checks, %d failures — %s\n", g_checks, g_fails, g_fails ? "FAIL" : "PASS");
 	return g_fails ? 1 : 0;
 }

@@ -609,6 +609,9 @@ public:
 	int8 m_PrefsVsync;
 	int8 m_PrefsVsyncDisp;
 	int8 m_PrefsFrameLimiter;
+	int8 m_PrefsFpsIdx;               // index into the frame-cap choices (0 = 30 FPS, last = unlimited)
+	void ApplyFpsCap();               // push the chosen cap into RsGlobal.maxFPS
+	wchar* FpsCapText();              // right-hand menu text for the cap
 	int8 m_nPrefsAudio3DProviderIndex;
 	int8 m_PrefsSpeakers;
 	int8 m_PrefsDMA;

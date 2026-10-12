@@ -13,6 +13,7 @@
 //   [BOT] RESULT: PASS|FAIL <reasons>
 
 #include "rnet_protocol.h"
+#include "rnet_voice.h"
 #include <enet/enet.h>
 
 #include <cstdio>
@@ -45,6 +46,7 @@ struct BotConfig {
 	std::string scenario = "roam";
 	double duration = 30.0;
 	std::string expectChat;
+	std::string password;        // profile password (claims/restores the name)
 	std::string rconPassword;
 	std::vector<std::string> rconCmds;   // extra RCON commands after auth (repeatable)
 	uint32_t seed = 0;
@@ -52,6 +54,7 @@ struct BotConfig {
 	bool discover = false;
 	bool masterQuery = false;
 	int vehModel = 0; // vehicle model for self-created cars (0 = guess)
+	bool voice = false; // -voice: send a 440 Hz tone as voice and report relayed voice frames
 };
 
 // ---------------------------------------------------------------------------
@@ -167,6 +170,7 @@ int main(int argc, char** argv)
 		else if(a == "-scenario" && hasNext) cfg.scenario = argv[++i];
 		else if(a == "-duration" && hasNext) cfg.duration = atof(argv[++i]);
 		else if(a == "-expect-chat" && hasNext) cfg.expectChat = argv[++i];
+		else if(a == "-password" && hasNext) cfg.password = argv[++i];
 		else if(a == "-rcon" && hasNext) cfg.rconPassword = argv[++i];
 		else if(a == "-cmd" && hasNext) cfg.rconCmds.push_back(argv[++i]);
 		else if(a == "-seed" && hasNext) cfg.seed = (uint32_t)atoi(argv[++i]);
@@ -174,6 +178,7 @@ int main(int argc, char** argv)
 		else if(a == "-discover") cfg.discover = true;
 		else if(a == "-master-query") cfg.masterQuery = true;
 		else if(a == "-vehmodel" && hasNext) cfg.vehModel = atoi(argv[++i]);
+		else if(a == "-voice") cfg.voice = true;
 	}
 	if(cfg.seed == 0) cfg.seed = (uint32_t)std::hash<std::string>{}(cfg.name);
 	std::mt19937 rng(cfg.seed);
@@ -228,6 +233,14 @@ int main(int argc, char** argv)
 	uint16_t seenVehId = 0xFFFF, seenVehModel = 0; // last vehicle that appeared
 	uint16_t ownVehId = 0xFFFF;                    // last car WE drove (seat 0)
 
+	// proximity voice (-voice): tone frames out, relayed frames in
+	double lastVoice = 0.0;
+	int voiceSent = 0, voiceOutOfRange = 0;
+	float voicePhase = 0.0f;
+	rnet::VoiceEncoder voiceEnc;
+	struct Heard { int frames = 0; float maxDist = 0.0f; };
+	std::map<uint8_t, Heard> heard;
+
 	auto elapsed = [&]{ return NowSec() - t0; };
 
 	// connect handshake
@@ -251,6 +264,7 @@ int main(int argc, char** argv)
 		BeginMsg(w, MSG_HELLO);
 		MsgHello h;
 		CopyStr(h.name, sizeof h.name, cfg.name.c_str());
+		CopyStr(h.password, sizeof h.password, cfg.password.c_str());
 		WriteHello(w, h);
 		ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 		enet_peer_send(peer, CHAN_RELIABLE, pkt);
@@ -537,6 +551,26 @@ int main(int argc, char** argv)
 					}
 					break;
 				}
+				case MSG_VOICE:{
+					uint8_t from = 0;
+					uint8_t packet[VOICE_MAX_PACKET];
+					uint8_t len = 0;
+					if(cfg.voice && ReadVoice(r, from, packet, len) && r.BitsLeft() == 0 && from != selfId){
+						Heard& hd = heard[from];
+						hd.frames++;
+						auto pit = peers.find(from);
+						if(pit != peers.end()){
+							float dx = (pit->second.state.xMm - self.xMm) / 1000.0f;
+							float dy = (pit->second.state.yMm - self.yMm) / 1000.0f;
+							float dz = (pit->second.state.zMm - self.zMm) / 1000.0f;
+							float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+							if(d > hd.maxDist) hd.maxDist = d;
+							// the server relays only within VOICE_RANGE_M (+ slack for stale peer state)
+							if(d > VOICE_RANGE_M + 5.0f) voiceOutOfRange++;
+						}
+					}
+					break;
+				}
 				case MSG_PONG: break;
 				default: break;
 				}
@@ -586,6 +620,27 @@ int main(int argc, char** argv)
 			lastStateSend = t;
 			self.health = self.health; // authoritative from server
 			sendState();
+		}
+
+		// proximity voice (-voice): one 20 ms Opus tone frame every 20 ms
+		if(cfg.voice && gotSpawn && t - lastVoice >= 0.02){
+			lastVoice = t;
+			int16_t pcm[VOICE_FRAME_SAMPLES];
+			for(int k = 0; k < VOICE_FRAME_SAMPLES; k++){
+				pcm[k] = (int16_t)(8000.0f * std::sin(voicePhase));
+				voicePhase += 2.0f * 3.14159265f * 440.0f / VOICE_SAMPLE_RATE;
+				if(voicePhase >= 6.2831853f) voicePhase -= 6.2831853f;
+			}
+			uint8_t packet[VOICE_MAX_PACKET];
+			int len = voiceEnc.Encode(pcm, packet);
+			if(len > 0){
+				BitWriter w;
+				BeginMsg(w, MSG_VOICE);
+				WriteVoice(w, selfId, packet, (uint8_t)len);
+				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);
+				enet_peer_send(peer, CHAN_STATE, pkt);
+				voiceSent++;
+			}
 		}
 
 		// chat every 3s
@@ -708,8 +763,12 @@ int main(int argc, char** argv)
 			double wall = std::chrono::duration_cast<std::chrono::duration<double>>(
 				std::chrono::system_clock::now().time_since_epoch()).count();
 			std::printf("[%.3f] IAM %.2f %.2f %.2f hp=%d\n",
-			            wall, self.xMm / 1000.0f, self.yMm / 1000.0f, self.zMm / 1000.0f,
-			            (int)self.health);
+			            wall, self.xMm / 1000.0f, self.yMm / 1000.0f, self.zMm / 1000.0f,            (int)self.health);
+			if(cfg.voice){
+				for(auto& kv : heard)
+					std::printf("[%.3f] HEARD %d frames=%d maxdist=%.2f\n", wall, (int)kv.first,
+					            kv.second.frames, kv.second.maxDist);
+			}
 			for(auto& kv : peers){
 				if(kv.second.lastSeen > t - 5.0)
 					std::printf("[%.3f] SEES %d %.2f %.2f %.2f age=%.2f\n", wall, (int)kv.first,
@@ -747,6 +806,12 @@ int main(int argc, char** argv)
 	if(!rconCmdOk) failReasons += "rcon_cmd_failed ";
 	if(statesSent < (int)(cfg.duration * 10)) failReasons += "too_few_states ";
 	if(kicked) failReasons += "kicked ";
+	if(cfg.voice){
+		if(voiceSent == 0) failReasons += "no_voice_sent ";
+		if(voiceOutOfRange > 0) failReasons += "voice_out_of_range ";
+		std::printf("[BOT] VOICE sent=%d heard_speakers=%d out_of_range=%d\n",
+		            voiceSent, (int)heard.size(), voiceOutOfRange);
+	}
 
 	bool pass = failReasons.empty();
 	std::printf("[BOT] RESULT: %s %s| states=%d corrections=%d deaths=%d spawns=%d "
