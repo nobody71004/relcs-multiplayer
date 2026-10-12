@@ -157,6 +157,20 @@ void Server::Shutdown()
 	m_running = false;
 }
 
+// Refuse a join (or drop a peer) with a machine-readable JoinRefused code plus
+// a human-readable reason.
+void Server::SendRefusal(ENetPeer* peer, uint8_t code, const char* reason)
+{
+	BitWriter w;
+	BeginMsg(w, MSG_DISCONNECT);
+	MsgKick k;
+	CopyStr(k.reason, sizeof k.reason, reason);
+	k.code = code;
+	WriteKick(w, k);
+	SendTo(peer, w, CHAN_RELIABLE, true);
+	enet_peer_disconnect_later(peer, 0);
+}
+
 void Server::PushConsoleLine(const std::string& line)
 {
 	std::lock_guard<std::mutex> lock(m_cmdMutex);
@@ -297,7 +311,9 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 
 	// flood defence: peers burning the packet budget get their burst dropped;
 	// persistent floods are kicked
-	if(p && !p->msgRate.Allow(Now())){
+	// voice has its own budget (HandleVoice): ~50 frames/s while talking must
+	// not drain the general packet bucket and read as a flood
+	if(p && type != MSG_VOICE && !p->msgRate.Allow(Now())){
 		if(++p->floodStrikes > 20){
 			KickPlayer(p->id, "packet flood");
 		}else
@@ -310,6 +326,7 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 	case MSG_PLAYER_STATE: if(p) HandlePlayerState(p, r); break;
 	case MSG_VEHICLE_STATE: if(p) HandleVehicleState(p, r); break;
 	case MSG_CHAT:        if(p) HandleChat(p, r); break;
+	case MSG_VOICE:       if(p) HandleVoice(p, r); break;
 	case MSG_SPAWN_REQ:   if(p) HandleSpawnReq(p); break;
 	case MSG_DAMAGE:      if(p) HandleDamage(p, r); break;
 	case MSG_VEH_ENTER:   if(p) HandleVehEnter(p, r); break;
@@ -343,26 +360,14 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	if(!ReadHello(r, hello)) return;
 
 	if(hello.protocolVersion != PROTOCOL_VERSION){
-		BitWriter w;
-		BeginMsg(w, MSG_DISCONNECT);
-		MsgKick k;
-		CopyStr(k.reason, sizeof k.reason, "protocol version mismatch");
-		WriteKick(w, k);
-		SendTo(peer, w, CHAN_RELIABLE, true);
-		enet_peer_disconnect_later(peer, 0);
+		SendRefusal(peer, REFUSE_PROTOCOL, "protocol version mismatch");
 		return;
 	}
 
 	// ban check
 	for(uint32_t ip : m_bannedIps){
 		if(ip == peer->address.host){
-			BitWriter w;
-			BeginMsg(w, MSG_DISCONNECT);
-			MsgKick k;
-			CopyStr(k.reason, sizeof k.reason, "banned");
-			WriteKick(w, k);
-			SendTo(peer, w, CHAN_RELIABLE, true);
-			enet_peer_disconnect_later(peer, 0);
+			SendRefusal(peer, REFUSE_BANNED, "banned");
 			return;
 		}
 	}
@@ -389,14 +394,31 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	}
 
 	if(ActivePlayerCount() >= m_cfg.maxPlayers){
-		BitWriter w;
-		BeginMsg(w, MSG_DISCONNECT);
-		MsgKick k;
-		CopyStr(k.reason, sizeof k.reason, "server full");
-		WriteKick(w, k);
-		SendTo(peer, w, CHAN_RELIABLE, true);
-		enet_peer_disconnect_later(peer, 0);
+		SendRefusal(peer, REFUSE_FULL, "server full");
 		return;
+	}
+
+	// Name+password auth: a claimed name may only be restored by its owner.
+	// A name nobody has claimed is free to take; setting a password claims it.
+	AuthResult auth = m_profiles.IsOpen()
+	    ? m_profiles.Auth(hello.name, hello.password)
+	    : AuthResult::UNCLAIMED;
+	if(auth == AuthResult::WRONG_PASSWORD){
+		Log("[AUTH] refused name=%s (wrong or missing password)", hello.name);
+		SendRefusal(peer, REFUSE_AUTH, "name is claimed — wrong or missing password");
+		return;
+	}
+	// First time a password is presented for an unclaimed name, it claims the
+	// name: from now on only that password restores the profile.
+	bool ownsProfile = (auth == AuthResult::OK);
+	if(auth == AuthResult::UNCLAIMED && hello.password[0] && m_profiles.IsOpen()){
+		if(!m_profiles.SetPassword(hello.name, hello.password)){
+			Log("[AUTH] refused name=%s (cannot claim: %s)", hello.name, m_profiles.LastError());
+			SendRefusal(peer, REFUSE_PASSWORD, m_profiles.LastError());
+			return;
+		}
+		ownsProfile = true;   // claiming the name makes it ours to save
+		Log("[AUTH] name=%s claimed", hello.name);
 	}
 
 	// allocate slot
@@ -420,6 +442,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	double nowT = Now();
 	np.msgRate.Reset(nowT, 60.0f, 120.0f);
 	np.chatRate.Reset(nowT, 2.5f, 5.0f);
+	np.voiceRate.Reset(nowT, 60.0f, 120.0f);
 	np.damageRate.Reset(nowT, 25.0f, 50.0f);
 	np.moneySeen = 0;
 	np.moneyGranted = 0;
@@ -440,9 +463,18 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			np.inv.count++;
 		}
 		np.invSet = true;
-		Log("[PROFILE] loaded name=%s money=%d weapons=%d", np.name.c_str(),
-		    np.savedProfile.money, (int)np.inv.count);
+		// match stats carry over; the first spawn resumes the last on-foot spot
+		np.score = np.savedProfile.score;
+		np.kills = np.savedProfile.kills;
+		np.deaths = np.savedProfile.deaths;
+		np.resumePos = np.savedProfile.hasPos;
+		Log("[PROFILE] loaded name=%s money=%d weapons=%d score=%d kills=%u deaths=%u", np.name.c_str(),
+		    np.savedProfile.money, (int)np.inv.count, np.score, (unsigned)np.kills, (unsigned)np.deaths);
 	}
+	// Only the account that owns a name may write to its row. An unclaimed name
+	// with an existing row (e.g. a legacy profile, or the owner claimed it
+	// mid-session) must not be overwritten by a same-named stranger.
+	np.profileStranger = !ownsProfile && np.hasProfile;
 	peer->data = &np;
 
 	Log("[JOIN] id=%d name=%s", np.id, np.name.c_str());
@@ -690,6 +722,34 @@ void Server::HandleVehicleState(ServerPlayer* p, BitReader& r)
 	}
 }
 
+// Proximity voice: relay one 20 ms frame to every spawned player within
+// VOICE_RANGE_M of the speaker. Unreliable on the state channel — a late frame
+// is worthless, so nothing is retransmitted.
+void Server::HandleVoice(ServerPlayer* p, BitReader& r)
+{
+	if(!p->spawned) return;
+	if(!p->voiceRate.Allow(Now())) return;
+	// the packet length is on the wire: a bad length or trailing bytes is malformed
+	uint8_t ignoredId = 0, len = 0;
+	uint8_t packet[VOICE_MAX_PACKET];
+	if(!ReadVoice(r, ignoredId, packet, len) || r.BitsLeft() != 0) return;
+
+	BitWriter w;
+	BeginMsg(w, MSG_VOICE);
+	WriteVoice(w, p->id, packet, len);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);
+	bool sent = false;
+	for(int j = 0; j < MAX_PLAYERS; j++){
+		ServerPlayer& q = m_players[j];
+		if(!q.active || !q.spawned || !q.peer || q.id == p->id) continue;
+		if(DistMm(p->state.xMm, p->state.yMm, p->state.zMm,
+		          q.state.xMm, q.state.yMm, q.state.zMm) > VOICE_RANGE_M) continue;
+		enet_peer_send(q.peer, CHAN_STATE, pkt);
+		sent = true;
+	}
+	if(!sent) enet_packet_destroy(pkt);
+}
+
 void Server::HandleChat(ServerPlayer* p, BitReader& r)
 {
 	MsgChat chat;
@@ -799,6 +859,27 @@ void Server::SaveProfile(ServerPlayer* p)
 		prof.weapons = p->savedProfile.weapons;
 		prof.currentWeapon = p->savedProfile.currentWeapon;
 	}
+	prof.score = p->score;
+	prof.kills = p->kills;
+	prof.deaths = p->deaths;
+	if(p->alive && p->spawned){
+		prof.hasPos = true;
+		prof.x = DequantPos(p->state.xMm);
+		prof.y = DequantPos(p->state.yMm);
+		prof.z = DequantPos(p->state.zMm);
+		prof.heading = DequantAngle(p->state.heading);
+	}else if(p->hasProfile){
+		// dead or not yet spawned: keep the last on-foot spot we recorded
+		prof.hasPos = p->savedProfile.hasPos;
+		prof.x = p->savedProfile.x; prof.y = p->savedProfile.y;
+		prof.z = p->savedProfile.z; prof.heading = p->savedProfile.heading;
+	}
+
+	if(p->profileStranger){
+		// another account owns this name; never write through to its row
+		p->profileDirty = false;
+		return;
+	}
 
 	if(m_profiles.Save(p->name, prof)){
 		p->savedMoney = prof.money;
@@ -817,7 +898,16 @@ void Server::FlushProfiles()
 	if(!m_profiles.IsOpen()) return;
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& p = m_players[i];
-		if(p.active && p.profileDirty) SaveProfile(&p);
+		if(!p.active) continue;
+		// a living player who has walked >1 m since the last save: persist the spot
+		if(p.alive && p.spawned && !p.profileStranger){
+			float dx = DequantPos(p.state.xMm) - p.savedProfile.x;
+			float dy = DequantPos(p.state.yMm) - p.savedProfile.y;
+			float dz = DequantPos(p.state.zMm) - p.savedProfile.z;
+			if(!p.savedProfile.hasPos || dx * dx + dy * dy + dz * dz > 1.0f)
+				p.profileDirty = true;
+		}
+		if(p.profileDirty) SaveProfile(&p);
 	}
 }
 
@@ -1055,6 +1145,12 @@ void Server::Tick()
 		BroadcastWorld();
 	}
 
+	// scoreboard / player list: ping + score for the top players, once a second
+	if(t - m_lastPingBroadcast >= 1.0){
+		m_lastPingBroadcast = t;
+		BroadcastPlayerPing();
+	}
+
 	// resource @on interval hooks
 	m_resources.Tick(t);
 }
@@ -1138,6 +1234,13 @@ void Server::SpawnPlayer(uint8_t playerId, float x, float y, float z, float head
 	ServerPlayer* p = FindPlayer(playerId);
 	if(!p) return;
 
+	// first spawn after a reconnect resumes the saved on-foot position
+	if(p->resumePos){
+		p->resumePos = false;
+		x = p->savedProfile.x; y = p->savedProfile.y; z = p->savedProfile.z;
+		heading = p->savedProfile.heading;
+	}
+
 	// (re)spawn teleports the player out of any vehicle
 	ClearPlayerVehicles(p, true);
 
@@ -1178,12 +1281,14 @@ void Server::KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId)
 	victim->alive = false;
 	victim->health = 0;
 	victim->deaths++;
+	victim->profileDirty = true;
 	victim->respawnAt = Now() + (m_gamemode ? m_gamemode->RespawnDelay() : 3.0f);
 
 	ServerPlayer* killer = FindPlayer(killerId);
 	if(killer && killer->id != victimId){
 		killer->kills++;
 		killer->score++;
+		killer->profileDirty = true;
 	}
 
 	BitWriter w;
@@ -1407,6 +1512,32 @@ void Server::BroadcastScores()
 	BeginMsg(w, MSG_SCORE_UPDATE);
 	WriteScoreUpdate(w, su);
 	Broadcast(w, CHAN_RELIABLE, true);
+}
+
+void Server::BroadcastPlayerPing()
+{
+	struct Row { uint8_t id; uint16_t ping; int32_t score; uint16_t kills, deaths; };
+	std::vector<Row> rows;
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active) continue;
+		Row r;
+		r.id = p.id;
+		r.ping = p.peer ? (uint16_t)std::min<uint32_t>(p.peer->roundTripTime, 65535u) : 0;
+		r.score = p.score; r.kills = p.kills; r.deaths = p.deaths;
+		rows.push_back(r);
+	}
+	std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){ return a.score > b.score; });
+	MsgPlayerPing msg;
+	for(size_t i = 0; i < rows.size() && i < (size_t)MAX_PING_ENTRIES; i++){
+		PingEntry& e = msg.entries[msg.count++];
+		e.playerId = rows[i].id; e.pingMs = rows[i].ping; e.score = rows[i].score;
+		e.kills = rows[i].kills; e.deaths = rows[i].deaths;
+	}
+	BitWriter w;
+	BeginMsg(w, MSG_PLAYER_PING);
+	WritePlayerPing(w, msg);
+	Broadcast(w, CHAN_STATE, false);
 }
 
 void Server::KickPlayer(uint8_t playerId, const char* reason)

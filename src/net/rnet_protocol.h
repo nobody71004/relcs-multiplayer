@@ -228,12 +228,19 @@ inline bool ReadGive(BitReader& r, MsgGive& m)
 	return r.Ok();
 }
 
-inline void WriteKick(BitWriter& w, const MsgKick& m) { w.WriteString(m.reason, MAX_REASON_LEN - 1); }
+inline void WriteKick(BitWriter& w, const MsgKick& m)
+{
+	w.WriteString(m.reason, MAX_REASON_LEN - 1);
+	w.WriteU8(m.code);            // JoinRefused; 0 for generic
+}
 inline bool ReadKick(BitReader& r, MsgKick& m)
 {
 	std::string t = r.ReadString(MAX_REASON_LEN - 1);
 	m.len = (uint16_t)t.size();
 	CopyStr(m.reason, sizeof m.reason, t.c_str());
+	m.code = 0;                   // a pre-code peer stops after the reason
+	if(r.BitsLeft() >= 8)
+		m.code = r.ReadU8();
 	return r.Ok();
 }
 
@@ -283,6 +290,25 @@ inline bool ReadPickup(BitReader& r, MsgPickup& m)
 	return r.Ok();
 }
 
+// MSG_VOICE payload: [u8 fromId][u8 len][len x u8 Opus packet]. The client
+// sends its own id (ignored: the server stamps the real sender). `packet` must
+// hold VOICE_MAX_PACKET bytes.
+inline void WriteVoice(BitWriter& w, uint8_t fromId, const uint8_t* packet, uint8_t len)
+{
+	w.WriteU8(fromId);
+	w.WriteU8(len);
+	for(int i = 0; i < len; i++) w.WriteU8(packet[i]);
+}
+// false on a short read or a length outside 1..VOICE_MAX_PACKET
+inline bool ReadVoice(BitReader& r, uint8_t& fromId, uint8_t* packet, uint8_t& len)
+{
+	fromId = r.ReadU8();
+	len = r.ReadU8();
+	if(!r.Ok() || len == 0 || len > VOICE_MAX_PACKET) return false;
+	for(int i = 0; i < len; i++) packet[i] = r.ReadU8();
+	return r.Ok();
+}
+
 inline void WriteWorld(BitWriter& w, const MsgWorld& m) { w.WriteU8(m.hour); w.WriteU8(m.minute); w.WriteU8(m.weather); }
 inline bool ReadWorld(BitReader& r, MsgWorld& m) { m.hour = r.ReadU8(); m.minute = r.ReadU8(); m.weather = r.ReadU8(); return r.Ok(); }
 
@@ -329,6 +355,30 @@ inline bool ReadScoreUpdate(BitReader& r, MsgScoreUpdate& m)
 	if(m.count > MAX_SCORE_ENTRIES){ return false; }
 	for(uint8_t i = 0; i < m.count; i++){
 		m.entries[i].playerId = r.ReadU8();
+		m.entries[i].score = r.ReadI32();
+		m.entries[i].kills = r.ReadU16(); m.entries[i].deaths = r.ReadU16();
+	}
+	return r.Ok();
+}
+
+inline void WritePlayerPing(BitWriter& w, const MsgPlayerPing& m)
+{
+	uint8_t n = m.count < MAX_PING_ENTRIES ? m.count : (uint8_t)MAX_PING_ENTRIES;
+	w.WriteU8(n);
+	for(uint8_t i = 0; i < n; i++){
+		w.WriteU8(m.entries[i].playerId);
+		w.WriteU16(m.entries[i].pingMs);
+		w.WriteI32(m.entries[i].score);
+		w.WriteU16(m.entries[i].kills); w.WriteU16(m.entries[i].deaths);
+	}
+}
+inline bool ReadPlayerPing(BitReader& r, MsgPlayerPing& m)
+{
+	m.count = r.ReadU8();
+	if(m.count > MAX_PING_ENTRIES){ return false; }
+	for(uint8_t i = 0; i < m.count; i++){
+		m.entries[i].playerId = r.ReadU8();
+		m.entries[i].pingMs = r.ReadU16();
 		m.entries[i].score = r.ReadI32();
 		m.entries[i].kills = r.ReadU16(); m.entries[i].deaths = r.ReadU16();
 	}

@@ -15,6 +15,9 @@ CXXFLAGS="$FLAGS -std=c++17"
 # 24.04 ships 3.4.32 -> "version `GLIBCXX_3.4.34' not found" at startup).
 # libc/libpthread stay dynamic; only the C++ runtime is bundled.
 LDFLAGS="-static-libstdc++ -static-libgcc"
+# proximity voice (src/net/rnet_voice.h) needs libopus: the bot and tests use it
+OPUS_CFLAGS="$(pkg-config --cflags opus)"
+OPUS_LIBS="$(pkg-config --libs opus)"
 
 echo "== enet =="
 for f in ../vendor/enet/*.c; do
@@ -41,14 +44,14 @@ $CXX $CXXFLAGS -c master/favorites.cpp -o obj/master_favorites.o
 $CXX -o bin/reLCS-master obj/master_main.o obj/master_favorites.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS
 
 echo "== net-bot =="
-$CXX $CXXFLAGS -c bot/main.cpp -o obj/bot_main.o
-$CXX -o bin/relcs-netbot obj/bot_main.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS
+$CXX $CXXFLAGS $OPUS_CFLAGS -c bot/main.cpp -o obj/bot_main.o
+$CXX -o bin/relcs-netbot obj/bot_main.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS $OPUS_LIBS
 
 echo "== net-tests =="
 # tests/main.cpp lives in tests/ but includes "profiles.h"/"resource.h" from
 # server/ (the VS target has includedirs { "server" } for the same reason).
-$CXX $CXXFLAGS -Iserver -c tests/main.cpp -o obj/tests_main.o
-$CXX -o bin/relcs-net-tests obj/tests_main.o obj/profiles.o obj/resource.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS
+$CXX $CXXFLAGS $OPUS_CFLAGS -Iserver -c tests/main.cpp -o obj/tests_main.o
+$CXX -o bin/relcs-net-tests obj/tests_main.o obj/profiles.o obj/resource.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS $OPUS_LIBS
 
 echo "built:"
 ls -la bin/reLCS-server bin/reLCS-master bin/relcs-netbot bin/relcs-net-tests

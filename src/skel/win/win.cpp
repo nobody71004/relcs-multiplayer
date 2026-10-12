@@ -2509,6 +2509,8 @@ WinMain(HINSTANCE instance,
 					case GS_PLAYING_GAME:
 					{
 						float ms = (float)CTimer::GetCurrentTimeInCycles() / (float)CTimer::GetCyclesPerMillisecond();
+						// skeleton init resets maxFPS to 30 after the ini is read: apply the saved cap once, here
+						static bool s_fpsCapApplied = false; if (!s_fpsCapApplied) { s_fpsCapApplied = true; FrontEndMenuManager.ApplyFpsCap(); }
 						if ( RwInitialised )
 						{
 							if (!FrontEndMenuManager.m_PrefsFrameLimiter || (1000.0f / (float)RsGlobal.maxFPS) < ms)

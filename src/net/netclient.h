@@ -46,6 +46,7 @@ public:
 		EV_BANNER,         // large center-screen announcement (text)
 		EV_WORLD,          // server world clock/weather: kind=hour arg=minute amount=weather
 		EV_RES_LIST,       // mod/resource inventory updated (see resList)
+		EV_VOICE,          // voice frame: id = speaker, text = one Opus packet
 	};
 
 	struct Event {
@@ -61,10 +62,11 @@ public:
 		rnet::MsgInventory inv;
 	};
 
-	bool Connect(const char* host, uint16_t port, const char* nick);
+	bool Connect(const char* host, uint16_t port, const char* nick, const char* password = nullptr);
 	void Disconnect();
 	void Pump();                                 // call every frame
 	void SendState(const rnet::PlayerState& s);  // unreliable, 20 Hz
+	void SendVoice(const uint8_t* packet, size_t n); // unreliable, one 20 ms Opus packet
 	void SendChat(const char* text);
 	void SendSpawnRequest();
 	void SendRconAuth(const char* password);
@@ -82,6 +84,7 @@ public:
 	const char* MapName() const { return m_mapName.c_str(); }
 	uint8_t Players() const { return m_players; }
 	uint8_t MaxPlayers() const { return m_maxPlayers; }
+	const char* MyName() const { return m_nick.c_str(); }
 
 	bool PopEvent(Event& ev);
 
@@ -89,6 +92,7 @@ public:
 	std::deque<NetChatLine> chat;   // ring; game layer draws it
 	rnet::PlayerState myState;
 	rnet::MsgResList resList;       // server mod/resource inventory (admin panel)
+	rnet::MsgPlayerPing board;      // latest MSG_PLAYER_PING: top players (scoreboard)
 
 private:
 	void HandleMessage(const uint8_t* data, size_t size);
@@ -100,6 +104,7 @@ private:
 	bool m_spawned = false;
 	uint8_t m_myId = 0;
 	std::string m_nick;
+	std::string m_password;   // claim/restore the server-side profile (sent in MSG_HELLO)
 	std::string m_hostname, m_gameMode, m_mapName;
 	uint8_t m_players = 0, m_maxPlayers = 0;
 	std::deque<Event> m_events;

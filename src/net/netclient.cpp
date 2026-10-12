@@ -10,7 +10,7 @@ using namespace rnet;
 
 static bool s_enetReady = false;
 
-bool NetClient::Connect(const char* host, uint16_t port, const char* nick)
+bool NetClient::Connect(const char* host, uint16_t port, const char* nick, const char* password)
 {
 	if(!s_enetReady){
 		if(enet_initialize() != 0) return false;
@@ -39,6 +39,7 @@ bool NetClient::Connect(const char* host, uint16_t port, const char* nick)
 	m_welcomed = false;
 	m_spawned = false;
 	m_nick = nick ? nick : "Player";
+	m_password = password ? password : "";
 
 	fprintf(stderr, "[NET] connecting to %s:%u as %s\n", host, (unsigned)port, nick);
 	fflush(stderr);
@@ -47,6 +48,7 @@ bool NetClient::Connect(const char* host, uint16_t port, const char* nick)
 
 void NetClient::Disconnect()
 {
+	board = rnet::MsgPlayerPing();
 	if(m_host && m_peer)
 		enet_peer_disconnect((ENetPeer*)m_peer, 0);
 	// brief drain so the disconnect reaches the server
@@ -71,6 +73,17 @@ void NetClient::SendState(const PlayerState& s)
 	BitWriter w;
 	BeginMsg(w, MSG_PLAYER_STATE);
 	WritePlayerState(w, s);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);
+	enet_peer_send((ENetPeer*)m_peer, CHAN_STATE, pkt);
+}
+
+void NetClient::SendVoice(const uint8_t* packet, size_t n)
+{
+	if(!m_host || !m_peer || !m_connected) return;
+	if(n == 0 || n > (size_t)VOICE_MAX_PACKET) return;
+	BitWriter w;
+	BeginMsg(w, MSG_VOICE);
+	WriteVoice(w, m_myId, packet, (uint8_t)n);
 	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);
 	enet_peer_send((ENetPeer*)m_peer, CHAN_STATE, pkt);
 }
@@ -195,6 +208,7 @@ void NetClient::Pump()
 				BeginMsg(w, MSG_HELLO);
 				MsgHello h;
 				CopyStr(h.name, sizeof h.name, m_nick.c_str());
+				CopyStr(h.password, sizeof h.password, m_password.c_str());
 				WriteHello(w, h);
 				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(),
 				                                     ENET_PACKET_FLAG_RELIABLE);
@@ -299,6 +313,19 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			rp.state = st;
 			rp.spawned = true;
 			rp.lastUpdate = 0.0; // refreshed by Pump caller via wall clock if needed
+		}
+		break;
+	}
+	case MSG_VOICE:{
+		uint8_t from = 0;
+		uint8_t packet[VOICE_MAX_PACKET];
+		uint8_t len = 0;
+		if(ReadVoice(r, from, packet, len) && r.BitsLeft() == 0 && from != m_myId){
+			Event e;
+			e.type = EV_VOICE;
+			e.id = from;
+			e.text.assign((const char*)packet, len);
+			m_events.push_back(e);
 		}
 		break;
 	}
@@ -477,10 +504,11 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 	case MSG_DISCONNECT:{
 		MsgKick k;
 		ReadKick(r, k);
-		fprintf(stderr, "[NET] KICKED: %s\n", k.reason);
+		fprintf(stderr, "[NET] KICKED: %s (code %u)\n", k.reason, (unsigned)k.code);
 		fflush(stderr);
 		Event e;
 		e.type = EV_DISCONNECTED;
+		e.kind = k.code;   // JoinRefused, so the game can show an auth-specific hint
 		e.text = k.reason;
 		m_events.push_back(e);
 		break;
@@ -524,6 +552,11 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 	}
 	case MSG_SCORE_UPDATE:
 		break;   // scores ride their own message; never parse as gamemode text
+	case MSG_PLAYER_PING:{
+		rnet::MsgPlayerPing pp;
+		if(ReadPlayerPing(r, pp)) board = pp;
+		break;
+	}
 	case MSG_GAMEMODE_EVENT:{
 		// server announcements (broadcast / round events) -> large banner
 		MsgGamemodeEvent ev;

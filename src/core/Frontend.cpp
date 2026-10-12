@@ -127,6 +127,35 @@ bool CMenuManager::m_PrefsCutsceneBorders = true;
 bool holdingScrollBar; // *(bool*)0x7039B9; // not original name
 
 CMenuManager FrontEndMenuManager;
+
+// frame-cap choices for the Frame Limiter row; 0 = unlimited
+static const int kMenuFpsCaps[] = { 30, 60, 120, 240, 360, 0 };
+static const int kNumMenuFpsCaps = 6;
+
+// the limiter stays on; an unlimited cap is a huge maxFPS (same as the net panel)
+void CMenuManager::ApplyFpsCap()
+{
+	if (m_PrefsFpsIdx < 0 || m_PrefsFpsIdx >= kNumMenuFpsCaps) m_PrefsFpsIdx = 0;
+	int cap = kMenuFpsCaps[m_PrefsFpsIdx];
+	RsGlobal.maxFPS = cap ? cap : 1000000;
+	m_PrefsFrameLimiter = 1;
+	// vsync pins the rate to the display refresh, which would defeat caps above 60
+	if (cap == 0 || cap > 60) m_PrefsVsync = 0;
+}
+
+wchar* CMenuManager::FpsCapText()
+{
+	static wchar text[16];
+	char buf[16];
+	int cap = kMenuFpsCaps[(m_PrefsFpsIdx >= 0 && m_PrefsFpsIdx < kNumMenuFpsCaps) ? m_PrefsFpsIdx : 0];
+	if (cap) snprintf(buf, sizeof buf, "%d FPS", cap);
+	else     snprintf(buf, sizeof buf, "UNLIMITED");
+	for (int i = 0; i < 16; i++) {
+		text[i] = (wchar)(unsigned char)buf[i];
+		if (!buf[i]) break;
+	}
+	return text;
+}
 MenuTrapezoid menuBg(CGeneral::GetRandomNumber() % 40 + 65, CGeneral::GetRandomNumber() % 40 + 21,
 	CGeneral::GetRandomNumber() % 40 + 568, CGeneral::GetRandomNumber() % 40 + 44,
 	CGeneral::GetRandomNumber() % 40 + 36, CGeneral::GetRandomNumber() % 40 + 352,
@@ -501,6 +530,7 @@ CMenuManager::CMenuManager()
 	m_PrefsVsync = 0;
 	m_PrefsVsyncDisp = 1;
 	m_PrefsFrameLimiter = 1;
+	m_PrefsFpsIdx = 0;
 	m_PrefsLanguage = 0;
 	field_54 = 0;
 	m_PrefsAllowNastyGame = 1;
@@ -1180,7 +1210,7 @@ CMenuManager::DrawStandardMenus(bool activeScreen)
 					rightText = TheText.Get(m_PrefsVsyncDisp ? "FEM_ON" : "FEM_OFF");
 					break;
 				case MENUACTION_FRAMELIMIT:
-					rightText = TheText.Get(m_PrefsFrameLimiter ? "FEM_ON" : "FEM_OFF");
+					rightText = FpsCapText();
 					break;
 				case MENUACTION_TRAILS:
 					rightText = TheText.Get(CMBlur::BlurOn ? "FEM_ON" : "FEM_OFF");
@@ -5232,7 +5262,8 @@ CMenuManager::ProcessOnOffMenuOptions()
 		SaveSettings(); // FIX: Again... This makes me very unhappy
 		break;
 	case MENUACTION_FRAMELIMIT:
-		m_PrefsFrameLimiter = !m_PrefsFrameLimiter;
+		m_PrefsFpsIdx = (m_PrefsFpsIdx + 1) % kNumMenuFpsCaps;
+		ApplyFpsCap();
 		SaveSettings();
 		break;
 	case MENUACTION_TRAILS:

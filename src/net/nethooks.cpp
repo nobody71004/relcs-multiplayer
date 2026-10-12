@@ -7,6 +7,7 @@
 // - overlay      : chat + players via CFont (from CHud::Draw)
 #include "nethooks.h"
 #include "netclient.h"
+#include "rnet_voice.h"
 #include "cefhud.h"
 
 #include "common.h"
@@ -68,6 +69,7 @@ static NetClient s_net;
 static bool s_wantConnect = false;
 static bool s_connected = false;
 static std::string s_host, s_nick = "Player";
+static std::string s_pass;   // claim/restore the server-side profile
 static uint16_t s_port = 7777;
 
 static double NowSec()
@@ -640,6 +642,7 @@ static CVector s_ncPos(0.0f, 0.0f, 0.0f);
 static float s_ncSpeed = 20.0f;   // noclip base speed m/s (nocspeed cmd, [ ] adjust)
 static double s_welcomeUntil = 0.0;
 static std::string s_bannerText;   // server broadcast / round announcement
+static bool s_voiceMuted = false;  // voicemute key: our mic is not sent
 static double s_bannerUntil = 0.0;
 static int s_worldHour = 12, s_worldMinute = 0;   // server-synced world clock
 static int s_worldWeather = -1;
@@ -710,6 +713,8 @@ struct KeyBinds {
 	int inventory = 'I';
 	int console = VK_F7;
 	int console2 = VK_OEM_3; // `~
+	int voicemute = VK_F9;   // proximity voice mic on/off
+	int scoreboard = VK_TAB; // hold: player list + ping/score board
 };
 static KeyBinds s_keys;
 
@@ -753,7 +758,7 @@ static void LoadKeyBinds(void)
 			fputs("; LCS Online keybinds — values: A-Z 0-9 F1-F12 ESC TAB SPACE ENTER\n"
 			      "; BACKSPACE UP DOWN LEFT RIGHT SHIFT CTRL ALT GRAVE SEMICOLON PLUS\n"
 			      "; MINUS COMMA PERIOD SLASH LBRACKET RBRACKET QUOTE\n"
-			      "chat=T\nadmin=F6\ninventory=I\nconsole=F7\nconsole2=GRAVE\n", f);
+			      "chat=T\nadmin=F6\ninventory=I\nconsole=F7\nconsole2=GRAVE\nvoicemute=F9\nscoreboard=TAB\n", f);
 			fclose(f);
 		}
 		return;
@@ -777,6 +782,8 @@ static void LoadKeyBinds(void)
 		else if(!_stricmp(key, "inventory")) s_keys.inventory = vk;
 		else if(!_stricmp(key, "console")) s_keys.console = vk;
 		else if(!_stricmp(key, "console2")) s_keys.console2 = vk;
+		else if(!_stricmp(key, "voicemute")) s_keys.voicemute = vk;
+		else if(!_stricmp(key, "scoreboard")) s_keys.scoreboard = vk;
 	}
 	fclose(f);
 	fprintf(stderr, "[NET] keybinds.ini loaded\n");
@@ -1111,6 +1118,9 @@ static void CefQueryHandler(const char* request, void*)
 }
 
 static double s_lastCefPush = 0.0;
+// scoreboard overlay: true while the scoreboard key is held (see NetGame_PollUi)
+static bool s_boardHeld = false;
+
 static void CefPushState(void)
 {
 	if(!CefHud_Active()) return;
@@ -1171,7 +1181,34 @@ static void CefPushState(void)
 	if(s_god) snprintf(modeBuf, sizeof modeBuf, "GOD");
 	else if(s_noclip) snprintf(modeBuf, sizeof modeBuf, "NOCLIP %.0fm/s", s_ncSpeed);
 	else modeBuf[0] = 0;
-	char buf[5120];
+	// player list rows from the server (MSG_PLAYER_PING); names come from joins
+	std::string board = "[";
+	{
+		bool first = true;
+		const rnet::MsgPlayerPing& bp = s_net.board;
+		for(int i = 0; i < bp.count && i < rnet::MAX_PING_ENTRIES; i++){
+			const rnet::PingEntry& e = bp.entries[i];
+			bool isMe = e.playerId == s_net.MyId();
+			std::string name;
+			if(isMe) name = s_net.MyName();
+			else{
+				auto it = s_net.remotes.find(e.playerId);
+				name = it != s_net.remotes.end() ? it->second.name : "Player " + std::to_string((int)e.playerId);
+			}
+			char row[512];
+			snprintf(row, sizeof row,
+			         "%s{\"id\":%d,\"name\":\"%s\",\"ping\":%d,\"score\":%d,"
+			         "\"kills\":%d,\"deaths\":%d,\"me\":%d}",
+			         first ? "" : ",", (int)e.playerId, jesc(name).c_str(), (int)e.pingMs,
+			         (int)e.score, (int)e.kills, (int)e.deaths, isMe ? 1 : 0);
+			board += row;
+			first = false;
+		}
+	}
+	board += "]";
+
+	// 16 KB: 32 board rows plus the chat/console/resource lists must fit
+	char buf[16384];
 	std::string banner = "\"\"";
 	if(NowSec() < s_bannerUntil && !s_bannerText.empty())
 		banner = "\"" + jesc(s_bannerText) + "\"";
@@ -1199,7 +1236,8 @@ static void CefPushState(void)
 	         "{\"server\":\"%s\",\"players\":%zu,\"fps\":\"%s\",\"mode\":\"%s\","
 	         "\"money\":%d,\"hp\":%d,\"armour\":%d,\"welcome\":%d,\"banner\":%s,"
 	         "\"wtime\":\"%s\",\"wweather\":%d,"
-	         "\"weapons\":%s,\"chat\":%s,\"console\":%s,\"resources\":%s}",
+	         "\"weapons\":%s,\"chat\":%s,\"console\":%s,\"resources\":%s,"
+	         "\"showBoard\":%s,\"board\":%s}",
 	         jesc(s_net.Hostname()).c_str(),
 	         s_net.remotes.size() + (s_net.Spawned() ? 1 : 0),
 	         fpsName, modeBuf,
@@ -1207,7 +1245,8 @@ static void CefPushState(void)
 	         me ? (int)me->m_fHealth : 0, me ? (int)me->m_fArmour : 0,
 	         (int)(NowSec() < s_welcomeUntil), banner.c_str(),
 	         wtime, s_worldWeather,
-	         weapons.c_str(), chat.c_str(), con.c_str(), res.c_str());
+	         weapons.c_str(), chat.c_str(), con.c_str(), res.c_str(),
+	         s_boardHeld ? "true" : "false", board.c_str());
 	CefHud_PushState(buf);
 }
 
@@ -1250,14 +1289,30 @@ static void NetGame_PollUi(void)
 		s_uiLockedPad = uiOwnsKeys;
 	}
 
+	// scoreboard: the key is passive (no focus change); it is ignored while a
+	// UI panel owns the keyboard so typing TAB never flashes the board
+	{
+		bool anyUi = s_consoleOpen || s_chatOpen || s_invOpen || s_panelOpen || !s_cefPanel.empty();
+		bool held = s_net.Connected() && !anyUi && (GetAsyncKeyState(s_keys.scoreboard) & 0x8000) != 0;
+		if(held != s_boardHeld){
+			s_boardHeld = held;
+			s_lastCefPush = -1e9;   // push the change now instead of within 200 ms
+		}
+	}
+
 	// poll every handled key first so edge state stays coherent
 	bool kAdmin = KeyEdge(s_keys.admin), kInv = KeyEdge(s_keys.inventory),
-	     kChat = KeyEdge(s_keys.chat),
+	     kChat = KeyEdge(s_keys.chat), kMute = KeyEdge(s_keys.voicemute),
 	     kConsole = KeyEdge(s_keys.console) ||
 	                (s_keys.console2 && s_keys.console2 != s_keys.console && KeyEdge(s_keys.console2)),
 	     kEsc = KeyEdge(VK_ESCAPE), kUp = KeyEdge(VK_UP), kDown = KeyEdge(VK_DOWN),
 	     kLeft = KeyEdge(VK_LEFT), kRight = KeyEdge(VK_RIGHT),
 	     kRet = KeyEdge(VK_RETURN), kBack = KeyEdge(VK_BACK), kSpace = KeyEdge(VK_SPACE);
+	if(kMute){
+		s_voiceMuted = !s_voiceMuted;
+		s_bannerText = s_voiceMuted ? "VOICE MUTED (F9)" : "VOICE ON (F9)";
+		s_bannerUntil = NowSec() + 2.0;
+	}
 	int letter = 0, digit = 0, punct = 0;
 	for(int k = '0'; k <= '9'; k++) if(KeyEdge(k)) digit = k;
 	for(int k = 'A'; k <= 'Z'; k++) if(KeyEdge(k)) letter = k;
@@ -1489,8 +1544,14 @@ bool NetGame_OnCommandLine(const char* arg)
 		s_pendingArg.clear();
 		return true;
 	}
+	if(s_pendingArg == "-password"){
+		s_pass = arg;
+		s_pendingArg.clear();
+		return true;
+	}
 	if(!strcmp(arg, "-connect") || !strcmp(arg, "-nick") ||
-	   !strcmp(arg, "-fps") || !strcmp(arg, "-rcon")){
+	   !strcmp(arg, "-fps") || !strcmp(arg, "-rcon") ||
+	   !strcmp(arg, "-password")){
 		s_pendingArg = arg;
 		return true;
 	}
@@ -1848,6 +1909,272 @@ static void NetGame_DoorChimeTick(void)
 	s_lastInVeh = me->InVehicle();
 }
 
+// ---------------------------------------------------------------------------
+// proximity voice chat
+//   capture : winmm waveIn, 8 kHz mono 16-bit, 20 ms blocks, energy-gated;
+//             speech blocks (plus a short hangover) are Opus encoded and sent;
+//             F9 (keybinds.ini: voicemute) toggles our mic off and on
+//   playback: one OpenAL source per nearby speaker (pool of VOICE_SRC_MAX),
+//             gain falls to 0 at VOICE_RANGE_M, pan follows the speaker's
+//             bearing relative to the local player's body
+// No microphone or no OpenAL context means voice stays silent; nothing else
+// in multiplayer depends on it.
+// ---------------------------------------------------------------------------
+#include <AL/al.h>
+#include <AL/alc.h>
+
+using rnet::VOICE_SAMPLE_RATE;
+using rnet::VOICE_FRAME_SAMPLES;
+using rnet::VOICE_MAX_PACKET;
+
+static const int   VOICE_SRC_MAX    = 8;       // speakers audible at once
+static const int   VOICE_BUFS       = 8;       // queued frames per speaker (160 ms max backlog)
+static const int   VOICE_PRIME      = 3;       // frames queued before a speaker starts (jitter)
+static const int   VOICE_MIC_BLOCKS = 4;       // waveIn blocks in flight
+static const float VOICE_VAD_RMS    = 350.0f;  // speech threshold (int16 RMS)
+static const int   VOICE_HANGOVER   = 10;      // frames (200 ms) sent after speech stops
+static const float VOICE_VOLUME     = 1.0f;
+
+struct VoiceSource {
+	rnet::VoiceDecoder dec;       // Opus state of the current speaker
+	bool used = false;
+	uint8_t speaker = 0;
+	ALuint src = 0;
+	ALuint bufs[VOICE_BUFS] = {};
+	bool busy[VOICE_BUFS] = {};   // buffer is queued on the source
+	bool primed = false;
+	ULONGLONG lastFrame = 0;      // GetTickCount64 ms
+};
+
+static bool s_voiceInitDone = false;
+static bool s_micOk = false;
+static bool s_outOk = false;
+static HWAVEIN s_waveIn = nullptr;
+static WAVEHDR s_micHdr[VOICE_MIC_BLOCKS];
+static int16_t s_micPcm[VOICE_MIC_BLOCKS][VOICE_FRAME_SAMPLES];
+static VoiceSource s_vsrc[VOICE_SRC_MAX];
+static int s_hangover = 0;
+static rnet::VoiceEncoder s_enc;
+
+static void VoiceInit(void)
+{
+	s_voiceInitDone = true;
+
+	// playback: sources and buffers
+	alGetError();
+	s_outOk = true;
+	for(int i = 0; i < VOICE_SRC_MAX; i++){
+		VoiceSource& vs = s_vsrc[i];
+		alGenSources(1, &vs.src);
+		alGenBuffers(VOICE_BUFS, vs.bufs);
+		if(alGetError() != AL_NO_ERROR){ s_outOk = false; break; }
+		alSourcef(vs.src, AL_ROLLOFF_FACTOR, 0.0f);   // no distance model: gain and pan are ours
+		alSourcei(vs.src, AL_SOURCE_RELATIVE, AL_TRUE);
+		alSource3f(vs.src, AL_POSITION, 0.0f, 0.0f, 0.0f);
+	}
+
+	// capture: default recording device, 8 kHz mono 16-bit
+	WAVEFORMATEX fmt = {};
+	fmt.wFormatTag = WAVE_FORMAT_PCM;
+	fmt.nChannels = 1;
+	fmt.nSamplesPerSec = VOICE_SAMPLE_RATE;
+	fmt.wBitsPerSample = 16;
+	fmt.nBlockAlign = 2;
+	fmt.nAvgBytesPerSec = VOICE_SAMPLE_RATE * 2;
+	if(waveInOpen(&s_waveIn, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) == MMSYSERR_NOERROR){
+		s_micOk = true;
+		for(int i = 0; i < VOICE_MIC_BLOCKS; i++){
+			WAVEHDR& h = s_micHdr[i];
+			memset(&h, 0, sizeof h);
+			h.lpData = (LPSTR)s_micPcm[i];
+			h.dwBufferLength = VOICE_FRAME_SAMPLES * 2;
+			waveInPrepareHeader(s_waveIn, &h, sizeof h);
+			waveInAddBuffer(s_waveIn, &h, sizeof h);
+		}
+		waveInStart(s_waveIn);
+	}
+
+	fprintf(stderr, "[VOICE] init: mic=%d playback=%d\n", (int)s_micOk, (int)s_outOk);
+	fflush(stderr);
+}
+
+static void VoiceReleaseSource(VoiceSource& vs)
+{
+	alSourceStop(vs.src);
+	ALint processed = 0;
+	alGetSourcei(vs.src, AL_BUFFERS_PROCESSED, &processed);
+	while(processed-- > 0){
+		ALuint b = 0;
+		alSourceUnqueueBuffers(vs.src, 1, &b);
+		for(int j = 0; j < VOICE_BUFS; j++) if(vs.bufs[j] == b) vs.busy[j] = false;
+	}
+	vs.used = false;
+	vs.primed = false;
+}
+
+static void VoiceShutdown(void)
+{
+	if(s_waveIn){
+		waveInStop(s_waveIn);
+		waveInReset(s_waveIn);
+		for(int i = 0; i < VOICE_MIC_BLOCKS; i++)
+			if(s_micHdr[i].dwFlags & WHDR_PREPARED)
+				waveInUnprepareHeader(s_waveIn, &s_micHdr[i], sizeof(WAVEHDR));
+		waveInClose(s_waveIn);
+		s_waveIn = nullptr;
+	}
+	s_micOk = false;
+	if(s_outOk && alcGetCurrentContext()){
+		for(int i = 0; i < VOICE_SRC_MAX; i++){
+			VoiceReleaseSource(s_vsrc[i]);
+			alDeleteSources(1, &s_vsrc[i].src);
+			alDeleteBuffers(VOICE_BUFS, s_vsrc[i].bufs);
+		}
+	}
+	s_outOk = false;
+	s_voiceInitDone = false;
+}
+
+// a speaker's source: the one already playing them, else a free one
+static VoiceSource* VoiceSourceFor(uint8_t speaker, ULONGLONG now)
+{
+	for(int i = 0; i < VOICE_SRC_MAX; i++)
+		if(s_vsrc[i].used && s_vsrc[i].speaker == speaker) return &s_vsrc[i];
+	for(int i = 0; i < VOICE_SRC_MAX; i++){
+		if(!s_vsrc[i].used){
+			s_vsrc[i].used = true;
+			s_vsrc[i].speaker = speaker;
+			s_vsrc[i].primed = false;
+			s_vsrc[i].lastFrame = now;
+			s_vsrc[i].dec.Reset();      // fresh decoder state for the new speaker
+			return &s_vsrc[i];
+		}
+	}
+	return nullptr;
+}
+
+// incoming frame from the server (EV_VOICE): decode and queue on the speaker's source
+static void VoiceOnFrame(uint8_t speaker, const std::string& packet)
+{
+	if(!s_outOk || packet.empty() || packet.size() > (size_t)VOICE_MAX_PACKET) return;
+	if(s_net.remotes.find(speaker) == s_net.remotes.end()) return;   // no position: cannot place it
+	ULONGLONG now = GetTickCount64();
+	VoiceSource* vs = VoiceSourceFor(speaker, now);
+	if(!vs) return;
+
+	int slot = -1;
+	for(int j = 0; j < VOICE_BUFS; j++) if(!vs->busy[j]){ slot = j; break; }
+	if(slot < 0) return;   // backlog full: drop the frame (bounds latency)
+
+	int16_t pcm[VOICE_FRAME_SAMPLES];
+	int n = vs->dec.Decode((const uint8_t*)packet.data(), (int)packet.size(), pcm);
+	if(n <= 0) return;   // corrupt packet: drop it, the decoder keeps going
+	alBufferData(vs->bufs[slot], AL_FORMAT_MONO16, pcm, n * (ALsizei)sizeof(int16_t), VOICE_SAMPLE_RATE);
+	alSourceQueueBuffers(vs->src, 1, &vs->bufs[slot]);
+	vs->busy[slot] = true;
+	vs->lastFrame = now;
+}
+
+// per-tick bookkeeping: recycle played buffers, jitter start, state
+static void VoiceServiceSource(VoiceSource& vs)
+{
+	ALint processed = 0;
+	alGetSourcei(vs.src, AL_BUFFERS_PROCESSED, &processed);
+	while(processed-- > 0){
+		ALuint b = 0;
+		alSourceUnqueueBuffers(vs.src, 1, &b);
+		for(int j = 0; j < VOICE_BUFS; j++) if(vs.bufs[j] == b) vs.busy[j] = false;
+	}
+	int queued = 0;
+	for(int j = 0; j < VOICE_BUFS; j++) if(vs.busy[j]) queued++;
+	if(queued == 0) vs.primed = false;                       // drained: wait for jitter again
+	else if(!vs.primed && queued >= VOICE_PRIME) vs.primed = true;
+
+	ALint state = 0;
+	alGetSourcei(vs.src, AL_SOURCE_STATE, &state);
+	if(vs.primed && state != AL_PLAYING) alSourcePlay(vs.src);
+}
+
+// gain from the 3D distance to the local player; pan from the bearing in the
+// local player's frame (GTA heading: forward = (-sin h, cos h), right = (fy, -fx))
+static void VoiceUpdateSpatial(VoiceSource& vs)
+{
+	auto rit = s_net.remotes.find(vs.speaker);
+	if(rit == s_net.remotes.end()){
+		alSourcef(vs.src, AL_GAIN, 0.0f);
+		return;
+	}
+	const rnet::PlayerState& sp = rit->second.state;
+	const rnet::PlayerState& me = s_net.myState;
+	float dx = (sp.xMm - me.xMm) / 1000.0f;
+	float dy = (sp.yMm - me.yMm) / 1000.0f;
+	float dz = (sp.zMm - me.zMm) / 1000.0f;
+	float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+	float gain = 1.0f - dist / rnet::VOICE_RANGE_M;
+	if(gain < 0.0f) gain = 0.0f;
+	if(gain > 1.0f) gain = 1.0f;
+
+	float h = rnet::DequantAngle(me.heading);
+	float fx = -std::sin(h), fy = std::cos(h);
+	float rx = fy, ry = -fx;
+	float hd = std::sqrt(dx * dx + dy * dy);
+	float right = 0.0f, fwd = 0.0f;
+	if(hd > 0.01f){
+		float ux = dx / hd, uy = dy / hd;
+		right = ux * rx + uy * ry;
+		fwd = ux * fx + uy * fy;
+	}
+	// OpenAL listener space: +x right, -z forward
+	alSource3f(vs.src, AL_POSITION, right, 0.0f, -fwd);
+	alSourcef(vs.src, AL_GAIN, gain * VOICE_VOLUME);
+}
+
+// once per frame while connected: capture, then service every speaker
+static void VoiceTick(void)
+{
+	if(!s_voiceInitDone){
+		if(!alcGetCurrentContext()) return;   // audio not up yet
+		VoiceInit();
+	}
+	ULONGLONG now = GetTickCount64();
+
+	if(s_micOk){
+		for(int i = 0; i < VOICE_MIC_BLOCKS; i++){
+			WAVEHDR& h = s_micHdr[i];
+			if(!(h.dwFlags & WHDR_DONE)) continue;
+			int n = (int)(h.dwBytesRecorded / 2);
+			if(n > VOICE_FRAME_SAMPLES) n = VOICE_FRAME_SAMPLES;
+			const int16_t* pcm = s_micPcm[i];
+			double sum = 0.0;
+			for(int k = 0; k < n; k++) sum += (double)pcm[k] * (double)pcm[k];
+			float rms = n > 0 ? (float)std::sqrt(sum / n) : 0.0f;
+			if(rms > VOICE_VAD_RMS) s_hangover = VOICE_HANGOVER;
+			else if(s_hangover > 0) s_hangover--;
+			if(n == VOICE_FRAME_SAMPLES){
+				// encode every full frame, even silence, so the Opus state stays continuous
+				uint8_t packet[VOICE_MAX_PACKET];
+				int len = s_enc.Encode(pcm, packet);
+				if(len > 0 && s_hangover > 0 && !s_voiceMuted && s_net.Spawned())
+					s_net.SendVoice(packet, (size_t)len);
+			}
+			waveInAddBuffer(s_waveIn, &h, sizeof h);
+		}
+	}
+
+	if(s_outOk){
+		for(int i = 0; i < VOICE_SRC_MAX; i++){
+			VoiceSource& vs = s_vsrc[i];
+			if(!vs.used) continue;
+			if(now - vs.lastFrame > 1000){       // silent for 1 s: free the source
+				VoiceReleaseSource(vs);
+				continue;
+			}
+			VoiceServiceSource(vs);
+			VoiceUpdateSpatial(vs);
+		}
+	}
+}
+
 void NetGame_Frame(void)
 {
 	NetGame_DoorChimeTick();
@@ -1867,7 +2194,7 @@ void NetGame_Frame(void)
 
 	// connect once the player exists (i.e. world loaded)
 	if(s_wantConnect && !s_connected && FindPlayerPed()){
-		if(s_net.Connect(s_host.c_str(), s_port, s_nick.c_str())){
+		if(s_net.Connect(s_host.c_str(), s_port, s_nick.c_str(), s_pass.c_str())){
 			s_connected = true;
 			s_wantConnect = false;
 		}else{
@@ -1880,6 +2207,7 @@ void NetGame_Frame(void)
 		return;
 
 	s_net.Pump();
+	VoiceTick();
 
 	float dt = CTimer::GetTimeStep() / 50.0f; // frames -> seconds-ish (50 fps units)
 	if(dt <= 0.0f || dt > 0.5f) dt = 0.02f;
@@ -2030,6 +2358,9 @@ void NetGame_Frame(void)
 				}
 			}
 			break;
+		case NetClient::EV_VOICE:
+			VoiceOnFrame(ev.id, ev.text);
+			break;
 		case NetClient::EV_REMOTE_QUIT:
 			RemoveRemote(ev.id);
 			break;
@@ -2155,6 +2486,10 @@ void NetGame_Frame(void)
 		case NetClient::EV_DISCONNECTED:
 			fprintf(stderr, "[NET] disconnected: %s\n", ev.text.c_str());
 			fflush(stderr);
+			if(ev.kind == rnet::REFUSE_AUTH)
+				ConsolePrint("join refused: this name is claimed — set the right password in the launcher (or use -password)");
+			else if(ev.kind == rnet::REFUSE_PASSWORD)
+				ConsolePrint("join refused: %s", ev.text.c_str());
 			while(!s_remotes.empty())
 				RemoveRemote(s_remotes.begin()->first);
 			ClearAllVehicles();
@@ -2602,6 +2937,7 @@ void NetGame_DrawHud(void)
 void NetGame_Shutdown(void)
 {
 	CefHud_Shutdown();
+	VoiceShutdown();
 	if(s_connected){
 		s_net.Disconnect();
 		s_connected = false;

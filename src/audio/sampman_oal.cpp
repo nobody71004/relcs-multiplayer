@@ -136,6 +136,7 @@ bool8      nStreamLoopedFlag[MAX_STREAMS];
 uint32 _CurMP3Index;
 int32 _CurMP3Pos;
 bool8 _bIsMp3Active;
+static bool s_streamMissing[TOTAL_STREAMED_SOUNDS]; // track files that failed to open (absent from the install)
 ///////////////////////////////////////////////////////////////
 //	Env		Size	Diffus	Room	RoomHF	RoomLF	DecTm	DcHF	DcLF	Refl	RefDel	Ref Pan				Revb	RevDel		Rev Pan				EchTm	EchDp	ModTm	ModDp	AirAbs	HFRef		LFRef	RRlOff	FLAGS
 EAXLISTENERPROPERTIES StartEAX3 =
@@ -1883,6 +1884,10 @@ cSampleManager::StartStreamedFile(uint32 nFile, uint32 nPos, uint8 nStream)
 
 	aStream[nStream]->Close();
 
+	// this track's files already failed to open: skip reopening them (stderr flood + stalls)
+	if ( s_streamMissing[nFile] )
+		return FALSE;
+
 	if ( nFile == STREAMED_SOUND_RADIO_MP3_PLAYER )
 	{
 		do
@@ -2035,6 +2040,8 @@ cSampleManager::StartStreamedFile(uint32 nFile, uint32 nPos, uint8 nStream)
 		return TRUE;
 	} else {
 		stream->Close();
+			if ( !opened )
+				s_streamMissing[nFile] = true;
 	}
 	return FALSE;
 }

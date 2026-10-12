@@ -49,6 +49,7 @@ struct ServerRow {
 static std::string g_gameExe = "reLCS.exe";
 static std::string g_nick = "Player";
 static std::string g_rconPw; // server rcon password for in-game admin tools
+static std::string g_pass;   // profile password (claims/restores the name in-game)
 // public staging master (VPS) — the Internet tab lists its servers by default.
 // launcher.ini `master = host:port` overrides it; the LAN tab (broadcast) is
 // independent of this and keeps finding local servers.
@@ -184,6 +185,44 @@ static std::vector<ServerRow> QueryMaster(const std::string& host, uint16_t port
 	}
 	enet_host_destroy(client);
 	return rows;
+}
+
+// reachability of a master: a bare ENet connect (no request), 3 s budget
+static bool ProbeMaster(const std::string& host, uint16_t port, std::string& err, int& ms)
+{
+	ms = -1;
+	ENetHost* client = enet_host_create(nullptr, 1, 2, 0, 0);
+	if(!client){ err = "no network stack"; return false; }
+	ENetAddress addr;
+	if(enet_address_set_host(&addr, host.c_str()) < 0){
+		enet_host_destroy(client);
+		err = "cannot resolve " + host;
+		return false;
+	}
+	addr.port = port;
+	ENetPeer* peer = enet_host_connect(client, &addr, 2, 0);
+	if(!peer){ enet_host_destroy(client); err = "cannot start a connection"; return false; }
+
+	ULONGLONG t0 = GetTickCount64();
+	bool connected = false;
+	while(!connected && GetTickCount64() - t0 < 3000){
+		ENetEvent ev;
+		int n = enet_host_service(client, &ev, 50);
+		if(n < 0) break;
+		if(n == 0) continue;
+		if(ev.type == ENET_EVENT_TYPE_CONNECT) connected = true;
+		else if(ev.type == ENET_EVENT_TYPE_DISCONNECT){ err = "connection refused"; break; }
+		else if(ev.type == ENET_EVENT_TYPE_RECEIVE) enet_packet_destroy(ev.packet);
+	}
+	if(connected){
+		ms = (int)(GetTickCount64() - t0);
+		enet_peer_disconnect_now(peer, 0);
+	}else{
+		if(err.empty()) err = "no answer within 3 s";
+		enet_peer_reset(peer);
+	}
+	enet_host_destroy(client);
+	return connected;
 }
 
 static std::vector<ServerRow> QueryMasterDefault()
@@ -611,6 +650,7 @@ static void LoadConfig()
 		if(key == "game") g_gameExe = val;
 		else if(key == "nick") g_nick = val;
 		else if(key == "rcon") g_rconPw = val;
+		else if(key == "pass") g_pass = val;
 		else if(key == "master"){
 			size_t c = val.find(':');
 			g_masterHost = val.substr(0, c);
@@ -626,6 +666,8 @@ static void SaveConfig()
 	f << "nick = " << g_nick << "\n";
 	f << "master = " << g_masterHost << ":" << g_masterPort << "\n";
 	f << "rcon = " << g_rconPw << "\n";
+	// profile password, plaintext in the local config (same trust level as rcon)
+	f << "pass = " << g_pass << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +938,9 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 	if(slash != std::string::npos) exeDir.resize(slash);
 
 	std::string cmd = "\"" + exe + "\" -connect " + address + " -nick \"" + g_nick + "\"";
+	// profile password: claims the name / restores the saved wallet + weapons
+	if(!g_pass.empty())
+		cmd += " -password \"" + g_pass + "\"";
 	// admin tools (broadcast/give/...) need the server's rcon password in-game
 	if(!g_rconPw.empty())
 		cmd += " -rcon \"" + g_rconPw + "\"";
@@ -1023,7 +1068,6 @@ static void HandleQuery(const char* request, void*)
 		std::string how, gErr;
 		bool dataOk = false;
 		std::string gameShown = DetectGameExe(how, dataOk, gErr);
-		if(gameShown.empty()) gameShown = g_gameExe;
 		bool cefOk = false;
 		if(!gameShown.empty()){
 			std::string d = gameShown;
@@ -1043,6 +1087,7 @@ static void HandleQuery(const char* request, void*)
 		      "\",\"version\":" + std::to_string((int)PROTOCOL_VERSION) +
 		      "\",\"master\":\"" + Jesc(g_masterHost + ":" + std::to_string(g_masterPort)) +
 		      "\",\"rcon\":\"" + Jesc(g_rconPw) +
+		      "\",\"pass\":\"" + Jesc(g_pass) +
 		      "\",\"profiles\":" + ProfilesToJson() + "}");
 	}else if(cmd.rfind("title ", 0) == 0){
 		if(req.find("CEF-OK") != std::string::npos) g_gotTitle = true;
@@ -1099,6 +1144,8 @@ static void HandleQuery(const char* request, void*)
 	}else if(cmd == "join"){
 		std::string address = arg("address");
 		std::string nick = arg("nick");
+		std::string pass = arg("pass");
+		if(args.find("pass=") != std::string::npos) g_pass = pass; // allow clearing
 		bool ok = !address.empty() && JoinServer(address, nick);
 		if(address.empty()) g_lastJoinError = "no server address";
 		Reply(std::string("{\"reply\":\"join\",\"ok\":") + (ok ? "true" : "false") +
@@ -1121,9 +1168,11 @@ static void HandleQuery(const char* request, void*)
 	}else if(cmd == "config"){
 		std::string game = arg("game"), master = arg("master"), nick = arg("nick");
 		std::string rcon = arg("rcon");
+		std::string pass = arg("pass");
 		if(!game.empty()) g_gameExe = game;
 		if(!nick.empty() && ValidUsername(nick)) g_nick = nick;
 		if(args.find("rcon=") != std::string::npos) g_rconPw = rcon; // allow clearing
+		if(args.find("pass=") != std::string::npos) g_pass = pass; // allow clearing
 		if(!master.empty()){
 			size_t c = master.find(':');
 			g_masterHost = master.substr(0, c);
@@ -1194,6 +1243,44 @@ static void HandleQuery(const char* request, void*)
 			      "\",\"data\":" + (dataOk ? "true" : "false") +
 			      "\",\"cef\":" + (cefOk ? "true" : "false") +
 			      ",\"error\":\"" + Jesc(err) + "\"}");
+		}).detach();
+	}else if(cmd == "diag"){
+		// the join path writes g_lastJoinError on the UI thread: copy the
+		// settings we need before the worker starts
+		const std::string lastJoin = g_lastJoinError;
+		const std::string mHost = g_masterHost;
+		const uint16_t mPort = g_masterPort;
+		std::thread([lastJoin, mHost, mPort](){
+			std::string mErr, how, gErr;
+			int mMs = -1;
+			bool mOk = ProbeMaster(mHost, mPort, mErr, mMs);
+			std::string exe, mAddr = mHost + ":" + std::to_string((int)mPort);
+			bool dataOk = false, cefOk = false;
+			exe = DetectGameExe(how, dataOk, gErr);
+			if(!exe.empty()){
+				std::string d = exe;
+				size_t s = d.find_last_of('\\');
+				if(s != std::string::npos){
+					d.resize(s);
+					bool data2 = false;
+					GameDirOk(d, data2, cefOk);
+				}
+			}
+			Log("[DIAG] master=%s ok=%d ms=%d err=%s | game=%s how=%s data=%d cef=%d err=%s | lastjoin=%s",
+			    mAddr.c_str(), (int)mOk, mMs, mErr.c_str(),
+			    exe.empty() ? "-" : exe.c_str(), how.empty() ? "-" : how.c_str(),
+			    (int)dataOk, (int)cefOk, gErr.c_str(),
+			    lastJoin.empty() ? "-" : lastJoin.c_str());
+			Reply("{\"reply\":\"diag\",\"master\":\"" + Jesc(mAddr) +
+			      "\",\"masterOk\":" + (mOk ? "true" : "false") +
+			      ",\"masterMs\":" + std::to_string(mMs) +
+			      ",\"masterError\":\"" + Jesc(mErr) +
+			      "\",\"game\":\"" + Jesc(exe) + "\",\"gameOk\":" + (exe.empty() ? "false" : "true") +
+			      ",\"gameHow\":\"" + Jesc(how) +
+			      "\",\"gameData\":" + (dataOk ? "true" : "false") +
+			      ",\"gameCef\":" + (cefOk ? "true" : "false") +
+			      ",\"gameError\":\"" + Jesc(gErr) +
+			      "\",\"lastJoinError\":\"" + Jesc(lastJoin) + "\"}");
 		}).detach();
 	}else if(cmd == "probe"){
 		std::string address = arg("address");
@@ -1274,7 +1361,9 @@ static HWND MakeHostWindow(HINSTANCE hInst, int nCmdShow, int w, int h)
 	                       CW_USEDEFAULT, CW_USEDEFAULT,
 	                       rc.right - rc.left, rc.bottom - rc.top,
 	                       nullptr, nullptr, hInst, nullptr);
-	ShowWindow(g_hWnd, nCmdShow);
+	// open filling the screen (the selftest keeps it hidden); the CEF view
+	// follows the size through WM_SIZE -> cefui_resize
+	ShowWindow(g_hWnd, nCmdShow == SW_HIDE ? SW_HIDE : SW_SHOWMAXIMIZED);
 	return g_hWnd;
 }
 
