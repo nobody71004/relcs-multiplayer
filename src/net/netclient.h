@@ -41,7 +41,7 @@ public:
 		EV_PICKUP,         // synced prop: kind=type amount=qty arg=weapon, pos in state
 		// vehicle events: arg = vehicleId, model = modelId, id = playerId,
 		// kind = seat, veh = VehicleState (EV_VEH_STATE / EV_VEH_SPAWN pos)
-		EV_VEH_SPAWN,      // a net vehicle exists (state carries spawn pos/heading)
+		EV_VEH_SPAWN,      // a net vehicle exists (state carries spawn pos/heading, id = owner)
 		EV_VEH_ENTER,      // a player took a seat (kind = seat)
 		EV_VEH_EXIT,       // a player left a vehicle
 		EV_VEH_STATE,      // driver state update (veh)

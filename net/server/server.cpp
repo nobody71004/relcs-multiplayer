@@ -317,7 +317,8 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 		if(++p->floodStrikes > 20){
 			KickPlayer(p->id, "packet flood");
 		}else
-			Log("[anticheat] %s packet flood strike %d", p->name.c_str(), p->floodStrikes);
+			Log("[anticheat] %s packet flood strike %d (dropped msg type=%d channel=%d len=%d)",
+			    p->name.c_str(), p->floodStrikes, (int)type, (int)channel, (int)packet->dataLength);
 		return;
 	}
 
@@ -537,6 +538,22 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			// ...and each existing player's current look, so the newcomer renders
 			// the whole roster with the right models from the first frame
 			SendAppearance(peer, &other);
+			// already in the world: the newcomer missed their MSG_SPAWN, so
+			// replay it from the last accepted state (ahead of the vehicle
+			// snapshot below, so occupants have a body to seat)
+			if(other.spawned && other.alive){
+				BitWriter ws;
+				BeginMsg(ws, MSG_SPAWN);
+				MsgSpawn sp;
+				sp.playerId = other.id; sp.skinModel = other.skin;
+				sp.x = DequantPos(other.state.xMm);
+				sp.y = DequantPos(other.state.yMm);
+				sp.z = DequantPos(other.state.zMm);
+				sp.heading = DequantAngle(other.state.heading);
+				sp.health = other.health; sp.armour = other.armour;
+				WriteSpawn(ws, sp);
+				SendTo(peer, ws, CHAN_RELIABLE, true);
+			}
 		}
 	}
 
@@ -567,6 +584,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		vs.y = v.state.yMm / 1000.0f;
 		vs.z = v.state.zMm / 1000.0f;
 		vs.heading = DequantAngle(v.state.heading);
+		vs.ownerId = v.ownerId;
 		WriteVehSpawn(wv, vs);
 		SendTo(peer, wv, CHAN_RELIABLE, true);
 
@@ -591,6 +609,17 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		}
 	}
 
+	{
+		int live = 0, seated = 0;
+		for(int i = 0; i < MAX_VEHICLES; i++){
+			if(!m_vehicles[i].active) continue;
+			live++;
+			for(int s = 0; s < 8; s++)
+				if(m_vehicles[i].occupants[s] != 0xFF) seated++;
+		}
+		Log("[VEHSYNC] join snapshot to player %d: %d vehicles, %d occupied seats",
+		    (int)np.id, live, seated);
+	}
 	if(m_gamemode) m_gamemode->OnPlayerConnect(*this, np.id);
 }
 
@@ -703,6 +732,10 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	// frames every tick (a 20 Hz rubber-band oscillation — seen as alternating
 	// positions in the violation log)
 	if(!(flags & (VAL_TOO_FAST | VAL_TELEPORT))){
+		// occupancy is server-side truth (HandleVehEnter/Exit): relay that, not
+		// the client's claim, so remotes can reconcile seating from any state
+		st.vehicleId = p->state.vehicleId;
+		st.seat = p->state.seat;
 		p->state = st;
 		p->lastStateTime = t;
 	}
@@ -722,9 +755,16 @@ void Server::HandleVehicleState(ServerPlayer* p, BitReader& r)
 	if(dt > 0.5f) dt = 0.5f;
 
 	if(v->lastStateTime > 0.0 && (ValidateVehicleMove(v->state, st, dt) & VAL_TELEPORT)){
-		// don't relay teleports; client will get corrected visually by its own physics
-		return;
+		// don't relay a one-off teleport. A driver that keeps reporting the new
+		// place really is there (warp, respawn in car): adopt it as the reference
+		// after a few drops — never adopting froze the car for everyone forever
+		if(++v->teleportDrops <= 5)
+			return;
+		Log("[VEHSYNC] veh=%d relocated by driver %d to (%.1f, %.1f, %.1f)",
+		    (int)v->id, (int)p->id, st.xMm / 1000.0f, st.yMm / 1000.0f, st.zMm / 1000.0f);
 	}
+	v->teleportDrops = 0;
+	st.modelId = v->modelId;   // the server's record, not the client's claim
 	v->state = st;
 	v->lastStateTime = t;
 
@@ -1037,9 +1077,14 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 {
 	MsgVehEnter m;
 	if(!ReadVehEnter(r, m)) return;
+	Log("[VEHSYNC] enter request player=%d veh=%d seat=%d model=%d",
+	    (int)p->id, (int)m.vehicleId, (int)m.seat, (int)m.modelId);
 
 	// claimed model sanity (real clients send the engine model index)
-	if(m.modelId == 0 || m.modelId > 20000) return;
+	if(m.modelId == 0 || m.modelId > 20000){
+		Log("[VEHSYNC] enter DENIED player=%d: bad model %d", (int)p->id, (int)m.modelId);
+		return;
+	}
 
 	// a player holds exactly one seat: drop any old occupancy (broadcasts exit)
 	ClearPlayerVehicles(p, true);
@@ -1048,15 +1093,23 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	uint16_t vid = m.vehicleId;
 
 	if(vid == 0xFFFF){
-		// allocate a new vehicle at the player's position
+		// allocate a new vehicle at the player's position. The spawn is tagged
+		// with the entering player as owner: that client binds the car it already
+		// has locally instead of materializing a duplicate puppet.
 		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
-		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false);
-		if(!v) return;
+		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false, p->id);
+		if(!v){
+			Log("[VEHSYNC] enter DENIED player=%d: could not spawn model %d", (int)p->id, (int)m.modelId);
+			return;
+		}
 		vid = v->id;
 		Log("[VEH] player %d spawned vehicle id=%d model=%d", p->id, vid, (int)m.modelId);
 	}else{
 		v = FindVehicle(vid);
-		if(!v) return;
+		if(!v){
+			Log("[VEHSYNC] enter DENIED player=%d: no vehicle id=%d", (int)p->id, (int)vid);
+			return;
+		}
 	}
 
 	// seat assignment: honour the request when free, otherwise the lowest free
@@ -1068,7 +1121,7 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 		for(int s = 0; s < 8; s++)
 			if(v->occupants[s] == 0xFF){ seat = (uint8_t)s; break; }
 	if(seat == 0xFF){
-		Log("[VEH] player %d denied: vehicle id=%d full", p->id, vid);
+		Log("[VEHSYNC] enter DENIED player=%d: vehicle id=%d has no free seat", (int)p->id, (int)vid);
 		return;
 	}
 
@@ -1076,6 +1129,9 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	if(seat == 0) v->driverId = p->id;
 	p->state.vehicleId = vid;
 	p->state.seat = seat;
+	Log("[VEHSYNC] enter OK player=%d veh=%d seat=%d (asked %d) model=%d owner=%d driver=%d",
+	    (int)p->id, (int)vid, (int)seat, (int)m.seat, (int)v->modelId,
+	    (int)v->ownerId, (int)v->driverId);
 
 	BitWriter w;
 	BeginMsg(w, MSG_VEH_ENTER);
@@ -1099,6 +1155,8 @@ void Server::ClearPlayerVehicles(ServerPlayer* p, bool broadcast)
 		for(int s = 0; s < 8; s++)
 			if(v.occupants[s] == p->id){ v.occupants[s] = 0xFF; held = true; }
 		if(v.driverId == p->id){ v.driverId = 0xFF; held = true; }
+		if(held)
+			Log("[VEHSYNC] clear player=%d veh=%d (broadcast=%d)", (int)p->id, (int)v.id, (int)broadcast);
 		if(held && broadcast){
 			BitWriter w;
 			BeginMsg(w, MSG_VEH_EXIT);
@@ -1117,6 +1175,7 @@ void Server::HandleVehExit(ServerPlayer* p, BitReader& r)
 {
 	MsgVehExit m;
 	if(!ReadVehExit(r, m)) return;
+	Log("[VEHSYNC] exit request player=%d veh=%d", (int)p->id, (int)m.vehicleId);
 
 	// occupancy is authoritative: clients may send 0 or a stale id (the bot
 	// sends 0), so resolve the vehicle actually holding the player
@@ -1132,7 +1191,11 @@ void Server::HandleVehExit(ServerPlayer* p, BitReader& r)
 		for(int i = 0; i < MAX_VEHICLES; i++)
 			if(m_vehicles[i].active && inVehicle(&m_vehicles[i])){ v = &m_vehicles[i]; break; }
 	}
-	if(!v) return;
+	if(!v){
+		Log("[VEHSYNC] exit ignored player=%d: not seated in any vehicle", (int)p->id);
+		return;
+	}
+	Log("[VEHSYNC] exit OK player=%d veh=%d", (int)p->id, (int)v->id);
 	for(int s = 0; s < 8; s++)
 		if(v->occupants[s] == p->id) v->occupants[s] = 0xFF;
 	if(v->driverId == p->id) v->driverId = 0xFF;
@@ -1219,7 +1282,44 @@ void Server::Tick()
 	}
 
 	// (vehicle states are relayed directly in HandleVehicleState — driver-paced
-	//  at 20 Hz, no stale re-broadcasts of parked vehicles)
+	//  at 20 Hz)
+
+	// reconciliation heartbeat, 1 Hz: what the in-range 20 Hz streams never
+	// deliver. Players beyond the stream distance still get a slow position
+	// (no ghost frozen where it left range), and every vehicle's last state
+	// reaches everyone but its driver (a parked car that moved while a client
+	// was out of range or not yet connected ends up in the same place for all).
+	if(t - m_lastReconcile >= 1.0){
+		m_lastReconcile = t;
+		for(int i = 0; i < MAX_PLAYERS; i++){
+			ServerPlayer& p = m_players[i];
+			if(!p.active || !p.spawned || p.lastStateTime <= 0.0) continue;
+			BitWriter w;
+			BeginMsg(w, MSG_PLAYER_STATE);
+			WritePlayerState(w, p.state);
+			for(int j = 0; j < MAX_PLAYERS; j++){
+				if(i == j) continue;
+				ServerPlayer& q = m_players[j];
+				if(!q.active || !q.spawned || !q.peer) continue;
+				if(DistMm(p.state.xMm, p.state.yMm, p.state.zMm,
+				          q.state.xMm, q.state.yMm, q.state.zMm) <= m_cfg.streamDistance)
+					continue;   // already streamed at tick rate above
+				SendTo(q.peer, w, CHAN_STATE, false);
+			}
+		}
+		for(int i = 0; i < MAX_VEHICLES; i++){
+			ServerVehicle& v = m_vehicles[i];
+			if(!v.active) continue;
+			BitWriter w;
+			BeginMsg(w, MSG_VEHICLE_STATE);
+			WriteVehicleState(w, v.state);
+			for(int j = 0; j < MAX_PLAYERS; j++){
+				ServerPlayer& q = m_players[j];
+				if(!q.active || !q.spawned || !q.peer || q.id == v.driverId) continue;
+				SendTo(q.peer, w, CHAN_STATE, false);
+			}
+		}
+	}
 
 	// world clock: +1 game minute every 2 real seconds
 	if(t - m_lastWorldUpdate > 2.0){
@@ -1452,7 +1552,7 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 // after its driver walks away, exactly like a car parked on the street.
 // ---------------------------------------------------------------------------
 ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
-                                    float heading, bool permanent)
+                                    float heading, bool permanent, uint8_t ownerId)
 {
 	if(modelId == 0){
 		Log("[VEH] refusing model 0");
@@ -1473,6 +1573,8 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	v->id = (uint16_t)(slot + 1);
 	v->modelId = modelId;
 	v->driverId = 0xFF;
+	v->ownerId = ownerId;
+	v->teleportDrops = 0;
 	for(int s = 0; s < 8; s++) v->occupants[s] = 0xFF;
 	v->state = VehicleState();
 	v->state.vehicleId = v->id;
@@ -1489,6 +1591,7 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	vs.vehicleId = v->id;
 	vs.modelId = modelId;
 	vs.x = x; vs.y = y; vs.z = z; vs.heading = heading;
+	vs.ownerId = ownerId;
 	WriteVehSpawn(w, vs);
 	Broadcast(w, CHAN_RELIABLE, true);
 
@@ -1653,6 +1756,13 @@ void Server::RestartGameMode()
 	Log("[GAMEMODE] %s restarted", m_gamemode ? m_gamemode->Name() : "?");
 }
 
+// The net projects build with RTTI off (premake rtti "Off"), so dynamic_cast
+// on a GameMode is undefined behaviour there: identify the mode by name.
+static LibertyCitySurvivorMode* AsSurvivor(GameMode* gm)
+{
+	return (gm && strcmp(gm->Name(), "survivor") == 0) ? static_cast<LibertyCitySurvivorMode*>(gm) : nullptr;
+}
+
 void Server::SetServerVar(const std::string& key, const std::string& value)
 {
 	if(key == "hostname") m_cfg.hostname = value;
@@ -1663,11 +1773,11 @@ void Server::SetServerVar(const std::string& key, const std::string& value)
 	else if(key == "hour") m_cfg.hour = (uint8_t)atoi(value.c_str());
 	else if(key == "minute") m_cfg.minute = (uint8_t)atoi(value.c_str());
 	else if(key == "lcs_scorelimit" && m_gamemode){
-		auto* lcs = dynamic_cast<LibertyCitySurvivorMode*>(m_gamemode);
+		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->scoreLimit = atoi(value.c_str());
 	}
 	else if(key == "lcs_roundtime" && m_gamemode){
-		auto* lcs = dynamic_cast<LibertyCitySurvivorMode*>(m_gamemode);
+		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->roundTime = (float)atof(value.c_str());
 	}
 	else {
@@ -2237,6 +2347,12 @@ void Server::UpdateMasterAnnounce()
 		a.maxPlayers = (uint8_t)m_cfg.maxPlayers;
 		a.protocolVersion = PROTOCOL_VERSION;
 		a.advertisedIp = LanIPv4();
+		if(!m_cfg.publicIp.empty()){
+			// port-forwarded box: list the WAN address, not the LAN one
+			ENetAddress pub;
+			if(enet_address_set_host(&pub, m_cfg.publicIp.c_str()) == 0)
+				a.advertisedIp = pub.host;
+		}
 		CopyStr(a.hostname, sizeof a.hostname, m_cfg.hostname.c_str());
 		CopyStr(a.gameMode, sizeof a.gameMode, m_gamemode ? m_gamemode->Name() : "");
 		CopyStr(a.mapName, sizeof a.mapName, m_cfg.mapName.c_str());

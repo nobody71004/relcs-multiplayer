@@ -12,6 +12,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace rnet;
@@ -156,6 +157,7 @@ static void TestStateCodecs()
 	vs.velX = 500; vs.velY = -500; vs.velZ = 0;
 	vs.steer = -128; vs.gas = 200; vs.brake = 0;
 	vs.flags = VEH_ENGINE | VEH_SIREN; vs.health = 999;
+	vs.doors[0] = 0; vs.doors[1] = 255; vs.doors[2] = 128; vs.doors[3] = 64; vs.doors[4] = 1; vs.doors[5] = 200;
 
 	BitWriter w2; WriteVehicleState(w2, vs);
 	BitReader r2(w2.Data(), w2.ByteSize());
@@ -167,6 +169,7 @@ static void TestStateCodecs()
 	CHECK(vout.velX == vs.velX && vout.velY == vs.velY && vout.velZ == vs.velZ);
 	CHECK(vout.steer == vs.steer && vout.gas == vs.gas && vout.brake == vs.brake);
 	CHECK(vout.flags == vs.flags && vout.health == vs.health);
+	for(int i = 0; i < 6; i++) CHECK(vout.doors[i] == vs.doors[i]);
 	CHECK(r2.Ok());
 }
 
@@ -463,6 +466,7 @@ static void TestVehicleMessages()
 	MsgVehSpawn vs;
 	vs.vehicleId = 1; vs.modelId = 401;
 	vs.x = 100.5f; vs.y = -200.25f; vs.z = 12.0f; vs.heading = 1.5f;
+	vs.ownerId = 7;
 	BitWriter w3; BeginMsg(w3, MSG_VEH_SPAWN); WriteVehSpawn(w3, vs);
 	BitReader r3(w3.Data(), w3.ByteSize());
 	CHECK((MsgType)r3.ReadU8() == MSG_VEH_SPAWN);
@@ -470,6 +474,7 @@ static void TestVehicleMessages()
 	CHECK(ReadVehSpawn(r3, vs2));
 	CHECK(vs2.vehicleId == 1 && vs2.modelId == 401);
 	CHECK(vs2.x == 100.5f && vs2.y == -200.25f && vs2.z == 12.0f && vs2.heading == 1.5f);
+	CHECK(vs2.ownerId == 7);
 	CHECK(r3.Ok());
 
 	// seat math: passenger slots are seat-1 (0 = driver)
@@ -490,6 +495,123 @@ static void TestVehicleMessages()
 	a = riding; b = riding;
 	a.xMm = 0; b.xMm = QuantPos(2.0f);
 	CHECK(ValidateMove(a, b, TICK_DT) == VAL_OK);      // in vehicle: fine
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle occupancy / single-entity reconciliation model.
+//
+// This mirrors the server's authoritative occupancy state machine
+// (Server::HandleVehEnter / HandleVehExit / ClearPlayerVehicles) in a
+// self-contained form — net-tests does not link the ENet-coupled server — and
+// locks the invariants the vehicle-sync fix depends on:
+//   1. a player entering a BRAND-NEW car allocates exactly ONE entity,
+//   2. re-entering (or a passenger boarding) an EXISTING id allocates nothing,
+//   3. occupancy is scoped to the entering player — an enter by A never
+//      disturbs B's seat (no "forced into a vehicle you didn't enter"),
+//   4. a player holds exactly one seat at a time (old seat released on re-enter).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct VehReg {
+	struct Veh { bool active = false; uint16_t id = 0; uint16_t model = 0; uint8_t occ[8]; };
+	static const int MAXV = 8;
+	Veh v[MAXV];
+	int spawnCount = 0;                       // total entities ever allocated
+
+	VehReg() { for(int i = 0; i < MAXV; i++) for(int s = 0; s < 8; s++) v[i].occ[s] = 0xFF; }
+
+	int findById(uint16_t id) {
+		for(int i = 0; i < MAXV; i++) if(v[i].active && v[i].id == id) return i;
+		return -1;
+	}
+	// drop every seat this player holds, anywhere (disconnect / respawn / re-enter)
+	void clearPlayer(uint8_t pid) {
+		for(int i = 0; i < MAXV; i++)
+			if(v[i].active)
+				for(int s = 0; s < 8; s++) if(v[i].occ[s] == pid) v[i].occ[s] = 0xFF;
+	}
+	int alloc(uint16_t model) {
+		for(int i = 0; i < MAXV; i++) if(!v[i].active){
+			v[i].active = true; v[i].id = (uint16_t)(i + 1); v[i].model = model;
+			for(int s = 0; s < 8; s++) v[i].occ[s] = 0xFF;
+			spawnCount++;
+			return i;
+		}
+		return -1;
+	}
+	// returns the ASSIGNED (vehId, seat), or (VEHICLE_NONE, 0xFF) on refusal.
+	// reqId == 0xFFFF => allocate a new car.
+	std::pair<uint16_t,uint8_t> enter(uint8_t pid, uint16_t reqId, uint8_t reqSeat, uint16_t model) {
+		clearPlayer(pid);                      // invariant 4: one seat per player
+		int idx;
+		if(reqId == VEHICLE_NONE){ idx = alloc(model); if(idx < 0) return {VEHICLE_NONE, 0xFF}; }
+		else { idx = findById(reqId); if(idx < 0) return {VEHICLE_NONE, 0xFF}; }
+		uint8_t seat = 0xFF;
+		if(reqSeat < 8 && v[idx].occ[reqSeat] == 0xFF) seat = reqSeat;
+		else for(int s = 0; s < 8; s++) if(v[idx].occ[s] == 0xFF){ seat = (uint8_t)s; break; }
+		if(seat == 0xFF) return {VEHICLE_NONE, 0xFF}; // full
+		v[idx].occ[seat] = pid;
+		return {v[idx].id, seat};
+	}
+	void exit(uint8_t pid) { clearPlayer(pid); }
+	int seatOf(uint16_t id, uint8_t pid) {
+		int idx = findById(id); if(idx < 0) return -1;
+		for(int s = 0; s < 8; s++) if(v[idx].occ[s] == pid) return s;
+		return -1;
+	}
+};
+
+} // namespace
+
+static void TestVehicleOccupancy()
+{
+	VehReg reg;
+
+	// invariant 1: A drives into a brand-new car -> exactly one entity allocated
+	auto ra = reg.enter(/*pid*/1, VEHICLE_NONE, /*seat*/0, /*model*/130);
+	CHECK(ra.first != VEHICLE_NONE && ra.second == 0);
+	CHECK(reg.spawnCount == 1);
+	uint16_t carA = ra.first;
+	CHECK(reg.seatOf(carA, 1) == 0);
+
+	// invariant 2 + 3: B boards A's EXISTING car as a passenger. No new entity,
+	// and A's driver seat is untouched (occupancy scoped to the entering player).
+	auto rb = reg.enter(/*pid*/2, carA, /*seat*/1, 130);
+	CHECK(rb.first == carA && rb.second == 1);
+	CHECK(reg.spawnCount == 1);              // NOT duplicated
+	CHECK(reg.seatOf(carA, 1) == 0);         // A still driving — never force-moved
+	CHECK(reg.seatOf(carA, 2) == 1);
+
+	// a second, independent driver C spawns a DIFFERENT entity
+	auto rc = reg.enter(/*pid*/3, VEHICLE_NONE, 0, 131);
+	CHECK(rc.first != VEHICLE_NONE && rc.first != carA);
+	CHECK(reg.spawnCount == 2);
+	uint16_t carC = rc.first;
+
+	// invariant 4: A re-enters its OWN existing car (seat 0) — no new entity, and
+	// A is not duplicated across seats (old seat released first).
+	auto ra2 = reg.enter(1, carA, 0, 130);
+	CHECK(ra2.first == carA && ra2.second == 0);
+	CHECK(reg.spawnCount == 2);
+	int held = 0;
+	for(int s = 0; s < 8; s++) if(reg.seatOf(carA, 1) == s) held++;
+	CHECK(held == 1);
+
+    // exit: A leaves, freeing only A's seat; B stays put (scoped)
+	reg.exit(1);
+	CHECK(reg.seatOf(carA, 1) == -1);
+	CHECK(reg.seatOf(carA, 2) == 1);         // B untouched by A's exit
+	CHECK(reg.seatOf(carC, 3) == 0);         // C's own car untouched throughout
+
+	// requesting a taken seat falls back to a free one, never evicts the holder
+	auto rd = reg.enter(/*pid*/4, carA, /*seat*/2 /*B's seat*/, 130);
+	CHECK(rd.first == carA && rd.second != 1); // got some OTHER free seat
+	CHECK(reg.seatOf(carA, 2) == 1);           // B still in seat 1
+
+	// entering a non-existent id is refused (no phantom entity)
+	auto re = reg.enter(5, /*bogus*/9999, 0, 130);
+	CHECK(re.first == VEHICLE_NONE);
+	CHECK(reg.spawnCount == 2);
 }
 
 static void TestInventoryMessages()
@@ -1300,6 +1422,7 @@ int main()
 	TestValidation();
 	TestToughValidator();
 	TestVehicleMessages();
+	TestVehicleOccupancy();
 	TestInventoryMessages();
 	TestAppearanceCodec();
 	TestProfileStore();

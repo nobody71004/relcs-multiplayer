@@ -108,6 +108,7 @@ inline void WriteVehicleState(BitWriter& w, const VehicleState& s)
 	w.WriteI16(s.velX); w.WriteI16(s.velY); w.WriteI16(s.velZ);
 	w.WriteI8(s.steer); w.WriteU8(s.gas); w.WriteU8(s.brake);
 	w.WriteU8(s.flags); w.WriteU16(s.health);
+	for(int i = 0; i < 6; i++) w.WriteU8(s.doors[i]);
 }
 
 inline bool ReadVehicleState(BitReader& r, VehicleState& s)
@@ -118,6 +119,7 @@ inline bool ReadVehicleState(BitReader& r, VehicleState& s)
 	s.velX = r.ReadI16(); s.velY = r.ReadI16(); s.velZ = r.ReadI16();
 	s.steer = r.ReadI8(); s.gas = r.ReadU8(); s.brake = r.ReadU8();
 	s.flags = r.ReadU8(); s.health = r.ReadU16();
+	for(int i = 0; i < 6; i++) s.doors[i] = r.ReadU8();
 	return r.Ok();
 }
 
@@ -278,11 +280,13 @@ inline void WriteVehSpawn(BitWriter& w, const MsgVehSpawn& m)
 {
 	w.WriteU16(m.vehicleId); w.WriteU16(m.modelId);
 	w.WriteF32(m.x); w.WriteF32(m.y); w.WriteF32(m.z); w.WriteF32(m.heading);
+	w.WriteU8(m.ownerId);
 }
 inline bool ReadVehSpawn(BitReader& r, MsgVehSpawn& m)
 {
 	m.vehicleId = r.ReadU16(); m.modelId = r.ReadU16();
 	m.x = r.ReadF32(); m.y = r.ReadF32(); m.z = r.ReadF32(); m.heading = r.ReadF32();
+	m.ownerId = r.ReadU8();
 	return r.Ok();
 }
 
