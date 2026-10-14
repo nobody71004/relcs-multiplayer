@@ -40,6 +40,8 @@
 #include "Pickups.h"
 #include "Vehicle.h"
 #include "Automobile.h"
+#include "Camera.h"
+#include "VisibilityPlugins.h"
 #include "Bike.h"
 #include "Boat.h"
 #include "CarCtrl.h"
@@ -113,6 +115,7 @@ static void SyncPuppetToRw(CEntity* ent)
 // ---------------------------------------------------------------------------
 struct NetVehicle {
 	CVehicle* veh = nil;
+	int32 handle = -1;         // pool handle of veh (slot + reuse counter)
 	uint16_t modelId = 0;
 	bool puppet = false;       // created by the netcode (vs a local game object)
 	bool rejected = false;     // invalid model — drop instead of retrying forever
@@ -129,10 +132,59 @@ static CVehicle* s_pendingVeh = nil;   // local car waiting for its server id
 static uint16_t s_pendingModel = 0;
 static std::map<uint8_t, std::pair<uint16_t, uint8_t>> s_pendingSeat; // remote ped -> (veh, seat)
 
+// Bind a game vehicle to a net id. The pool handle is kept so a pointer the
+// engine has since freed (or reused for another vehicle) is never trusted.
+static void BindNetVehicle(uint16_t netId, NetVehicle& nv, CVehicle* v)
+{
+	nv.veh = v;
+	nv.handle = v ? CPools::GetVehicleRef(v) : -1;
+	if(v) s_vehByPtr[v] = netId;
+}
+
+// The engine can free a net vehicle behind our back: puppets built from the
+// join snapshot while the game was still starting were wiped by the new-game
+// pool reset, and the slots were reused by the world's trains and later by the
+// next car anyone spawned. The stale entries then positioned those objects
+// every frame — a fresh i8 was dragged onto a train 1 km away and its seated
+// driver vanished with it. Drop a stale binding (never delete through it);
+// UpdateNetVehicles rebuilds the puppet on the next frame.
+static bool NetVehicleStale(uint16_t netId, NetVehicle& nv)
+{
+	if(!nv.veh) return false;
+	// the object must still be ours alone: a newer binding of the same pointer
+	// (slot reused by another net vehicle) wins
+	auto own = s_vehByPtr.find(nv.veh);
+	bool ok = own != s_vehByPtr.end() && own->second == netId &&
+	          CPools::GetVehicle(nv.handle) == nv.veh &&
+	          nv.veh->GetModelIndex() == (int32)nv.modelId &&
+	          (!nv.puppet || (nv.veh->VehicleCreatedBy == MISSION_VEHICLE && !nv.veh->IsTrain()));
+	if(ok) return false;
+	fprintf(stderr, "[VEHSYNC] net vehicle %d lost its game object (%p) — rebuilding\n",
+	        (int)netId, (void*)nv.veh);
+	fflush(stderr);
+	auto pit = s_vehByPtr.find(nv.veh);
+	if(pit != s_vehByPtr.end() && pit->second == netId)
+		s_vehByPtr.erase(pit);
+	nv.veh = nil;
+	nv.handle = -1;
+	nv.puppet = false;
+	return true;
+}
+
 static uint16_t NetIdOfVehicle(CVehicle* v)
 {
 	auto it = s_vehByPtr.find(v);
-	return it == s_vehByPtr.end() ? rnet::VEHICLE_NONE : it->second;
+	if(it == s_vehByPtr.end()) return rnet::VEHICLE_NONE;
+	uint16_t id = it->second;
+	auto vit = s_vehicles.find(id);
+	if(vit == s_vehicles.end() || vit->second.veh != v){
+		// left over from a freed vehicle: must never name a new one
+		s_vehByPtr.erase(it);
+		return rnet::VEHICLE_NONE;
+	}
+	if(NetVehicleStale(id, vit->second))   // drops the s_vehByPtr entry itself
+		return rnet::VEHICLE_NONE;
+	return id;
 }
 
 static void UnseatNetPed(CPed* ped)
@@ -176,6 +228,11 @@ static void AnchorSeatedPuppet(CPed* ped)
 		ped->SetPedPositionInTrain();
 	else
 		ped->SetPedPositionInCar();
+	// a static entity is never re-sectored by the world loop (only
+	// ProcessCollision calls RemoveAndAdd), so the puppet stayed listed in the
+	// sector where it got in: once the car left the renderer's scan range the
+	// player was not drawn at all. Re-sector it with the car.
+	ped->RemoveAndAdd();
 	SyncPuppetToRw(ped);
 }
 
@@ -366,6 +423,7 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 		x = me.x; y = me.y; z = me.z; // keep smooth* latch in-world too
 	}
 	NetVehicle& nv = s_vehicles[netId];
+	NetVehicleStale(netId, nv);
 	if(!nv.veh){
 		if(nv.modelId == 0){
 			nv.modelId = modelId;
@@ -381,11 +439,10 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 			             (int)netId, (int)nv.modelId);
 		}
 		if(!nv.rejected){
-			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
+			BindNetVehicle(netId, nv, CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH));
 			// an adopted game train is owned by the game — only constructed
 			// puppets may be deleted by RemoveNetVehicle
 			nv.puppet = nv.veh != nil && nv.veh->VehicleCreatedBy == MISSION_VEHICLE;
-			if(nv.veh) s_vehByPtr[nv.veh] = netId;
 		}
 	}
 	return nv;
@@ -394,13 +451,12 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 static void AdoptNetVehicle(uint16_t netId, CVehicle* veh, uint16_t modelId)
 {
 	NetVehicle& nv = s_vehicles[netId];
-	nv.veh = veh;
 	nv.modelId = modelId;
 	nv.puppet = false;
+	BindNetVehicle(netId, nv, veh);
 	CVector p = veh->GetPosition();
 	nv.smoothX = p.x; nv.smoothY = p.y; nv.smoothZ = p.z;
 	nv.smoothH = std::atan2(-veh->GetForward().x, veh->GetForward().y);
-	s_vehByPtr[veh] = netId;
 	// our car is a net entity now: keep the population from reclaiming it
 	veh->VehicleCreatedBy = MISSION_VEHICLE;
 }
@@ -438,6 +494,7 @@ static void RemoveNetVehicle(uint16_t netId)
 	auto it = s_vehicles.find(netId);
 	if(it == s_vehicles.end()) return;
 	NetVehicle& nv = it->second;
+	NetVehicleStale(netId, nv);   // never delete through a freed pointer
 	if(nv.veh){
 		s_vehByPtr.erase(nv.veh);
 		if(nv.puppet){
@@ -494,14 +551,36 @@ static void ApplyNetDoors(CAutomobile* car, const uint8_t* ratios)
 // freeze/unfreeze based on who drives
 static void UpdateNetVehicles(float dt)
 {
+	// render-state probe for remote-driven cars, every 2 s: where the puppet
+	// is, how far from the camera, its fade alpha and its driver's state —
+	// enough to tell "not drawn" apart from "drawn somewhere else"
+	static double s_lastVehDiag = 0.0;
+	bool diag = NowSec() - s_lastVehDiag >= 2.0;
+	if(diag) s_lastVehDiag = NowSec();
+	for(auto& kv : s_vehicles){
+		NetVehicleStale(kv.first, kv.second);
+		if(diag && kv.second.veh && kv.first != s_myVehNet){
+			CVehicle* v = kv.second.veh;
+			CVector p = v->GetPosition();
+			CVector c = TheCamera.GetPosition();
+			float cd = (p - c).Magnitude();
+			int alpha = -1;
+#ifdef VIS_DISTANCE_ALPHA
+			if(v->m_rwObject) alpha = CVisibilityPlugins::GetObjectDistanceAlpha(v->m_rwObject);
+#endif
+			fprintf(stderr, "[VEHDIAG] veh=%d model=%d puppet=%d pos=(%.1f,%.1f,%.1f) camDist=%.1f rw=%d visible=%d alpha=%d fade=%d static=%d driver=%p drvState=%d\n",
+			        (int)kv.first, (int)kv.second.modelId, (int)kv.second.puppet, p.x, p.y, p.z, cd,
+			        (int)(v->m_rwObject != nil), (int)v->bIsVisible, alpha, (int)v->bDistanceFade,
+			        (int)v->GetIsStatic(), (void*)v->pDriver, v->pDriver ? (int)v->pDriver->m_nPedState : -1);
+		}
+	}
 	for(auto& kv : s_vehicles){
 		NetVehicle& nv = kv.second;
 		if(!nv.veh){
 			if(nv.rejected) continue;
-			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
+			BindNetVehicle(kv.first, nv, CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH));
 			if(!nv.veh) continue;
 			nv.puppet = nv.veh->VehicleCreatedBy == MISSION_VEHICLE; // trains adopted
-			s_vehByPtr[nv.veh] = kv.first;
 		}
 		CVehicle* veh = nv.veh;
 		// belt & braces: streaming eviction kills the clump — rebuild it
@@ -550,6 +629,12 @@ static void UpdateNetVehicles(float dt)
 		veh->SetOrientation(0.0f, 0.0f, nv.smoothH);
 		veh->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 		veh->SetTurnSpeed(0.0f, 0.0f, 0.0f);
+		// CAutomobile::ProcessControl marks a frozen car bIsInSafePosition, so
+		// the world loop skips its ProcessCollision — the only place a
+		// collisionless car is re-sectored. The puppet then stayed listed in its
+		// spawn sector: once it drove off, the renderer never found it, and its
+		// seated driver (drawn as part of the car) vanished with it.
+		veh->RemoveAndAdd();
 		SyncPuppetToRw(veh);
 		if(veh->IsCar() && nv.hasTarget)
 			ApplyNetDoors((CAutomobile*)veh, nv.target.doors);
@@ -564,9 +649,26 @@ struct RemotePed {
 	int lastAnim = -1;
 	float smoothX = 0, smoothY = 0, smoothZ = 0;
 	bool init = false;
+	int  model = MI_MALE01;   // the ped model this remote should render as (appearance sync)
 	float seatMismatch = 0.0f; // seconds the relayed seat has disagreed with the puppet
 };
 static std::map<uint8_t, RemotePed> s_remotes;
+
+// A player's chosen look may arrive (MSG_APPEARANCE) before the ped exists, or
+// be changed mid-session. Remember the desired model per id so SpawnRemote
+// materializes the right one and ApplyRemote can re-skin on change.
+static std::map<uint8_t, uint16_t> s_remoteModel;
+
+// Only ped models are valid avatars; a vehicle/other model would crash the ped
+// clump build. Fall back to the default civilian if the id is not a ped model.
+static int ResolvePedModel(uint16_t model)
+{
+	if(model == 0) return MI_MALE01;
+	CBaseModelInfo* mi = CModelInfo::GetModelInfo((int)model);
+	if(mi && mi->GetModelType() == MITYPE_PED)
+		return (int)model;
+	return MI_MALE01;
+}
 
 static void RemoveRemote(uint8_t id)
 {
@@ -580,6 +682,10 @@ static void RemoveRemote(uint8_t id)
 		s_remotes.erase(it);
 	}
 	s_pendingSeat.erase(id);
+	// note: s_remoteModel is intentionally NOT erased here — the clump is often
+	// torn down and rebuilt (streaming eviction, re-skin) while the player stays,
+	// and keeping the last known look lets SpawnRemote restore it. It is cleared
+	// on EV_REMOTE_QUIT instead.
 }
 
 static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
@@ -588,6 +694,12 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 		return;
 	if(!NetPosSane(x, y, z, "ped spawn"))
 		return; // ApplyRemote retries on the next sane state
+	// the look the server told us this player uses (default until MSG_APPEARANCE)
+	int model = MI_MALE01;
+	{
+		auto mit = s_remoteModel.find(id);
+		if(mit != s_remoteModel.end()) model = ResolvePedModel(mit->second);
+	}
 	// RemoveRemote drops the pending seat; keep it so the frame pass can seat
 	// the ped once it (and its car) exist, whichever arrives last
 	auto pit = s_pendingSeat.find(id);
@@ -595,7 +707,7 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 	auto pendingSeat = hadSeat ? pit->second : std::make_pair((uint16_t)rnet::VEHICLE_NONE, (uint8_t)0xFF);
 	RemoveRemote(id);
 	if(hadSeat) s_pendingSeat[id] = pendingSeat;
-	CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
+	CStreaming::RequestModel(model, STREAMFLAGS_KEEP_IN_MEMORY);
 	CStreaming::LoadAllRequestedModels(false);
 
 	// CPed::operator new returns nil when the ped pool is full and the
@@ -609,7 +721,7 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 		return;
 	}
 
-	CCivilianPed* ped = new CCivilianPed(PEDTYPE_CIVMALE, MI_MALE01);
+	CCivilianPed* ped = new CCivilianPed(PEDTYPE_CIVMALE, model);
 	if(!ped)
 		return;
 	// puppets are positioned directly each frame; letting them collide makes
@@ -635,7 +747,36 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 	rp.ped = ped;
 	rp.smoothX = x; rp.smoothY = y; rp.smoothZ = z;
 	rp.init = true;
-	fprintf(stderr, "[NET] remote ped id=%d created at (%.1f, %.1f, %.1f)\n", (int)id, x, y, z);
+	rp.model = model;
+	fprintf(stderr, "[NET] remote ped id=%d created at (%.1f, %.1f, %.1f) model=%d\n",
+	        (int)id, x, y, z, model);
+	fflush(stderr);
+}
+
+// A player's look arrived/changed (MSG_APPEARANCE). Remember the model for the
+// id, and if the ped already exists re-skin it in place: SetModelIndex rebuilds
+// the RenderWare clump, so the puppet instantly renders as the new character.
+// (LCS renders a ped by model index; the component slots are carried for mods.)
+static void ApplyRemoteAppearance(uint8_t id, const rnet::MsgAppearance& ap)
+{
+	int model = ResolvePedModel(ap.model);
+	s_remoteModel[id] = (uint16_t)model;
+	auto it = s_remotes.find(id);
+	if(it == s_remotes.end() || !it->second.ped){
+		// ped not built yet: SpawnRemote will pick up the stored model
+		return;
+	}
+	RemotePed& rp = it->second;
+	if(rp.model == model)
+		return;   // already wearing this look
+	CStreaming::RequestModel(model, STREAMFLAGS_KEEP_IN_MEMORY);
+	CStreaming::LoadAllRequestedModels(false);
+	rp.ped->SetModelIndex(model);   // rebuilds the clump
+	SyncPuppetToRw(rp.ped);
+	rp.model = model;
+	rp.lastAnim = -1;               // re-blend the idle/walk anim on the new clump
+	PoseSeatedPuppet(rp.ped);       // a seated look change keeps sitting
+	fprintf(stderr, "[NET] remote ped id=%d re-skinned to model %d\n", (int)id, model);
 	fflush(stderr);
 }
 
@@ -656,13 +797,13 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	// the puppet silently renders as nothing (nametag floats "in the air") —
 	// rebuild it in place
 	if(!ped->m_rwObject){
-		CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
+		CStreaming::RequestModel(rp.model, STREAMFLAGS_KEEP_IN_MEMORY);
 		CStreaming::LoadAllRequestedModels(false);
-		ped->SetModelIndex(MI_MALE01);
+		ped->SetModelIndex(rp.model);
 		SyncPuppetToRw(ped);
 		rp.lastAnim = -1;
 		PoseSeatedPuppet(ped);   // no-op on foot
-		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt\n", (int)id);
+		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt (model %d)\n", (int)id, rp.model);
 		fflush(stderr);
 	}
 
@@ -715,6 +856,7 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	ped->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(st.heading));
 	ped->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 	ped->SetTurnSpeed(0.0f, 0.0f, 0.0f);
+	ped->RemoveAndAdd();   // keep the world sector current (see AnchorSeatedPuppet)
 	SyncPuppetToRw(ped);   // collisionless puppets are skipped by the engine's sync
 
 	// anim from relayed speed
@@ -782,6 +924,26 @@ void NetGame_SetFpsLimit(int n)
 	fflush(stderr);
 }
 
+// GetAsyncKeyState is global: it reports keys typed into ANY window. Without
+// this gate a second client on the same PC ran every console command typed into
+// the first one ("ride 295" spawned a duplicate car and warped that client's
+// player into it). The foreground window counts as ours when it belongs to this
+// process, so the CEF overlay/panels (same process) keep working.
+static bool GameHasFocus(void)
+{
+	HWND fg = GetForegroundWindow();
+	if(!fg) return false;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(fg, &pid);
+	return pid == GetCurrentProcessId();
+}
+
+// GetAsyncKeyState held-test, false while another window has focus
+static bool KeyDown(int vk)
+{
+	return GameHasFocus() && (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
 // one-shot key edge detector (edges are computed once per frame and cached,
 // so every caller sees the same answer — the old consuming version meant a
 // keybind key (T=chat, I=inventory) could never be typed into a text field)
@@ -793,9 +955,12 @@ static bool KeyEdge(int vk)
 	uint32 frame = CTimer::GetFrameCounter();
 	if(s_frame != frame){
 		s_frame = frame;
+		bool focused = GameHasFocus();
 		for(int k = 0; k < 256; k++){
 			bool now = (GetAsyncKeyState(k) & 0x8000) != 0;
-			cur[k] = now && !prev[k];
+			// unfocused: track the key state but never report an edge, so a key
+			// still held when focus returns does not fire either
+			cur[k] = focused && now && !prev[k];
 			prev[k] = now;
 		}
 	}
@@ -932,6 +1097,24 @@ static void StopDoorChime(void);
 static void PlayRemoteDoorChime(float x, float y, float z);
 static bool s_doorChime = true;
 
+// --- appearance sync: the local player's chosen look (model + components) ----
+// Default = MI_MALE01. The player customizes via the `model` console command;
+// the server restores a saved look on join (EV_APPEARANCE for our own id).
+static rnet::MsgAppearance s_myAppearance;
+static bool   s_appearanceDirty = false;   // needs sending to the server
+static bool   s_appearanceServerKnown = false; // the server has echoed our look at least once
+
+// queue our look for sending (console command / server restore -> re-send)
+static void SetMyAppearance(uint16_t model, const uint8_t* comps /*8 or null*/)
+{
+	s_myAppearance.playerId = s_net.MyId();
+	if(model != 0) s_myAppearance.model = model;
+	if(comps)
+		for(int i = 0; i < rnet::MAX_APPEARANCE_COMPONENTS; i++)
+			s_myAppearance.components[i] = comps[i];
+	s_appearanceDirty = true;
+}
+
 static void ConsoleExec(const char* line)
 {
 	char cmd[32] = {}, rest[160] = {};
@@ -941,7 +1124,7 @@ static void ConsoleExec(const char* line)
 	CPlayerPed* me = FindPlayerPed();
 	int myId = (int)s_net.MyId();
 	if(is("help")){
-		ConsolePrint("commands: help say broadcast(bc) give spawnbot spawnprop teleport(tp) ride");
+		ConsolePrint("commands: help say broadcast(bc) give spawnbot spawnprop teleport(tp) ride model");
 		ConsolePrint("          fps god noclip nocspeed players worldstats ground status settime setweather res doorchime rcon keybinds clear quit");
 	}else if(is("say")){
 		if(rest[0]) s_net.SendChat(rest);
@@ -1141,6 +1324,32 @@ static void ConsoleExec(const char* line)
 	}else if(is("rcon")){
 		if(rest[0]) s_net.SendRconCmd(rest);
 		else ConsolePrint("usage: rcon <server command>");
+	}else if(is("model") || is("appearance") || is("skin")){
+		// customization entry point: choose the character/outfit the other
+		// players see you as. "model <pedModelId> [c0 c1 ...]" sets the ped model
+		// (and optional clothing/component slots); "model" alone prints the current.
+		if(!rest[0]){
+			ConsolePrint("your model=%d (components %d %d %d %d %d %d %d %d)",
+			             (int)s_myAppearance.model,
+			             s_myAppearance.components[0], s_myAppearance.components[1],
+			             s_myAppearance.components[2], s_myAppearance.components[3],
+			             s_myAppearance.components[4], s_myAppearance.components[5],
+			             s_myAppearance.components[6], s_myAppearance.components[7]);
+			ConsolePrint("usage: model <pedModelId> [c0..c7]  (e.g. model 9=taxi-driver, 11=criminal, 78=gang)");
+		}else{
+			int mdl = 0, c[rnet::MAX_APPEARANCE_COMPONENTS] = {};
+			int n = sscanf(rest, "%d %d %d %d %d %d %d %d %d",
+			               &mdl, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+			if(n < 1 || mdl <= 0){
+				ConsolePrint("usage: model <pedModelId> [c0..c7]");
+			}else{
+				uint8_t comps[rnet::MAX_APPEARANCE_COMPONENTS];
+				for(int i = 0; i < rnet::MAX_APPEARANCE_COMPONENTS; i++)
+					comps[i] = (uint8_t)(c[i] & 0xFF);
+				SetMyAppearance((uint16_t)mdl, comps);
+				ConsolePrint("appearance set to model %d — sending to server", mdl);
+			}
+		}
 	}else if(is("clear")){
 		s_consoleLog.clear();
 	}else if(is("doorchime")){
@@ -1202,6 +1411,13 @@ static void CefQueryHandler(const char* request, void*)
 	if(cmd == "chat"){
 		std::string text = arg("text");
 		if(!text.empty()) s_net.SendChat(text.c_str());
+	}else if(cmd == "model" || cmd == "appearance"){
+		// UI customization entry point: the overlay sends ?model=<pedModelId>
+		std::string m = arg("model");
+		if(!m.empty()){
+			int mdl = atoi(m.c_str());
+			if(mdl > 0) SetMyAppearance((uint16_t)mdl, nullptr);
+		}
 	}else if(cmd == "console"){
 		std::string c = arg("cmd");
 		if(!c.empty()) ConsoleExec(c.c_str());
@@ -1390,7 +1606,7 @@ static void NetGame_PollUi(void)
 	// UI panel owns the keyboard so typing TAB never flashes the board
 	{
 		bool anyUi = s_consoleOpen || s_chatOpen || s_invOpen || s_panelOpen || !s_cefPanel.empty();
-		bool held = s_net.Connected() && !anyUi && (GetAsyncKeyState(s_keys.scoreboard) & 0x8000) != 0;
+		bool held = s_net.Connected() && !anyUi && KeyDown(s_keys.scoreboard);
 		if(held != s_boardHeld){
 			s_boardHeld = held;
 			s_lastCefPush = -1e9;   // push the change now instead of within 200 ms
@@ -1459,7 +1675,7 @@ static void NetGame_PollUi(void)
 		GetCursorPos(&pt);
 		ScreenToClient(GetActiveWindow(), &pt);
 		static bool s_lmbPrev = false;
-		bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		bool lmb = KeyDown(VK_LBUTTON);
 		CefHud_Mouse(0, pt.x, pt.y, 0, 0);
 		if(lmb && !s_lmbPrev) CefHud_Mouse(1, pt.x, pt.y, 0, 0);
 		if(!lmb && s_lmbPrev) CefHud_Mouse(2, pt.x, pt.y, 0, 0);
@@ -1615,9 +1831,24 @@ static void NetGame_PollUi(void)
 // ---------------------------------------------------------------------------
 static std::string s_pendingArg;
 
+// The launcher starts the game without a console, so every [NET]/[VEHSYNC]
+// line was lost and sync bugs reported from real sessions had no evidence.
+// When stderr is not redirected anywhere, write it to reLCS-net-<pid>.log.
+static void EnsureNetLogFile(void)
+{
+	HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+	if(h != nil && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN)
+		return;   // already captured (pipe, file or console)
+	char name[64];
+	snprintf(name, sizeof name, "reLCS-net-%lu.log", GetCurrentProcessId());
+	if(freopen(name, "w", stderr))
+		setvbuf(stderr, nil, _IONBF, 0);
+}
+
 bool NetGame_OnCommandLine(const char* arg)
 {
 	if(s_pendingArg == "-connect"){
+		EnsureNetLogFile();
 		std::string v = arg;
 		size_t c = v.find(':');
 		s_host = v.substr(0, c);
@@ -2339,6 +2570,11 @@ void NetGame_Frame(void)
 	float dt = CTimer::GetTimeStep() / 50.0f; // frames -> seconds-ish (50 fps units)
 	if(dt <= 0.0f || dt > 0.5f) dt = 0.02f;
 
+	// drop bindings to vehicles the engine freed before any event handler
+	// (seat, state, despawn) can touch them
+	for(auto& kv : s_vehicles)
+		NetVehicleStale(kv.first, kv.second);
+
 	// events
 	NetClient::Event ev;
 	while(s_net.PopEvent(ev)){
@@ -2488,6 +2724,24 @@ void NetGame_Frame(void)
 			break;
 		case NetClient::EV_REMOTE_QUIT:
 			RemoveRemote(ev.id);
+			s_remoteModel.erase(ev.id);   // forget the departed player's look
+			break;
+		case NetClient::EV_APPEARANCE:
+			if(ev.id == s_net.MyId()){
+				// the server restored our saved look (join) or echoed our change.
+				// Adopt it as our baseline so we don't immediately re-send/fight it;
+				// LCS keeps the local PlayerPed as MI_PLAYER, so we don't re-skin self.
+				s_myAppearance = ev.appearance;
+				s_myAppearance.playerId = s_net.MyId();
+				s_appearanceServerKnown = true;
+				s_appearanceDirty = false;
+				fprintf(stderr, "[NET] own appearance from server: model=%d\n",
+				        (int)ev.appearance.model);
+				fflush(stderr);
+			}else{
+				// a remote player's look: re-skin their puppet (or store for spawn)
+				ApplyRemoteAppearance(ev.id, ev.appearance);
+			}
 			break;
 		case NetClient::EV_VEH_SPAWN:{
 			float vx = ev.state.xMm / 1000.0f, vy = ev.state.yMm / 1000.0f, vz = ev.state.zMm / 1000.0f;
@@ -2744,20 +2998,20 @@ void NetGame_Frame(void)
 		me->bUsesCollision = false;
 		me->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 		float sp = s_ncSpeed * dt;
-		if(GetAsyncKeyState(VK_CONTROL) & 0x8000) sp *= 4.0f;      // speed boost
-		else if(GetAsyncKeyState(VK_MENU) & 0x8000) sp *= 0.25f;   // fine control
+		if(KeyDown(VK_CONTROL)) sp *= 4.0f;      // speed boost
+		else if(KeyDown(VK_MENU)) sp *= 0.25f;   // fine control
 		// [ / ] adjust the base speed — but never while typing in a UI
 		bool uiUp = !s_cefPanel.empty() || s_consoleOpen || s_chatOpen || s_panelOpen;
 		if(!uiUp && KeyEdge(VK_OEM_6)) s_ncSpeed = s_ncSpeed * 1.5f > 500.0f ? 500.0f : s_ncSpeed * 1.5f;
 		if(!uiUp && KeyEdge(VK_OEM_4)) s_ncSpeed = s_ncSpeed / 1.5f < 1.0f ? 1.0f : s_ncSpeed / 1.5f;
 		CVector fwd = me->GetForward();
 		CVector right = me->GetRight();
-		if(GetAsyncKeyState('W') & 0x8000) s_ncPos += fwd * sp;
-		if(GetAsyncKeyState('S') & 0x8000) s_ncPos -= fwd * sp;
-		if(GetAsyncKeyState('D') & 0x8000) s_ncPos += right * sp;
-		if(GetAsyncKeyState('A') & 0x8000) s_ncPos -= right * sp;
-		if(GetAsyncKeyState(VK_SPACE) & 0x8000) s_ncPos.z += sp;
-		if(GetAsyncKeyState(VK_SHIFT) & 0x8000) s_ncPos.z -= sp;
+		if(KeyDown('W')) s_ncPos += fwd * sp;
+		if(KeyDown('S')) s_ncPos -= fwd * sp;
+		if(KeyDown('D')) s_ncPos += right * sp;
+		if(KeyDown('A')) s_ncPos -= right * sp;
+		if(KeyDown(VK_SPACE)) s_ncPos.z += sp;
+		if(KeyDown(VK_SHIFT)) s_ncPos.z -= sp;
 		me->SetPosition(s_ncPos);
 	}
 
@@ -2873,6 +3127,17 @@ void NetGame_Frame(void)
 			s_invHave = true;
 			s_invLastSend = now;
 			s_invForce = false;
+		}
+
+		// appearance: send our chosen look whenever it changed (the `model`
+		// console command sets s_appearanceDirty). The server persists it and
+		// rebroadcasts so every other client re-skins our puppet.
+		if(s_appearanceDirty){
+			s_appearanceDirty = false;
+			s_myAppearance.playerId = s_net.MyId();
+			s_net.SendAppearance(s_myAppearance);
+			fprintf(stderr, "[NET] sent appearance model=%d\n", (int)s_myAppearance.model);
+			fflush(stderr);
 		}
 
 		// the driver streams the vehicle (seat 0 is authoritative for the car)

@@ -968,21 +968,33 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 // ---------------------------------------------------------------------------
 // JS <-> host plumbing (lcs:// scheme)
 // ---------------------------------------------------------------------------
+// JSON string escaping (the value goes between double quotes in a JSON text)
 static std::string Jesc(const std::string& s)
 {
 	std::string o;
 	for(char c : s){
-		if(c == '\'' || c == '\\' || c == '"'){ o += '\\'; o += c; }
+		if(c == '\\' || c == '"'){ o += '\\'; o += c; }
 		else if((unsigned char)c < 0x20) continue;
 		else o += c;
 	}
 	return o;
 }
 
+// The JSON text travels inside a single-quoted JavaScript string literal, so it
+// needs a second escaping layer of its own. With one layer the JS literal ate
+// the JSON escapes: a game path reached JSON.parse with bare backslashes (an
+// invalid escape), so the init reply never parsed and the page stayed on
+// "Game: detecting" / "Player —" whenever a game install was found.
 static void Reply(const std::string& json)
 {
-	if(g_exec)
-		g_exec(("window.onCefReply && onCefReply('" + json + "')").c_str());
+	if(!g_exec) return;
+	std::string lit;
+	lit.reserve(json.size() + 16);
+	for(char c : json){
+		if(c == '\\' || c == '\''){ lit += '\\'; lit += c; }
+		else lit += c;
+	}
+	g_exec(("window.onCefReply && onCefReply('" + lit + "')").c_str());
 }
 
 static std::string RowToJson(const ServerRow& r)
@@ -1078,14 +1090,18 @@ static void HandleQuery(const char* request, void*)
 				GameDirOk(d, data2, cefOk);
 			}
 		}
+		// NOTE: boolean/numeric fields must NOT be wrapped in quotes. The next
+		// segment after such a value starts with ,\" (not \",\") — otherwise the
+		// value becomes a malformed string (e.g. gameData:true") and the whole
+		// init reply fails to parse in the browser.
 		Reply("{\"reply\":\"init\",\"nick\":\"" + Jesc(g_nick) +
 		      "\",\"game\":\"" + Jesc(gameShown) +
 		      "\",\"gameHow\":\"" + Jesc(how) +
 		      "\",\"gameData\":" + (dataOk ? "true" : "false") +
-		      "\",\"gameCef\":" + (cefOk ? "true" : "false") +
-		      "\",\"gameError\":\"" + Jesc(gErr) +
+		      ",\"gameCef\":" + (cefOk ? "true" : "false") +
+		      ",\"gameError\":\"" + Jesc(gErr) +
 		      "\",\"version\":" + std::to_string((int)PROTOCOL_VERSION) +
-		      "\",\"master\":\"" + Jesc(g_masterHost + ":" + std::to_string(g_masterPort)) +
+		      ",\"master\":\"" + Jesc(g_masterHost + ":" + std::to_string(g_masterPort)) +
 		      "\",\"rcon\":\"" + Jesc(g_rconPw) +
 		      "\",\"pass\":\"" + Jesc(g_pass) +
 		      "\",\"profiles\":" + ProfilesToJson() + "}");
@@ -1241,7 +1257,7 @@ static void HandleQuery(const char* request, void*)
 			Reply("{\"reply\":\"game\",\"ok\":" + std::string(exe.empty() ? "false" : "true") +
 			      ",\"path\":\"" + Jesc(exe) + "\",\"how\":\"" + Jesc(how) +
 			      "\",\"data\":" + (dataOk ? "true" : "false") +
-			      "\",\"cef\":" + (cefOk ? "true" : "false") +
+			      ",\"cef\":" + (cefOk ? "true" : "false") +
 			      ",\"error\":\"" + Jesc(err) + "\"}");
 		}).detach();
 	}else if(cmd == "diag"){
@@ -1333,6 +1349,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 	case WM_SIZE:
 		if(g_resize) g_resize(LOWORD(lParam), HIWORD(lParam));
 		break;
+	case WM_DPICHANGED:{
+		// moved to a monitor with another scale: take the size Windows suggests
+		const RECT* r = (const RECT*)lParam;
+		SetWindowPos(hWnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+		             SWP_NOZORDER | SWP_NOACTIVATE);
+		return 0;
+	}
 	case WM_DESTROY:
 		if(g_close) g_close();
 		PostQuitMessage(0);
@@ -1361,6 +1384,8 @@ static HWND MakeHostWindow(HINSTANCE hInst, int nCmdShow, int w, int h)
 	                       CW_USEDEFAULT, CW_USEDEFAULT,
 	                       rc.right - rc.left, rc.bottom - rc.top,
 	                       nullptr, nullptr, hInst, nullptr);
+	// the A call above cannot carry the em dash (it showed as "â€”")
+	SetWindowTextW(g_hWnd, L"Liberty City Stories Online \x2014 Launcher");
 	// open filling the screen (the selftest keeps it hidden); the CEF view
 	// follows the size through WM_SIZE -> cefui_resize
 	ShowWindow(g_hWnd, nCmdShow == SW_HIDE ? SW_HIDE : SW_SHOWMAXIMIZED);
@@ -1496,6 +1521,16 @@ static int SelfTest(bool cefLoaded)
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 {
+	// Per-monitor DPI awareness, before any window exists. CEF renders DPI
+	// aware; a DPI-unaware host got a scaled-down client size while the page
+	// laid out at the real scale, so on a 125-150% display the right side and
+	// the bottom of the page (most of the server list) were cut off.
+	{
+		typedef BOOL (WINAPI* SetDpiCtxFn)(HANDLE);
+		SetDpiCtxFn setCtx = (SetDpiCtxFn)GetProcAddress(GetModuleHandleA("user32.dll"),
+		                                                "SetProcessDpiAwarenessContext");
+		if(setCtx) setCtx((HANDLE)-4);   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+	}
 	g_log = fopen("launcher.log", "w");
 	LoadConfig();
 	LoadProfiles();
