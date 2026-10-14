@@ -157,6 +157,7 @@ static void TestStateCodecs()
 	vs.velX = 500; vs.velY = -500; vs.velZ = 0;
 	vs.steer = -128; vs.gas = 200; vs.brake = 0;
 	vs.flags = VEH_ENGINE | VEH_SIREN; vs.health = 999;
+	vs.doors[0] = 0; vs.doors[1] = 255; vs.doors[2] = 128; vs.doors[3] = 64; vs.doors[4] = 1; vs.doors[5] = 200;
 
 	BitWriter w2; WriteVehicleState(w2, vs);
 	BitReader r2(w2.Data(), w2.ByteSize());
@@ -168,6 +169,7 @@ static void TestStateCodecs()
 	CHECK(vout.velX == vs.velX && vout.velY == vs.velY && vout.velZ == vs.velZ);
 	CHECK(vout.steer == vs.steer && vout.gas == vs.gas && vout.brake == vs.brake);
 	CHECK(vout.flags == vs.flags && vout.health == vs.health);
+	for(int i = 0; i < 6; i++) CHECK(vout.doors[i] == vs.doors[i]);
 	CHECK(r2.Ok());
 }
 
@@ -464,6 +466,7 @@ static void TestVehicleMessages()
 	MsgVehSpawn vs;
 	vs.vehicleId = 1; vs.modelId = 401;
 	vs.x = 100.5f; vs.y = -200.25f; vs.z = 12.0f; vs.heading = 1.5f;
+	vs.ownerId = 7;
 	BitWriter w3; BeginMsg(w3, MSG_VEH_SPAWN); WriteVehSpawn(w3, vs);
 	BitReader r3(w3.Data(), w3.ByteSize());
 	CHECK((MsgType)r3.ReadU8() == MSG_VEH_SPAWN);
@@ -471,6 +474,7 @@ static void TestVehicleMessages()
 	CHECK(ReadVehSpawn(r3, vs2));
 	CHECK(vs2.vehicleId == 1 && vs2.modelId == 401);
 	CHECK(vs2.x == 100.5f && vs2.y == -200.25f && vs2.z == 12.0f && vs2.heading == 1.5f);
+	CHECK(vs2.ownerId == 7);
 	CHECK(r3.Ok());
 
 	// seat math: passenger slots are seat-1 (0 = driver)
@@ -611,11 +615,11 @@ static void TestVehicleOccupancy()
 }
 
 // ---------------------------------------------------------------------------
-// v6 MSG_VEH_ENTER: the vehicle position rides along (placement of client-
+// v8 MSG_VEH_ENTER: the vehicle position rides along (placement of client-
 // created cars, and where the server has the car for late joiners)
 static void TestVehEnterPosition()
 {
-	CHECK(PROTOCOL_VERSION == 6);
+	CHECK(PROTOCOL_VERSION == 8);
 	MsgVehEnter ve;
 	ve.playerId = 3; ve.vehicleId = 0xFFFF; ve.seat = 0; ve.modelId = 151;
 	ve.x = 1122.125f; ve.y = -562.5f; ve.z = 25.0f; ve.heading = 1.25f;
@@ -628,7 +632,7 @@ static void TestVehEnterPosition()
 	CHECK(got.x == ve.x && got.y == ve.y && got.z == ve.z && got.heading == ve.heading);
 	CHECK(r.BitsLeft() < 8);
 
-	// a v5 enter (no position) is a short read: refused, never half-applied
+	// a pre-v8 enter (no position) is a short read: refused, never half-applied
 	BitWriter w5;
 	w5.WriteU8(3); w5.WriteU16(0xFFFF); w5.WriteU8(0); w5.WriteU16(151);
 	BitReader r5(w5.Data(), w5.ByteSize());
@@ -654,9 +658,10 @@ static void TestMoveReference()
 
 // The server's player-state rule (ValidateMove + MoveReference + adopt unless
 // REF_REJECT + violation ledger), replayed on the reported scenario: a seated
-// driver whose flagged warp packet was lost. Before v6 every later state was
+// driver whose flagged warp packet was lost. Before this every later state was
 // refused against the stale reference: the player froze for everyone and was
-// kicked. Now the server re-anchors well before the kick threshold.
+// kicked unless the client could act on the corrections. Now the server
+// re-anchors well before the kick threshold.
 struct RefSim {
 	PlayerState ref;
 	MoveReference streak;
@@ -712,35 +717,6 @@ static void TestLostTeleportResync()
 	CHECK(kicked);
 }
 
-// vehicles: a >100 m jump is refused, but a driver that keeps reporting the
-// car there re-anchors it instead of freezing it forever
-static void TestVehicleTeleportResync()
-{
-	VehicleState ref;
-	ref.xMm = QuantPos(1000.0f); ref.yMm = QuantPos(-600.0f);
-	MoveReference streak;
-	VehicleState st = ref;
-	float x = 1150.0f;   // warped 150 m
-	int adopted = -1;
-	for(int i = 0; i < 30; i++){
-		x += 1.0f; st.xMm = QuantPos(x);
-		bool tp = (ValidateVehicleMove(ref, st, TICK_DT) & VAL_TELEPORT) != 0;
-		if(streak.Judge(tp) != REF_REJECT){
-			ref = st;
-			if(adopted < 0) adopted = i;
-		}
-	}
-	CHECK(adopted == MOVE_RESYNC_REJECTS - 1);
-	CHECK(ref.xMm == QuantPos(x));
-	// a lone glitch packet is still dropped and the next good state adopted
-	MoveReference s2;
-	VehicleState glitch = ref, good = ref;
-	glitch.xMm += QuantPos(500.0f);
-	good.xMm += QuantPos(1.0f);
-	CHECK(s2.Judge((ValidateVehicleMove(ref, glitch, TICK_DT) & VAL_TELEPORT) != 0) == REF_REJECT);
-	CHECK(s2.Judge((ValidateVehicleMove(ref, good, TICK_DT) & VAL_TELEPORT) != 0) == REF_ADOPT);
-}
-
 // client-created car placement: the client's position when sane and close to
 // the player's accepted state, else the player's state
 static void TestPlaceNewVehicle()
@@ -771,31 +747,6 @@ static void TestPlaceNewVehicle()
 	MsgVehEnter zero;
 	CHECK(!PlaceNewVehicle(ref, zero, x, y, z, h));
 	CHECK_NEAR(x, 1120.0f, 0.001f);
-}
-
-static void TestVehicleStreamDecision()
-{
-	CHECK(VehicleStreamDecision(false, false, false) == STREAM_NONE);
-	CHECK(VehicleStreamDecision(false, false, true) == STREAM_NONE);
-	CHECK(VehicleStreamDecision(true, false, true) == STREAM_NONE);    // left range
-	CHECK(VehicleStreamDecision(false, true, false) == STREAM_ENTER);  // entered: at once
-	CHECK(VehicleStreamDecision(false, true, true) == STREAM_ENTER);
-	CHECK(VehicleStreamDecision(true, true, false) == STREAM_NONE);
-	CHECK(VehicleStreamDecision(true, true, true) == STREAM_KEYFRAME);
-
-	// a viewer that walks out of range and back gets the state again on
-	// re-entry, and keyframes (every other tick here) while in range
-	bool was = false;
-	int enters = 0, keys = 0;
-	const bool inRange[] = { true, true, true, false, false, true, true };
-	for(int tick = 0; tick < 7; tick++){
-		StreamSend s = VehicleStreamDecision(was, inRange[tick], tick % 2 == 0);
-		if(s == STREAM_ENTER) enters++;
-		if(s == STREAM_KEYFRAME) keys++;
-		was = inRange[tick];
-	}
-	CHECK(enters == 2);   // ticks 0 and 5
-	CHECK(keys == 2);     // ticks 2 and 6
 }
 
 static void TestInventoryMessages()
@@ -1521,9 +1472,7 @@ int main()
 	TestVehEnterPosition();
 	TestMoveReference();
 	TestLostTeleportResync();
-	TestVehicleTeleportResync();
 	TestPlaceNewVehicle();
-	TestVehicleStreamDecision();
 	TestInventoryMessages();
 	TestProfileStore();
 	TestProfileAuth();

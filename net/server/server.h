@@ -23,6 +23,7 @@ struct ServerConfig {
 	std::string gamemode = "survivor";     // survivor | freeroam
 	bool announce = false;                 // list on master server
 	std::string master = "127.0.0.1";      // master server host
+	std::string publicIp;                  // WAN address to list (port-forwarded LAN box); empty = LAN IP
 	uint16_t masterPort = rnet::DEFAULT_MASTER_PORT;
 	bool lanDiscover = true;
 	std::string rconPassword = "";
@@ -47,7 +48,7 @@ struct ServerPlayer {
 	bool spawned = false;
 	bool alive = false;
 	rnet::PlayerState state;         // latest client-reported
-	float lastStateTime = 0.0;
+	double lastStateTime = 0.0;
 	double respawnAt = 0.0;          // server clock seconds
 	// authoritative vitals
 	uint8_t health = 100, armour = 0;
@@ -58,10 +59,6 @@ struct ServerPlayer {
 	int teleportBurst = 0;            // client-flagged teleports in the current window
 	double teleportWindowStart = 0.0;
 	rnet::MoveReference moveRef;      // refused-move streak (re-anchor, rnet_validator.h)
-	// vehicle streaming: which vehicles were in this player's range last tick
-	// (entering range sends the state at once) and when the next keyframe is due
-	bool vehInRange[rnet::MAX_VEHICLES] = {};
-	double nextVehKeyframe = 0.0;
 	// tough validator state (rnet_validator.h)
 	rnet::RateLimiter msgRate;        // every packet — flood defence
 	rnet::RateLimiter chatRate;       // chat lines — spam defence
@@ -92,9 +89,10 @@ struct ServerVehicle {
 	uint16_t modelId = 0;
 	rnet::VehicleState state;
 	uint8_t driverId = 0xFF;
+	uint8_t ownerId = 0xFF;            // player whose enter allocated it (0xFF = static/admin)
 	uint8_t occupants[8];            // seat -> playerId (0xFF = free)
-	float lastStateTime = 0.0;
-	rnet::MoveReference moveRef;     // refused-teleport streak (re-anchor)
+	int teleportDrops = 0;           // consecutive driver states dropped as teleports
+	double lastStateTime = 0.0;
 };
 
 class GameMode;
@@ -126,12 +124,7 @@ public:
 	                 uint16_t skin, uint8_t health, uint8_t armour);
 	void KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId);
 	void TeleportPlayer(uint8_t playerId, float x, float y, float z, float heading);
-	// excludeId: a player who already holds this car locally (it entered a car it
-	// spawned itself) must NOT receive the MSG_VEH_SPAWN echo — it adopts its own
-	// local entity from the MSG_VEH_ENTER echo instead. Broadcasting the spawn to
-	// that player would make it build a duplicate puppet of a car it already owns.
-	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading,
-	                            bool permanent, uint8_t excludeId = 0);
+	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent, uint8_t ownerId = 0xFF);
 	void RemoveVehicle(uint16_t vehicleId);
 	void SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour);
 	void BroadcastScores();
@@ -168,8 +161,6 @@ private:
 	void HandleVehEnter(ServerPlayer* p, rnet::BitReader& r);
 	void HandleVehExit(ServerPlayer* p, rnet::BitReader& r);
 	void ClearPlayerVehicles(ServerPlayer* p, bool broadcast); // drop all seats held by p
-	void StreamVehicles(double t);    // stream-in + keyframes of vehicle states (Tick)
-	void ForgetVehicleSlot(int slot); // nobody has seen this vehicle slot yet
 	void HandleRcon(ServerPlayer* p, rnet::BitReader& r, bool auth);
 	void LoadVehicleSpawns(const std::string& path); // vehicles.cfg -> permanent vehicles
 
@@ -207,6 +198,7 @@ private:
 	double m_lastNetStats = 0.0;
 	double m_lastWorldUpdate = 0.0;
 	double m_lastPingBroadcast = 0.0;
+	double m_lastReconcile = 0.0;     // 1 Hz out-of-range player + vehicle state heartbeat
 	uint64_t m_totalBytesIn = 0, m_totalBytesOut = 0;
 
 	friend class GameMode;

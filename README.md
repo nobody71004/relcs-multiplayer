@@ -45,7 +45,7 @@ This fork adds a full multiplayer stack on top of the port:
 | Launcher (CEF GUI) | `net/launcher/` | Chromium/CEF launcher: server browser (master list + per-username favorites), settings, join flow, in-game UI host |
 | Dedicated server | `net/server/` | 20 Hz authoritative server: movement anticheat, ped/vehicle puppets, gamemodes, resource packs, static vehicle spawns, in-band RCON, SQLite player profiles |
 | Master server | `net/master/` | server list (30 s announce, 90 s expiry) + favorites in SQLite (`master.db`), so a player's list follows the nickname across machines |
-| Bot / test client | `net/bot/` | scriptable scenario bot (roam/combat/drive/chaos/solo/cruise/watch), `-master-query`, `-rcon`/`-cmd` |
+| Bot / test client | `net/bot/` | scriptable scenario bot (roam/combat/drive/chaos/fight/solo/cruise/watch), `-master-query`, `-rcon`/`-cmd` |
 | Agent | `net/agent/` | tracing/telemetry harness |
 | Game hooks | `src/net/` | nethooks (HUD/chat/console/admin, ped + vehicle puppets), netclient, CEF HUD glue |
 | Tests | `net/tests/` | 3287-check unit suite (protocol codecs, validator, profile store, resources) |

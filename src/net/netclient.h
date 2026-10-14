@@ -40,7 +40,7 @@ public:
 		// vehicle events: arg = vehicleId, model = modelId, id = playerId,
 		// kind = seat, veh = VehicleState (EV_VEH_STATE), state = position
 		// (EV_VEH_SPAWN, and EV_VEH_ENTER: where the server has the vehicle)
-		EV_VEH_SPAWN,      // a net vehicle exists (state carries spawn pos/heading)
+		EV_VEH_SPAWN,      // a net vehicle exists (state carries spawn pos/heading, id = owner)
 		EV_VEH_ENTER,      // a player took a seat (kind = seat)
 		EV_VEH_EXIT,       // a player left a vehicle
 		EV_VEH_STATE,      // driver state update (veh)

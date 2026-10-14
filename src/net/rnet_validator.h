@@ -151,8 +151,7 @@ inline int32_t ValidateMoney(int32_t reported, int32_t& seen, int32_t& granted, 
 
 // ---------------------------------------------------------------------------
 // movement reference — whether a refused move keeps being refused.
-// The server adopts a player/vehicle state as its reference only when it
-// validates. A one-off discontinuity the server never learnt about (a flagged
+// The server adopts a player state as its reference only when it validates. A one-off discontinuity the server never learnt about (a flagged
 // teleport lost in transit, a correction a seated client cannot apply) would
 // otherwise make every later state fail against the stale reference, freezing
 // the entity for everyone forever. Judge() re-anchors after a streak of
@@ -185,7 +184,7 @@ struct MoveReference {
 // ---------------------------------------------------------------------------
 // where a client-created car (VEH_ENTER 0xFFFF) goes: the position the client
 // reports when it is sane and close to the player's accepted state, else the
-// player's accepted state (pre-v6 behaviour)
+// player's accepted state (pre-v8 behaviour)
 // ---------------------------------------------------------------------------
 inline bool PlaceNewVehicle(const PlayerState& ref, const MsgVehEnter& m,
                             float& x, float& y, float& z, float& heading)
@@ -204,22 +203,6 @@ inline bool PlaceNewVehicle(const PlayerState& ref, const MsgVehEnter& m,
 	if(std::isfinite(m.heading))
 		heading = m.heading;
 	return true;
-}
-
-// ---------------------------------------------------------------------------
-// per-viewer vehicle streaming decision (one vehicle, one viewer, one tick)
-// ---------------------------------------------------------------------------
-enum StreamSend : uint8_t {
-	STREAM_NONE     = 0,
-	STREAM_ENTER    = 1,  // just came into range: send now, reliably
-	STREAM_KEYFRAME = 2,  // still in range, keyframe due: send unreliably
-};
-
-inline StreamSend VehicleStreamDecision(bool wasInRange, bool inRange, bool keyframeDue)
-{
-	if(!inRange) return STREAM_NONE;
-	if(!wasInRange) return STREAM_ENTER;
-	return keyframeDue ? STREAM_KEYFRAME : STREAM_NONE;
 }
 
 } // namespace rnet

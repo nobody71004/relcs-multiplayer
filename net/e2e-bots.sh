@@ -12,12 +12,13 @@
 #          must see the player (MSG_SPAWN + state), the car, the occupancy and
 #          the car moving, converging with where the driver really is
 # Phase 4: lost relocation — the driver's car is warped 150 m and the flagged
-#          state packets are lost in transit: the server must re-anchor instead
-#          of freezing (or kicking) the driver, and the observer must converge
+#          state packets are lost in transit: the driver must not be frozen or
+#          kicked, and the observer must converge on wherever it ends up
+#          (4b: the driver cannot act on corrections — the server re-anchors)
 # Phase 5: out-of-range parked car — the car drives out of the observer's
 #          streaming range, parks and is left; the observer then relocates next
-#          to it and must see it where it really is (stream-in), not where it
-#          was last relayed
+#          to it and must see it where it really is (the server's vehicle
+#          heartbeat), not where it was last relayed
 #
 # Usage: ./e2e-bots.sh            (build first: ./build-linux.sh)
 set -u
@@ -183,15 +184,33 @@ wait_bots
 result Warper; result WarpWatcher
 grep "\[BOT\] CRUISE" "$OUT/Warper.log"
 grep "\[BOT\] WATCH" "$OUT/WarpWatcher.log"
-grep -E "\[resync\]" "$OUT/server4.log" | head -4
 awk -v MODE=vehicle -v MIN=6 -f e2e-converge.awk "$OUT"/Warper.log "$OUT"/WarpWatcher.log \
 	|| fail "phase 4 vehicle convergence after the warp"
 awk -v MODE=player -v MIN=6 -f e2e-converge.awk "$OUT"/Warper.log "$OUT"/WarpWatcher.log \
 	|| fail "phase 4 player convergence after the warp"
 stop_server
 
+# 4b: same warp, but the driver cannot act on the server's corrections. The
+# server must re-anchor on where the driver really is (MOVE_RESYNC_REJECTS),
+# not keep refusing it until the movement-violation kick
+step "phase 4b: lost relocation, driver ignores corrections (server re-anchor)"
+start_server "$OUT/server4b.log" -gamemode freeroam -stream_distance 1000
+bot Stubborn -scenario cruise -duration 30 -vehmodel 151 -jump-at 8 -jump-dist 150 -drop-jump -ignore-corrections -seed 9
+sleep 3
+bot StubbornWatcher -scenario watch -duration 22 -expect-driver -seed 10
+wait_bots
+result Stubborn; result StubbornWatcher
+grep "\[BOT\] WATCH" "$OUT/StubbornWatcher.log"
+grep -E "\[resync\]" "$OUT/server4b.log" | head -4
+grep -q "\[resync\] Stubborn re-anchored" "$OUT/server4b.log" || fail "phase 4b: server never re-anchored the driver"
+awk -v MODE=vehicle -v MIN=6 -f e2e-converge.awk "$OUT"/Stubborn.log "$OUT"/StubbornWatcher.log \
+	|| fail "phase 4b vehicle convergence after the warp"
+awk -v MODE=player -v MIN=6 -f e2e-converge.awk "$OUT"/Stubborn.log "$OUT"/StubbornWatcher.log \
+	|| fail "phase 4b player convergence after the warp"
+stop_server
+
 # ---------------------------------------------------------------- phase 5
-step "phase 5: out-of-range parked car (stream-in on entering range)"
+step "phase 5: out-of-range parked car (vehicle heartbeat)"
 start_server "$OUT/server5.log" -gamemode freeroam
 # park ~280+ m from every spawn point (streaming range 200 m). Tolerance 3 m:
 # like the game client, the driver streams no state on the tick it gets out,
