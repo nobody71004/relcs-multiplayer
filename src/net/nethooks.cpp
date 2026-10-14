@@ -1432,9 +1432,11 @@ static void NetGame_PollUi(void)
 			s_chatBuf[s_chatLen] = 0;
 			if(s_chatLen > 0){
 				if(s_chatMode == 'b'){
-					char cmd[128];
-					snprintf(cmd, sizeof cmd, "broadcast %s", s_chatBuf);
-					s_net.SendRconCmd(cmd);
+					// admin broadcast: route through SendRconFmt so the same client-side
+					// admin gate (and "rcon not configured" feedback) applies as every
+					// other admin command — never fire an unauthenticated MSG_RCON_CMD
+					// the server will only bounce with "not authenticated"
+					SendRconFmt("broadcast %s", s_chatBuf);
 				}else
 					s_net.SendChat(s_chatBuf);
 			}
