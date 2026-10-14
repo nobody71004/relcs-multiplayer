@@ -1672,6 +1672,13 @@ void Server::RestartGameMode()
 	Log("[GAMEMODE] %s restarted", m_gamemode ? m_gamemode->Name() : "?");
 }
 
+// The net projects build with RTTI off (premake rtti "Off"), so dynamic_cast
+// on a GameMode is undefined behaviour there: identify the mode by name.
+static LibertyCitySurvivorMode* AsSurvivor(GameMode* gm)
+{
+	return (gm && strcmp(gm->Name(), "survivor") == 0) ? static_cast<LibertyCitySurvivorMode*>(gm) : nullptr;
+}
+
 void Server::SetServerVar(const std::string& key, const std::string& value)
 {
 	if(key == "hostname") m_cfg.hostname = value;
@@ -1682,11 +1689,11 @@ void Server::SetServerVar(const std::string& key, const std::string& value)
 	else if(key == "hour") m_cfg.hour = (uint8_t)atoi(value.c_str());
 	else if(key == "minute") m_cfg.minute = (uint8_t)atoi(value.c_str());
 	else if(key == "lcs_scorelimit" && m_gamemode){
-		auto* lcs = dynamic_cast<LibertyCitySurvivorMode*>(m_gamemode);
+		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->scoreLimit = atoi(value.c_str());
 	}
 	else if(key == "lcs_roundtime" && m_gamemode){
-		auto* lcs = dynamic_cast<LibertyCitySurvivorMode*>(m_gamemode);
+		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->roundTime = (float)atof(value.c_str());
 	}
 	else {
