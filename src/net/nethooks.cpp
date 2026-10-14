@@ -115,6 +115,7 @@ static void SyncPuppetToRw(CEntity* ent)
 // ---------------------------------------------------------------------------
 struct NetVehicle {
 	CVehicle* veh = nil;
+	int32 handle = -1;         // pool handle of veh (slot + reuse counter)
 	uint16_t modelId = 0;
 	bool puppet = false;       // created by the netcode (vs a local game object)
 	bool rejected = false;     // invalid model — drop instead of retrying forever
@@ -131,10 +132,59 @@ static CVehicle* s_pendingVeh = nil;   // local car waiting for its server id
 static uint16_t s_pendingModel = 0;
 static std::map<uint8_t, std::pair<uint16_t, uint8_t>> s_pendingSeat; // remote ped -> (veh, seat)
 
+// Bind a game vehicle to a net id. The pool handle is kept so a pointer the
+// engine has since freed (or reused for another vehicle) is never trusted.
+static void BindNetVehicle(uint16_t netId, NetVehicle& nv, CVehicle* v)
+{
+	nv.veh = v;
+	nv.handle = v ? CPools::GetVehicleRef(v) : -1;
+	if(v) s_vehByPtr[v] = netId;
+}
+
+// The engine can free a net vehicle behind our back: puppets built from the
+// join snapshot while the game was still starting were wiped by the new-game
+// pool reset, and the slots were reused by the world's trains and later by the
+// next car anyone spawned. The stale entries then positioned those objects
+// every frame — a fresh i8 was dragged onto a train 1 km away and its seated
+// driver vanished with it. Drop a stale binding (never delete through it);
+// UpdateNetVehicles rebuilds the puppet on the next frame.
+static bool NetVehicleStale(uint16_t netId, NetVehicle& nv)
+{
+	if(!nv.veh) return false;
+	// the object must still be ours alone: a newer binding of the same pointer
+	// (slot reused by another net vehicle) wins
+	auto own = s_vehByPtr.find(nv.veh);
+	bool ok = own != s_vehByPtr.end() && own->second == netId &&
+	          CPools::GetVehicle(nv.handle) == nv.veh &&
+	          nv.veh->GetModelIndex() == (int32)nv.modelId &&
+	          (!nv.puppet || (nv.veh->VehicleCreatedBy == MISSION_VEHICLE && !nv.veh->IsTrain()));
+	if(ok) return false;
+	fprintf(stderr, "[VEHSYNC] net vehicle %d lost its game object (%p) — rebuilding\n",
+	        (int)netId, (void*)nv.veh);
+	fflush(stderr);
+	auto pit = s_vehByPtr.find(nv.veh);
+	if(pit != s_vehByPtr.end() && pit->second == netId)
+		s_vehByPtr.erase(pit);
+	nv.veh = nil;
+	nv.handle = -1;
+	nv.puppet = false;
+	return true;
+}
+
 static uint16_t NetIdOfVehicle(CVehicle* v)
 {
 	auto it = s_vehByPtr.find(v);
-	return it == s_vehByPtr.end() ? rnet::VEHICLE_NONE : it->second;
+	if(it == s_vehByPtr.end()) return rnet::VEHICLE_NONE;
+	uint16_t id = it->second;
+	auto vit = s_vehicles.find(id);
+	if(vit == s_vehicles.end() || vit->second.veh != v){
+		// left over from a freed vehicle: must never name a new one
+		s_vehByPtr.erase(it);
+		return rnet::VEHICLE_NONE;
+	}
+	if(NetVehicleStale(id, vit->second))   // drops the s_vehByPtr entry itself
+		return rnet::VEHICLE_NONE;
+	return id;
 }
 
 static void UnseatNetPed(CPed* ped)
@@ -373,6 +423,7 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 		x = me.x; y = me.y; z = me.z; // keep smooth* latch in-world too
 	}
 	NetVehicle& nv = s_vehicles[netId];
+	NetVehicleStale(netId, nv);
 	if(!nv.veh){
 		if(nv.modelId == 0){
 			nv.modelId = modelId;
@@ -388,11 +439,10 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 			             (int)netId, (int)nv.modelId);
 		}
 		if(!nv.rejected){
-			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
+			BindNetVehicle(netId, nv, CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH));
 			// an adopted game train is owned by the game — only constructed
 			// puppets may be deleted by RemoveNetVehicle
 			nv.puppet = nv.veh != nil && nv.veh->VehicleCreatedBy == MISSION_VEHICLE;
-			if(nv.veh) s_vehByPtr[nv.veh] = netId;
 		}
 	}
 	return nv;
@@ -401,13 +451,12 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 static void AdoptNetVehicle(uint16_t netId, CVehicle* veh, uint16_t modelId)
 {
 	NetVehicle& nv = s_vehicles[netId];
-	nv.veh = veh;
 	nv.modelId = modelId;
 	nv.puppet = false;
+	BindNetVehicle(netId, nv, veh);
 	CVector p = veh->GetPosition();
 	nv.smoothX = p.x; nv.smoothY = p.y; nv.smoothZ = p.z;
 	nv.smoothH = std::atan2(-veh->GetForward().x, veh->GetForward().y);
-	s_vehByPtr[veh] = netId;
 	// our car is a net entity now: keep the population from reclaiming it
 	veh->VehicleCreatedBy = MISSION_VEHICLE;
 }
@@ -445,6 +494,7 @@ static void RemoveNetVehicle(uint16_t netId)
 	auto it = s_vehicles.find(netId);
 	if(it == s_vehicles.end()) return;
 	NetVehicle& nv = it->second;
+	NetVehicleStale(netId, nv);   // never delete through a freed pointer
 	if(nv.veh){
 		s_vehByPtr.erase(nv.veh);
 		if(nv.puppet){
@@ -508,6 +558,7 @@ static void UpdateNetVehicles(float dt)
 	bool diag = NowSec() - s_lastVehDiag >= 2.0;
 	if(diag) s_lastVehDiag = NowSec();
 	for(auto& kv : s_vehicles){
+		NetVehicleStale(kv.first, kv.second);
 		if(diag && kv.second.veh && kv.first != s_myVehNet){
 			CVehicle* v = kv.second.veh;
 			CVector p = v->GetPosition();
@@ -527,10 +578,9 @@ static void UpdateNetVehicles(float dt)
 		NetVehicle& nv = kv.second;
 		if(!nv.veh){
 			if(nv.rejected) continue;
-			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
+			BindNetVehicle(kv.first, nv, CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH));
 			if(!nv.veh) continue;
 			nv.puppet = nv.veh->VehicleCreatedBy == MISSION_VEHICLE; // trains adopted
-			s_vehByPtr[nv.veh] = kv.first;
 		}
 		CVehicle* veh = nv.veh;
 		// belt & braces: streaming eviction kills the clump — rebuild it
@@ -2519,6 +2569,11 @@ void NetGame_Frame(void)
 
 	float dt = CTimer::GetTimeStep() / 50.0f; // frames -> seconds-ish (50 fps units)
 	if(dt <= 0.0f || dt > 0.5f) dt = 0.02f;
+
+	// drop bindings to vehicles the engine freed before any event handler
+	// (seat, state, despawn) can touch them
+	for(auto& kv : s_vehicles)
+		NetVehicleStale(kv.first, kv.second);
 
 	// events
 	NetClient::Event ev;
