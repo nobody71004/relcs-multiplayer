@@ -40,6 +40,8 @@
 #include "Pickups.h"
 #include "Vehicle.h"
 #include "Automobile.h"
+#include "Camera.h"
+#include "VisibilityPlugins.h"
 #include "Bike.h"
 #include "Boat.h"
 #include "CarCtrl.h"
@@ -499,6 +501,28 @@ static void ApplyNetDoors(CAutomobile* car, const uint8_t* ratios)
 // freeze/unfreeze based on who drives
 static void UpdateNetVehicles(float dt)
 {
+	// render-state probe for remote-driven cars, every 2 s: where the puppet
+	// is, how far from the camera, its fade alpha and its driver's state —
+	// enough to tell "not drawn" apart from "drawn somewhere else"
+	static double s_lastVehDiag = 0.0;
+	bool diag = NowSec() - s_lastVehDiag >= 2.0;
+	if(diag) s_lastVehDiag = NowSec();
+	for(auto& kv : s_vehicles){
+		if(diag && kv.second.veh && kv.first != s_myVehNet){
+			CVehicle* v = kv.second.veh;
+			CVector p = v->GetPosition();
+			CVector c = TheCamera.GetPosition();
+			float cd = (p - c).Magnitude();
+			int alpha = -1;
+#ifdef VIS_DISTANCE_ALPHA
+			if(v->m_rwObject) alpha = CVisibilityPlugins::GetObjectDistanceAlpha(v->m_rwObject);
+#endif
+			fprintf(stderr, "[VEHDIAG] veh=%d model=%d puppet=%d pos=(%.1f,%.1f,%.1f) camDist=%.1f rw=%d visible=%d alpha=%d fade=%d static=%d driver=%p drvState=%d\n",
+			        (int)kv.first, (int)kv.second.modelId, (int)kv.second.puppet, p.x, p.y, p.z, cd,
+			        (int)(v->m_rwObject != nil), (int)v->bIsVisible, alpha, (int)v->bDistanceFade,
+			        (int)v->GetIsStatic(), (void*)v->pDriver, v->pDriver ? (int)v->pDriver->m_nPedState : -1);
+		}
+	}
 	for(auto& kv : s_vehicles){
 		NetVehicle& nv = kv.second;
 		if(!nv.veh){
@@ -555,6 +579,12 @@ static void UpdateNetVehicles(float dt)
 		veh->SetOrientation(0.0f, 0.0f, nv.smoothH);
 		veh->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 		veh->SetTurnSpeed(0.0f, 0.0f, 0.0f);
+		// CAutomobile::ProcessControl marks a frozen car bIsInSafePosition, so
+		// the world loop skips its ProcessCollision — the only place a
+		// collisionless car is re-sectored. The puppet then stayed listed in its
+		// spawn sector: once it drove off, the renderer never found it, and its
+		// seated driver (drawn as part of the car) vanished with it.
+		veh->RemoveAndAdd();
 		SyncPuppetToRw(veh);
 		if(veh->IsCar() && nv.hasTarget)
 			ApplyNetDoors((CAutomobile*)veh, nv.target.doors);
@@ -1751,9 +1781,24 @@ static void NetGame_PollUi(void)
 // ---------------------------------------------------------------------------
 static std::string s_pendingArg;
 
+// The launcher starts the game without a console, so every [NET]/[VEHSYNC]
+// line was lost and sync bugs reported from real sessions had no evidence.
+// When stderr is not redirected anywhere, write it to reLCS-net-<pid>.log.
+static void EnsureNetLogFile(void)
+{
+	HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+	if(h != nil && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN)
+		return;   // already captured (pipe, file or console)
+	char name[64];
+	snprintf(name, sizeof name, "reLCS-net-%lu.log", GetCurrentProcessId());
+	if(freopen(name, "w", stderr))
+		setvbuf(stderr, nil, _IONBF, 0);
+}
+
 bool NetGame_OnCommandLine(const char* arg)
 {
 	if(s_pendingArg == "-connect"){
+		EnsureNetLogFile();
 		std::string v = arg;
 		size_t c = v.find(':');
 		s_host = v.substr(0, c);
