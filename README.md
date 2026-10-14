@@ -106,8 +106,10 @@ cd net
 ```
 
 Outputs land in `net/bin/Release/`. The game hooks build together with `reLCS.exe`.
-The generated projects pin the VS2019 `v142` toolset — on a machine with only a
-newer toolchain, build with `-p:PlatformToolset=v143`.
+The generated projects target the `v143` toolset (VS 2022 BuildTools), set in
+`net/premake5.lua` and `premake5.lua`, so plain `msbuild` needs no
+`PlatformToolset` override. On a machine without `v143`, change that `toolset`
+line in the premake scripts and regenerate.
 
 On Linux the server, master, bot and unit tests need no game assets:
 
