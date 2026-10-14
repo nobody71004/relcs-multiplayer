@@ -43,7 +43,7 @@
     display: flex;
     overflow: hidden;
     user-select: none;
-    cursor: none;                 /* custom cursor replaces the system one */
+    cursor: default;
     position: relative;
   }
   button, input, select { font: inherit; }
@@ -70,43 +70,13 @@
     transform: perspective(520px) rotateX(62deg) translateY(0);
     transform-origin: 50% 0;
     mask-image: linear-gradient(180deg, transparent, #000 35%, transparent 92%);
-    animation: grid 22s linear infinite;
     opacity: .7;
   }
   @keyframes grid { to { background-position: 0 48px, 48px 0; } }
   #bg::after {
     content: ""; position: absolute; inset: 0;
     background: repeating-linear-gradient(180deg, rgba(0,0,0,0) 0 2px, rgba(0,0,0,.14) 2px 3px);
-    mix-blend-mode: overlay; opacity: .4;
-  }
-  .scanline {
-    position: fixed; left: 0; right: 0; height: 180px; z-index: 1; pointer-events: none;
-    background: linear-gradient(180deg, transparent, rgba(53,224,216,.05) 48%, transparent);
-    animation: sweep 7.5s linear infinite; opacity: .6;
-  }
-  @keyframes sweep { 0% { top: -200px; } 100% { top: 100%; } }
-
-  /* ---- custom cursor + trail ---- */
-  #cursor {
-    position: fixed; z-index: 9999; top: 0; left: 0; width: 26px; height: 26px;
-    margin: -13px 0 0 -13px; pointer-events: none;
-    border: 1.5px solid var(--neon); border-radius: 50%;
-    box-shadow: 0 0 10px rgba(53,224,216,.65), inset 0 0 6px rgba(53,224,216,.35);
-    transition: width .14s ease, height .14s ease, margin .14s ease, border-color .14s ease, background .14s ease;
-    mix-blend-mode: screen;
-  }
-  #cursor::after {
-    content: ""; position: absolute; inset: 0; margin: auto; width: 4px; height: 4px;
-    background: var(--neon); border-radius: 50%; box-shadow: 0 0 6px var(--neon);
-  }
-  #cursor.hot { width: 42px; height: 42px; margin: -21px 0 0 -21px; border-color: var(--accent);
-    box-shadow: 0 0 16px rgba(255,180,58,.6), inset 0 0 10px rgba(255,180,58,.3); }
-  #cursor.hot::after { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
-  #cursor.down { transform: scale(.78); }
-  .trail {
-    position: fixed; z-index: 9998; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px;
-    border-radius: 50%; pointer-events: none; background: var(--neon);
-    mix-blend-mode: screen; opacity: .5;
+    opacity: .25;
   }
   .ripple {
     position: fixed; z-index: 9997; border: 2px solid var(--accent); border-radius: 50%;
@@ -148,7 +118,7 @@
   .nav-item {
     position: relative; text-align: left; padding: 11px 13px 11px 15px; border: none;
     border-radius: var(--radius); background: transparent; color: var(--muted);
-    cursor: none; font-weight: 600; font-size: 13px; letter-spacing: .2px;
+    cursor: pointer; font-weight: 600; font-size: 13px; letter-spacing: .2px;
     display: flex; align-items: center; gap: 11px; overflow: hidden;
     transition: color .18s, background .18s, box-shadow .18s;
   }
@@ -202,12 +172,12 @@
   .btn {
     position: relative; padding: 8px 16px; border-radius: var(--radius);
     border: 1px solid var(--line-2); background: var(--surface-2); color: var(--text);
-    font-size: 13px; font-weight: 600; cursor: none; overflow: hidden;
+    font-size: 13px; font-weight: 600; cursor: pointer; overflow: hidden;
     transition: border-color .18s, background .18s, box-shadow .18s, transform .08s;
   }
   .btn:hover { border-color: #3c475f; background: var(--surface-3); box-shadow: 0 0 0 1px rgba(53,224,216,.1); }
   .btn:active { transform: translateY(1px); }
-  .btn:disabled { opacity: .45; cursor: none; }
+  .btn:disabled { opacity: .45; cursor: pointer; }
   .btn.small { padding: 5px 11px; font-size: 12px; }
   .btn.primary {
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
@@ -221,7 +191,7 @@
   input, select {
     width: 100%; padding: 9px 12px; background: var(--bg-2); color: var(--text);
     border: 1px solid var(--line); border-radius: var(--radius); outline: none; font-size: 13px;
-    cursor: none; transition: border-color .18s, box-shadow .18s;
+    cursor: pointer; transition: border-color .18s, box-shadow .18s;
   }
   input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,180,58,.12); }
   input.mono { font-family: var(--mono); font-size: 12.5px; letter-spacing: .3px; }
@@ -263,20 +233,20 @@
     flex: none; display: flex; align-items: stretch; gap: 16px;
   }
   .hero-card {
-    flex: 1; min-width: 0; border-radius: 14px; padding: 18px 22px; position: relative; overflow: hidden;
+    flex: 1; min-width: 0; border-radius: 12px; padding: 10px 18px; position: relative; overflow: hidden;
+    display: grid; grid-template-columns: 1fr auto; align-items: center; column-gap: 24px;
     background:
       radial-gradient(520px 200px at 88% 0%, rgba(255,138,30,.22), transparent 70%),
       linear-gradient(120deg, rgba(20,26,37,.95), rgba(12,16,23,.95));
     border: 1px solid var(--line-2);
     box-shadow: 0 14px 40px rgba(0,0,0,.4);
-    transform-style: preserve-3d; transition: transform .25s ease, box-shadow .25s ease;
   }
-  .hero-card .tagline { font-size: 11px; letter-spacing: 2.4px; text-transform: uppercase; color: var(--neon); font-weight: 700; }
-  .hero-card .title { font-size: 25px; font-weight: 900; letter-spacing: -.3px; margin: 7px 0 4px; }
+  .hero-card .tagline { grid-column: 1; font-size: 10px; letter-spacing: 2.4px; text-transform: uppercase; color: var(--neon); font-weight: 700; }
+  .hero-card .title { grid-column: 1; font-size: 19px; font-weight: 900; letter-spacing: -.3px; margin: 1px 0 0; }
   .hero-card .title em { font-style: normal; color: var(--accent); text-shadow: 0 0 20px rgba(255,180,58,.4); }
-  .hero-card .sub { color: var(--muted); font-size: 12.5px; max-width: 520px; }
-  .hero-stats { display: flex; gap: 26px; margin-top: 16px; }
-  .hero-stat .n { font-size: 22px; font-weight: 800; font-family: var(--mono); color: var(--text); }
+  .hero-card .sub { display: none; }
+  .hero-stats { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 22px; }
+  .hero-stat .n { font-size: 17px; font-weight: 800; font-family: var(--mono); color: var(--text); }
   .hero-stat .n.live { color: var(--neon); text-shadow: 0 0 14px rgba(53,224,216,.4); }
   .hero-stat .l { font-size: 10.5px; color: var(--faint); text-transform: uppercase; letter-spacing: 1.2px; margin-top: 2px; }
 
@@ -286,7 +256,7 @@
     border-radius: 10px; padding: 4px;
   }
   .tab {
-    padding: 6px 16px; border-radius: 7px; cursor: none; color: var(--muted);
+    padding: 6px 16px; border-radius: 7px; cursor: pointer; color: var(--muted);
     font-weight: 650; font-size: 12.5px; letter-spacing: .3px; display: flex; align-items: center; gap: 7px;
     transition: color .16s, background .16s, box-shadow .16s;
   }
@@ -310,11 +280,11 @@
   th {
     position: sticky; top: 0; z-index: 2; background: rgba(16,21,30,.98); text-align: left;
     font-size: 10.5px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; color: var(--faint);
-    padding: 12px 16px; border-bottom: 1px solid var(--line-2);
+    padding: 9px 16px; border-bottom: 1px solid var(--line-2);
   }
-  td { padding: 11px 16px; border-bottom: 1px solid rgba(34,43,58,.6); font-size: 13px; white-space: nowrap; }
+  td { padding: 8px 16px; border-bottom: 1px solid rgba(34,43,58,.6); font-size: 13px; white-space: nowrap; }
   tr:last-child td { border-bottom: none; }
-  tr.server { cursor: none; transition: background .12s; }
+  tr.server { cursor: pointer; transition: background .12s; }
   tr.server:hover td { background: rgba(53,224,216,.05); }
   tr.server.sel td { background: linear-gradient(90deg, rgba(255,180,58,.12), rgba(255,180,58,.03)); }
   tr.server.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
@@ -391,8 +361,6 @@
 </head>
 <body>
   <div id="bg"></div>
-  <div class="scanline"></div>
-  <div id="cursor"></div>
 
   <nav>
     <div class="brand">
@@ -895,6 +863,10 @@ window.onCefReply = function (json) {
                 (tab === "favorites" ? "" : " — hover a row for map, mode and ping"),
                 msg.note ? "warn" : "ok");
       if (tab === "lan") setNav("navMaster", true, "LAN broadcast active");
+      // the internet list comes straight from the master: its answer is the
+      // master's status (a note means the cached list was shown instead)
+      if (msg.source === "internet")
+        setNav("navMaster", servers.length > 0, "Master: " + (servers.length ? "online" : "no answer"));
       if (servers.length) send("pingall");
       break;
     }
@@ -1135,14 +1107,7 @@ $("filter").addEventListener("keydown", e => {
 //  mouse / cursor effects — all pure front-end, no native calls
 // ======================================================================
 (function cursorFx() {
-  const cur = $("cursor");
-  let cx = window.innerWidth / 2, cy = window.innerHeight / 2;
-  let tx = cx, ty = cy;
-  const HOT = "a,button,.btn,.nav-item,.tab,tr.server,input,select,.chip,[data-remove]";
-  let lastTrail = 0;
-
   document.addEventListener("mousemove", e => {
-    tx = e.clientX; ty = e.clientY;
     // hover-aware server tooltip follows the cursor
     if (hoverAddr) {
       const el = $("tooltip");
@@ -1153,37 +1118,9 @@ $("filter").addEventListener("keydown", e => {
       el.style.left = x + "px";
       el.style.top = y + "px";
     }
-    // lightweight particle trail (throttled)
-    const now = performance.now();
-    if (now - lastTrail > 28) {
-      lastTrail = now;
-      spawnTrail(e.clientX, e.clientY);
-    }
-    // hover state for interactive elements
-    cur.classList.toggle("hot", !!(e.target.closest && e.target.closest(HOT)));
   });
-  document.addEventListener("mousedown", e => {
-    cur.classList.add("down");
-    spawnRipple(e.clientX, e.clientY);
-  });
-  document.addEventListener("mouseup", () => cur.classList.remove("down"));
+  document.addEventListener("mousedown", e => spawnRipple(e.clientX, e.clientY));
 
-  function spawnTrail(x, y) {
-    const t = document.createElement("div");
-    t.className = "trail";
-    t.style.left = x + "px"; t.style.top = y + "px";
-    const hue = Math.random() < 0.5 ? "var(--neon)" : "var(--accent)";
-    t.style.background = hue;
-    document.body.appendChild(t);
-    const born = performance.now();
-    (function fade() {
-      const age = (performance.now() - born) / 420;
-      if (age >= 1) { t.remove(); return; }
-      t.style.opacity = (0.5 * (1 - age)).toFixed(3);
-      t.style.transform = `scale(${1 - age * 0.7})`;
-      requestAnimationFrame(fade);
-    })();
-  }
   function spawnRipple(x, y) {
     const r = document.createElement("div");
     r.className = "ripple";
@@ -1192,29 +1129,6 @@ $("filter").addEventListener("keydown", e => {
     setTimeout(() => r.remove(), 560);
   }
 
-  // smooth trailing cursor ring
-  (function animate() {
-    cx += (tx - cx) * 0.3;
-    cy += (ty - cy) * 0.3;
-    cur.style.transform = `translate(${cx}px, ${cy}px)`;
-    requestAnimationFrame(animate);
-  })();
-
-  // hero card parallax / tilt tied to the pointer
-  const hero = $("heroCard");
-  if (hero) {
-    hero.addEventListener("mousemove", e => {
-      const r = hero.getBoundingClientRect();
-      const px = (e.clientX - r.left) / r.width - 0.5;
-      const py = (e.clientY - r.top) / r.height - 0.5;
-      hero.style.transform = `perspective(900px) rotateX(${(-py * 4).toFixed(2)}deg) rotateY(${(px * 5).toFixed(2)}deg) translateZ(0)`;
-      hero.style.boxShadow = `${(-px * 20).toFixed(0)}px ${(18 - py * 12).toFixed(0)}px 48px rgba(0,0,0,.5)`;
-    });
-    hero.addEventListener("mouseleave", () => {
-      hero.style.transform = "perspective(900px) rotateX(0) rotateY(0)";
-      hero.style.boxShadow = "0 14px 40px rgba(0,0,0,.4)";
-    });
-  }
 })();
 
 // tell the host we are ready
