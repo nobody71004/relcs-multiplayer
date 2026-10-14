@@ -272,6 +272,25 @@ done
 VSPAWN1B=$(grep -c "\[VEH\] spawn id=" "$OUT/server.log")
 echo "server vehicle spawns so far: $VSPAWN1B"
 
+# ---------------------------------------------------------------- phase 1c
+# Late join. One bot takes a car and keeps driving; a second bot joins well
+# afterwards and must still be told about the world that already exists: the
+# spawned player, the vehicle, who sits in it, and its moving state.
+step "phase 1c: late joiner sees an existing driver and car"
+CRUISER=$(spawn_bot "$OUT/cruiser.log" $BIN/relcs-netbot.exe -name Cruiser -server 127.0.0.1:$PORT -scenario cruise -duration 26 -vehmodel 151 -seed 404)
+sleep 9
+LATE=$(spawn_bot "$OUT/late.log" $BIN/relcs-netbot.exe -name LateJoin -server 127.0.0.1:$PORT -scenario roam -expect-world -duration 14 -seed 505)
+wait_result "$OUT/late.log" 30 || FAIL=1
+wait_result "$OUT/cruiser.log" 30 || FAIL=1
+for pid in $CRUISER $LATE; do
+	[ "$pid" != "-1" ] && wait $pid 2>/dev/null
+done
+for f in cruiser late; do
+	RESULT=$(grep -o "RESULT: [A-Z]*" "$OUT/$f.log" | head -1)
+	[ "$RESULT" = "RESULT: PASS" ] && echo "PASS: $f" || { echo "FAIL: $f ($(grep "RESULT:" "$OUT/$f.log" | head -1))"; FAIL=1; }
+done
+echo "late-join: $(grep -o "WORLDSUMMARY.*" "$OUT/late.log" | tail -1)"
+
 # ---------------------------------------------------------------- phase 2
 step "phase 2: LAN discovery"
 $BIN/relcs-netbot.exe -discover -name Probe > "$OUT/discover.log" 2>&1

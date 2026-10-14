@@ -57,6 +57,9 @@ struct BotConfig {
 	bool masterQuery = false;
 	int vehModel = 0; // vehicle model for self-created cars (0 = guess)
 	bool voice = false; // -voice: send a 440 Hz tone as voice and report relayed voice frames
+	// -expect-world: late-joiner check — the world that existed before we joined
+	// (a spawned player seated in a moving vehicle) must reach us
+	bool expectWorld = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,6 +184,7 @@ int main(int argc, char** argv)
 		else if(a == "-master-query") cfg.masterQuery = true;
 		else if(a == "-vehmodel" && hasNext) cfg.vehModel = atoi(argv[++i]);
 		else if(a == "-voice") cfg.voice = true;
+		else if(a == "-expect-world") cfg.expectWorld = true;
 	}
 	if(cfg.seed == 0) cfg.seed = (uint32_t)std::hash<std::string>{}(cfg.name);
 	std::mt19937 rng(cfg.seed);
@@ -212,6 +216,10 @@ int main(int argc, char** argv)
 	int statesSent = 0, correctionsReceived = 0, deathsSelf = 0, spawnsSeen = 0;
 	int killsMade = 0, myScore = 0; // fight scenario: kills dealt + latest scoreboard score
 	int vehStatesSeen = 0, vehEntersSeen = 0; // relayed traffic from other drivers
+	int otherSpawnsSeen = 0;   // MSG_SPAWN for other players (join roster replay included)
+	int peerSeatedStates = 0;  // relayed player states that carry a vehicle seat
+	bool vehMoved = false;     // some relayed vehicle changed position while we watched
+	std::map<uint16_t, VehicleState> vehFirst;   // first relayed state per vehicle
 	std::string failReasons;
 	std::map<uint8_t, PeerView> peers;
 	PlayerState self;
@@ -403,6 +411,7 @@ int main(int argc, char** argv)
 						pv.state.zMm = QuantPos(sp.z);
 						pv.lastSeen = elapsed();
 						sawPeer = true;
+						otherSpawnsSeen++;
 						if(cfg.verbose)
 							std::printf("[%.3f] SPAWN-other id=%d at %.1f %.1f %.1f\n",
 							            elapsed(), (int)sp.playerId, sp.x, sp.y, sp.z);
@@ -417,6 +426,8 @@ int main(int argc, char** argv)
 							pv.state = st;
 							pv.lastSeen = elapsed();
 							sawPeer = true;
+							if(st.vehicleId != VEHICLE_NONE && st.vehicleId != VEHICLE_UNSYNCED)
+								peerSeatedStates++;
 						}
 					}
 					break;
@@ -615,6 +626,12 @@ int main(int argc, char** argv)
 					VehicleState vst;
 					if(ReadVehicleState(r, vst)){
 						vehStatesSeen++;
+						auto vf = vehFirst.find(vst.vehicleId);
+						if(vf == vehFirst.end())
+							vehFirst[vst.vehicleId] = vst;
+						else if(DistMm(vf->second.xMm, vf->second.yMm, vf->second.zMm,
+						               vst.xMm, vst.yMm, vst.zMm) > 2.0f)
+							vehMoved = true;
 						if(cfg.verbose && vehStatesSeen % 40 == 1)
 							std::printf("[%.3f] VEH_STATE veh=%d at %.1f %.1f %.1f\n",
 							            elapsed(), (int)vst.vehicleId,
@@ -756,8 +773,12 @@ int main(int argc, char** argv)
 
 		// drive: cycle enter/drive/exit — join a vehicle someone else created
 		// when one exists (passenger flow), otherwise spawn our own and drive
-		if(cfg.scenario == "drive" && gotSpawn && t - lastVehCycle >= 8.0){
+		// cruise: take our own car once, 2 s in, and keep driving it to the end
+		bool cruise = (cfg.scenario == "cruise");
+		if((cfg.scenario == "drive" && gotSpawn && t - lastVehCycle >= 8.0) ||
+		   (cruise && gotSpawn && myVehicle == 0xFFFF && t - lastVehCycle >= 2.0)){
 			lastVehCycle = t;
+			if(cruise) seenVehId = 0xFFFF;   // always our own car, never a passenger seat
 			if(myVehicle == 0xFFFF){
 				BitWriter w;
 				BeginMsg(w, MSG_VEH_ENTER);					MsgVehEnter ve;
@@ -912,6 +933,17 @@ int main(int argc, char** argv)
 	            "forced_self_enters=%d other_occupants=%d own_veh=%d\n",
 	            (int)liveVehicles.size(), (int)maxLiveVehicles, dupSpawns,
 	            unexpectedSelfEnters, (int)otherOccupant.size(), (int)ownVehId);
+	if(cfg.scenario == "cruise" && ownVehId == 0xFFFF) failReasons += "cruise_never_drove ";
+	if(cfg.expectWorld){
+		if(otherSpawnsSeen == 0) failReasons += "no_roster_spawn ";
+		if(liveVehicles.empty()) failReasons += "no_vehicle ";
+		if(otherOccupant.empty()) failReasons += "no_occupant ";
+		if(peerSeatedStates == 0) failReasons += "no_seated_state ";
+		if(vehStatesSeen == 0) failReasons += "no_vehicle_state ";
+		else if(!vehMoved) failReasons += "vehicle_never_moved ";
+	}
+	std::printf("[BOT] WORLDSUMMARY other_spawns=%d seated_states=%d veh_states=%d veh_moved=%d\n",
+	            otherSpawnsSeen, peerSeatedStates, vehStatesSeen, (int)vehMoved);
 	if(cfg.voice){
 		if(voiceSent == 0) failReasons += "no_voice_sent ";
 		if(voiceOutOfRange > 0) failReasons += "voice_out_of_range ";

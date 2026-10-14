@@ -342,6 +342,8 @@ static CVehicle* CreatePuppetVehicle(uint16_t modelId, float x, float y, float z
 	return veh;
 }
 
+static void ConsolePrint(const char* fmt, ...);
+
 static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
                                 float x, float y, float z, float heading)
 {
@@ -360,6 +362,9 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 			fprintf(stderr, "[NET] veh model %d is not a vehicle — net vehicle %d dropped\n",
 			        (int)nv.modelId, (int)netId);
 			fflush(stderr);
+			// say so in-game too: otherwise the other player just "has no car"
+			ConsolePrint("net vehicle %d uses model %d, which this install does not have - it stays invisible here",
+			             (int)netId, (int)nv.modelId);
 		}
 		if(!nv.rejected){
 			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
@@ -496,6 +501,16 @@ static void UpdateNetVehicles(float dt)
 			// we drive: the local simulation is authoritative — real physics
 			veh->bIsFrozen = false;
 			veh->bUsesCollision = true;
+			// keep the kinematic latch on the live car: the moment we step out
+			// it is glued to smooth*/target, which otherwise still hold where
+			// we got in (the car snapped back there on exit)
+			CVector p = veh->GetPosition();
+			nv.smoothX = p.x; nv.smoothY = p.y; nv.smoothZ = p.z;
+			nv.smoothH = std::atan2(-veh->GetForward().x, veh->GetForward().y);
+			nv.target.xMm = rnet::QuantPos(p.x);
+			nv.target.yMm = rnet::QuantPos(p.y);
+			nv.target.zMm = rnet::QuantPos(p.z);
+			nv.target.heading = rnet::QuantAngle(nv.smoothH);
 			continue;
 		}
 		// remote-driven or parked: kinematic, glued to the relayed state
@@ -535,6 +550,7 @@ struct RemotePed {
 	int lastAnim = -1;
 	float smoothX = 0, smoothY = 0, smoothZ = 0;
 	bool init = false;
+	float seatMismatch = 0.0f; // seconds the relayed seat has disagreed with the puppet
 };
 static std::map<uint8_t, RemotePed> s_remotes;
 
@@ -633,6 +649,29 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 		rp.lastAnim = -1;
 		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt\n", (int)id);
 		fflush(stderr);
+	}
+
+	// seat reconciliation: every relayed state carries the server's occupancy
+	// for this player. The reliable enter/exit events normally get there first;
+	// when one was missed or raced (late join, ped built after the enter), a
+	// disagreement that outlives any in-flight event is repaired from the state.
+	{
+		bool wantSeat = st.vehicleId != rnet::VEHICLE_NONE && st.vehicleId != rnet::VEHICLE_UNSYNCED;
+		bool seated = ped->bInVehicle && ped->m_pMyVehicle;
+		bool agree = wantSeat ? (seated && NetIdOfVehicle(ped->m_pMyVehicle) == st.vehicleId)
+		                      : !seated;
+		if(agree || s_pendingSeat.count(id))
+			rp.seatMismatch = 0.0f;
+		else if((rp.seatMismatch += dt) > 0.75f){
+			rp.seatMismatch = 0.0f;
+			fprintf(stderr, "[VEHSYNC] remote player %d seat repaired from state: veh=%d seat=%d (was %s)\n",
+			        (int)id, (int)st.vehicleId, (int)st.seat, seated ? "seated" : "on foot");
+			fflush(stderr);
+			if(wantSeat)
+				s_pendingSeat[id] = std::make_pair(st.vehicleId, st.seat); // frame pass seats it
+			else
+				UnseatNetPed(ped);
+		}
 	}
 
 	// seated in a net vehicle: the world loop holds the ped in its seat
@@ -2292,8 +2331,15 @@ void NetGame_Frame(void)
 			if(me && NetPosSane(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
 			                    ev.state.zMm / 1000.0f, "correction")){
 				CVector pos(ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f, ev.state.zMm / 1000.0f);
-				me->Teleport(pos);   // clears bIsStanding — see EV_SPAWNED
-				me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(ev.state.heading));
+				if(me->bInVehicle && me->m_pMyVehicle){
+					// a seated ped is re-anchored to its car every frame: moving
+					// the ped alone changes nothing, so move the car we sit in
+					me->m_pMyVehicle->Teleport(pos);
+					me->m_pMyVehicle->SetMoveSpeed(0.0f, 0.0f, 0.0f);
+				}else{
+					me->Teleport(pos);   // clears bIsStanding — see EV_SPAWNED
+					me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(ev.state.heading));
+				}
 				me->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 				s_lastSentPos = pos;
 				s_haveLastSent = true;
