@@ -782,6 +782,26 @@ void NetGame_SetFpsLimit(int n)
 	fflush(stderr);
 }
 
+// GetAsyncKeyState is global: it reports keys typed into ANY window. Without
+// this gate a second client on the same PC ran every console command typed into
+// the first one ("ride 295" spawned a duplicate car and warped that client's
+// player into it). The foreground window counts as ours when it belongs to this
+// process, so the CEF overlay/panels (same process) keep working.
+static bool GameHasFocus(void)
+{
+	HWND fg = GetForegroundWindow();
+	if(!fg) return false;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(fg, &pid);
+	return pid == GetCurrentProcessId();
+}
+
+// GetAsyncKeyState held-test, false while another window has focus
+static bool KeyDown(int vk)
+{
+	return GameHasFocus() && (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
 // one-shot key edge detector (edges are computed once per frame and cached,
 // so every caller sees the same answer — the old consuming version meant a
 // keybind key (T=chat, I=inventory) could never be typed into a text field)
@@ -793,9 +813,12 @@ static bool KeyEdge(int vk)
 	uint32 frame = CTimer::GetFrameCounter();
 	if(s_frame != frame){
 		s_frame = frame;
+		bool focused = GameHasFocus();
 		for(int k = 0; k < 256; k++){
 			bool now = (GetAsyncKeyState(k) & 0x8000) != 0;
-			cur[k] = now && !prev[k];
+			// unfocused: track the key state but never report an edge, so a key
+			// still held when focus returns does not fire either
+			cur[k] = focused && now && !prev[k];
 			prev[k] = now;
 		}
 	}
@@ -1390,7 +1413,7 @@ static void NetGame_PollUi(void)
 	// UI panel owns the keyboard so typing TAB never flashes the board
 	{
 		bool anyUi = s_consoleOpen || s_chatOpen || s_invOpen || s_panelOpen || !s_cefPanel.empty();
-		bool held = s_net.Connected() && !anyUi && (GetAsyncKeyState(s_keys.scoreboard) & 0x8000) != 0;
+		bool held = s_net.Connected() && !anyUi && KeyDown(s_keys.scoreboard);
 		if(held != s_boardHeld){
 			s_boardHeld = held;
 			s_lastCefPush = -1e9;   // push the change now instead of within 200 ms
@@ -1459,7 +1482,7 @@ static void NetGame_PollUi(void)
 		GetCursorPos(&pt);
 		ScreenToClient(GetActiveWindow(), &pt);
 		static bool s_lmbPrev = false;
-		bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		bool lmb = KeyDown(VK_LBUTTON);
 		CefHud_Mouse(0, pt.x, pt.y, 0, 0);
 		if(lmb && !s_lmbPrev) CefHud_Mouse(1, pt.x, pt.y, 0, 0);
 		if(!lmb && s_lmbPrev) CefHud_Mouse(2, pt.x, pt.y, 0, 0);
@@ -2744,20 +2767,20 @@ void NetGame_Frame(void)
 		me->bUsesCollision = false;
 		me->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 		float sp = s_ncSpeed * dt;
-		if(GetAsyncKeyState(VK_CONTROL) & 0x8000) sp *= 4.0f;      // speed boost
-		else if(GetAsyncKeyState(VK_MENU) & 0x8000) sp *= 0.25f;   // fine control
+		if(KeyDown(VK_CONTROL)) sp *= 4.0f;      // speed boost
+		else if(KeyDown(VK_MENU)) sp *= 0.25f;   // fine control
 		// [ / ] adjust the base speed — but never while typing in a UI
 		bool uiUp = !s_cefPanel.empty() || s_consoleOpen || s_chatOpen || s_panelOpen;
 		if(!uiUp && KeyEdge(VK_OEM_6)) s_ncSpeed = s_ncSpeed * 1.5f > 500.0f ? 500.0f : s_ncSpeed * 1.5f;
 		if(!uiUp && KeyEdge(VK_OEM_4)) s_ncSpeed = s_ncSpeed / 1.5f < 1.0f ? 1.0f : s_ncSpeed / 1.5f;
 		CVector fwd = me->GetForward();
 		CVector right = me->GetRight();
-		if(GetAsyncKeyState('W') & 0x8000) s_ncPos += fwd * sp;
-		if(GetAsyncKeyState('S') & 0x8000) s_ncPos -= fwd * sp;
-		if(GetAsyncKeyState('D') & 0x8000) s_ncPos += right * sp;
-		if(GetAsyncKeyState('A') & 0x8000) s_ncPos -= right * sp;
-		if(GetAsyncKeyState(VK_SPACE) & 0x8000) s_ncPos.z += sp;
-		if(GetAsyncKeyState(VK_SHIFT) & 0x8000) s_ncPos.z -= sp;
+		if(KeyDown('W')) s_ncPos += fwd * sp;
+		if(KeyDown('S')) s_ncPos -= fwd * sp;
+		if(KeyDown('D')) s_ncPos += right * sp;
+		if(KeyDown('A')) s_ncPos -= right * sp;
+		if(KeyDown(VK_SPACE)) s_ncPos.z += sp;
+		if(KeyDown(VK_SHIFT)) s_ncPos.z -= sp;
 		me->SetPosition(s_ncPos);
 	}
 
