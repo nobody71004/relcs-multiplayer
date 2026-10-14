@@ -24,6 +24,8 @@
 #include "ModelIndices.h"
 #include "AnimManager.h"
 #include "AnimationId.h"
+#include "AnimBlendAssociation.h"
+#include "RpAnimBlend.h"
 #include "Font.h"
 #include "ModelInfo.h"
 #include "Collision.h"
@@ -157,6 +159,8 @@ static void UnseatNetPed(CPed* ped)
 	veh->CleanUpOldReference((CEntity**)&ped->m_pMyVehicle);
 	ped->bInVehicle = false;
 	ped->SetPedState(PED_IDLE);
+	if(ped->m_rwObject)
+		ped->RemoveInCarAnims(); // fade the sit pose out; on-foot anims take over
 }
 
 // a seated puppet is static (CWorld::Add, not on the moving-entity list), so
@@ -202,10 +206,14 @@ static bool SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
 	ped->bInVehicle = true;
 	ped->SetPedState(PED_DRIVING);
 	AnchorSeatedPuppet(ped);
-	// hold the seated pose; the frame pass keeps the ped in its seat from here
-	RpClump* clump = (RpClump*)ped->m_rwObject;
-	if(clump)
-		CAnimManager::BlendAnimation(clump, ASSOCGRP_STD, ANIM_STD_CAR_SIT, 8.0f);
+	// the engine's own in-car pose for this seat and vehicle (low cars, bikes
+	// and boats each have their own sit anim; a plain CAR_SIT blended over the
+	// on-foot anims left the model standing up through the seat). The frame
+	// pass keeps the ped in its seat from here.
+	if(ped->m_rwObject){
+		RpAnimBlendClumpSetBlendDeltas((RpClump*)ped->m_rwObject, ASSOC_PARTIAL, -1000.0f);
+		ped->AddInCarAnims(veh, seat == 0);
+	}
 	return true;
 }
 
@@ -679,6 +687,7 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	if(ped->bInVehicle && ped->m_pMyVehicle){
 		CVector p = ped->GetPosition();
 		rp.smoothX = p.x; rp.smoothY = p.y; rp.smoothZ = p.z;
+		rp.lastAnim = -1; // re-blend the on-foot anim once it steps out
 		return;
 	}
 
@@ -984,14 +993,13 @@ static void ConsoleExec(const char* line)
 				car->SetPosition(p);
 				car->SetOrientation(0.0f, 0.0f, std::atan2(-fwd.x, fwd.y));
 				CWorld::Add(car);
-				me->m_pMyVehicle = car;
-				car->RegisterReference((CEntity**)&me->m_pMyVehicle);
-				me->bInVehicle = true;
-				me->bUsesCollision = false;
-				me->SetPedState(PED_DRIVING);
-				car->SetDriver(me);
-				car->SetStatus(STATUS_PLAYER);
-				car->bEngineOn = true;
+				// the engine's own warp (what the mission scripts use): seats the
+				// driver, hands the car to the player and applies the in-car sit
+				// anims. Setting the seat fields by hand skipped the anims, so the
+				// character stood upright through the seat.
+				me->SetObjective(OBJECTIVE_ENTER_CAR_AS_DRIVER, car);
+				me->WarpPedIntoCar(car);
+				me->RestorePreviousObjective();
 				me->SetPedPositionInCar();
 				// a stale enter-car objective (left behind by a failed enter
 				// attempt) makes the ped AI call SetExitCar the moment the player
@@ -1872,19 +1880,49 @@ static double s_lastTeleportLog = 0.0;
 // ped exists — same pattern as the inventory restore (s_pendingInv).
 static rnet::PlayerState s_pendingSpawn;
 static bool s_havePendingSpawn = false;
+// the spawn the server last gave us: re-asserted when the game's own start-up
+// (new-game script) drags the player somewhere else right after it
+static rnet::PlayerState s_spawnState;
+static double s_spawnAt = -100.0;
+static int s_spawnReasserts = 0;
 
-static void ApplySpawnState(const rnet::PlayerState& st)
+// A relocation (spawn, server teleport) usually lands in a part of the map that
+// is not streamed in yet. Dropping a ped or car there lets it fall through the
+// unloaded ground until the engine's rescue puts it on some path node far away.
+// Load the destination first and stand the entity on the real ground under the
+// requested point. A short hop inside the loaded area skips the (blocking) load.
+static CVector NetArrivalPos(CEntity* ent, CVector pos)
+{
+	CVector d = ent->GetPosition() - pos;
+	if(d.x * d.x + d.y * d.y > 30.0f * 30.0f){
+		CStreaming::LoadScene(pos);
+		CStreaming::LoadSceneCollision(pos);
+	}
+	bool found = false;
+	float ground = CWorld::FindGroundZFor3DCoord(pos.x, pos.y, pos.z + 2.0f, &found);
+	if(!found)
+		ground = CWorld::FindGroundZForCoord(pos.x, pos.y); // asked for a point below the map
+	pos.z = ground + ent->GetDistanceFromCentreOfMassToBaseOfModel();
+	return pos;
+}
+
+static void ApplySpawnState(const rnet::PlayerState& st, bool fresh = true)
 {
 	CPlayerPed* me = FindPlayerPed();
 	if(!me || !NetPosSane(st.xMm / 1000.0f, st.yMm / 1000.0f,
 	                      st.zMm / 1000.0f, "spawn"))
 		return;
+	if(fresh){
+		s_spawnState = st;
+		s_spawnAt = NowSec();
+		s_spawnReasserts = 0;
+	}
 	// a gamemode respawn can land mid-drive: detach from the car
 	// first or the ped stays hidden and steers a phantom vehicle
 	UnseatPlayerForWorld(me);
-	CVector pos(st.xMm / 1000.0f, st.yMm / 1000.0f, st.zMm / 1000.0f);
+	CVector pos = NetArrivalPos(me, CVector(st.xMm / 1000.0f, st.yMm / 1000.0f, st.zMm / 1000.0f));
 	// Teleport (not SetPosition): it clears bIsStanding so the ped
-	// falls to the ground instead of hovering mid-air forever
+	// settles on the ground instead of hovering mid-air forever
 	me->Teleport(pos);
 	me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(st.heading));
 	s_lastSentPos = pos;
@@ -2334,9 +2372,12 @@ void NetGame_Frame(void)
 				if(me->bInVehicle && me->m_pMyVehicle){
 					// a seated ped is re-anchored to its car every frame: moving
 					// the ped alone changes nothing, so move the car we sit in
+					pos = NetArrivalPos(me->m_pMyVehicle, pos);
 					me->m_pMyVehicle->Teleport(pos);
 					me->m_pMyVehicle->SetMoveSpeed(0.0f, 0.0f, 0.0f);
+					me->m_pMyVehicle->SetTurnSpeed(0.0f, 0.0f, 0.0f);
 				}else{
+					pos = NetArrivalPos(me, pos);
 					me->Teleport(pos);   // clears bIsStanding — see EV_SPAWNED
 					me->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(ev.state.heading));
 				}
@@ -2739,6 +2780,19 @@ void NetGame_Frame(void)
 				fprintf(stderr, "[NET] game-driven move (%.1f, %.1f, %.1f)->(%.1f, %.1f, %.1f) — flagged\n",
 				        s_lastSentPos.x, s_lastSentPos.y, s_lastSentPos.z, pos.x, pos.y, pos.z);
 				fflush(stderr);
+			}
+			// right after a spawn that jump is the game's own start-up moving
+			// the player off the server's spawn point: put them back on it
+			// (a long jump that also left the spawn far behind — walking or a
+			// small physics hop near the spawn is the player's own movement)
+			float sx = pos.x - s_spawnState.xMm / 1000.0f, sy = pos.y - s_spawnState.yMm / 1000.0f;
+			if(st.moveFlags && !inVehicle && s_spawnReasserts < 3 && now - s_spawnAt < 10.0 &&
+			   h > 40.0f && sx * sx + sy * sy > 40.0f * 40.0f){
+				s_spawnReasserts++;
+				fprintf(stderr, "[NET] spawn re-asserted after game-side relocation (%d)\n", s_spawnReasserts);
+				fflush(stderr);
+				ApplySpawnState(s_spawnState, false);
+				pos = me->GetPosition();
 			}
 		}
 		st.xMm = rnet::QuantPos(pos.x);

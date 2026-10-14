@@ -509,6 +509,8 @@ int main(int argc, char** argv)
 						correctionsReceived++;
 						self.xMm = fix.xMm; self.yMm = fix.yMm; self.zMm = fix.zMm;
 						self.heading = fix.heading;
+						// a server teleport moves our home too: roam around the new spot
+						homeX = fix.xMm / 1000.0f; homeY = fix.yMm / 1000.0f; homeZ = fix.zMm / 1000.0f;
 						{ // position discontinuity marker for the e2e convergence check
 							double jw = std::chrono::duration_cast<std::chrono::duration<double>>(
 								std::chrono::system_clock::now().time_since_epoch()).count();
