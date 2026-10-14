@@ -83,6 +83,23 @@ inline bool ReadInventory(BitReader& r, MsgInventory& m)
 	return r.Ok();
 }
 
+inline void WriteAppearance(BitWriter& w, const MsgAppearance& m)
+{
+	w.WriteU16(m.playerId);
+	w.WriteU16(m.model);
+	for(int i = 0; i < MAX_APPEARANCE_COMPONENTS; i++)
+		w.WriteU8(m.components[i]);
+}
+
+inline bool ReadAppearance(BitReader& r, MsgAppearance& m)
+{
+	m.playerId = r.ReadU16();
+	m.model = r.ReadU16();
+	for(int i = 0; i < MAX_APPEARANCE_COMPONENTS; i++)
+		m.components[i] = r.ReadU8();
+	return r.Ok();
+}
+
 inline void WriteVehicleState(BitWriter& w, const VehicleState& s)
 {
 	w.WriteU16(s.vehicleId); w.WriteU16(s.modelId);

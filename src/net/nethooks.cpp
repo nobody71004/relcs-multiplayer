@@ -498,8 +498,25 @@ struct RemotePed {
 	int lastAnim = -1;
 	float smoothX = 0, smoothY = 0, smoothZ = 0;
 	bool init = false;
+	int  model = MI_MALE01;   // the ped model this remote should render as (appearance sync)
 };
 static std::map<uint8_t, RemotePed> s_remotes;
+
+// A player's chosen look may arrive (MSG_APPEARANCE) before the ped exists, or
+// be changed mid-session. Remember the desired model per id so SpawnRemote
+// materializes the right one and ApplyRemote can re-skin on change.
+static std::map<uint8_t, uint16_t> s_remoteModel;
+
+// Only ped models are valid avatars; a vehicle/other model would crash the ped
+// clump build. Fall back to the default civilian if the id is not a ped model.
+static int ResolvePedModel(uint16_t model)
+{
+	if(model == 0) return MI_MALE01;
+	CBaseModelInfo* mi = CModelInfo::GetModelInfo((int)model);
+	if(mi && mi->GetModelType() == MITYPE_PED)
+		return (int)model;
+	return MI_MALE01;
+}
 
 static void RemoveRemote(uint8_t id)
 {
@@ -513,6 +530,10 @@ static void RemoveRemote(uint8_t id)
 		s_remotes.erase(it);
 	}
 	s_pendingSeat.erase(id);
+	// note: s_remoteModel is intentionally NOT erased here — the clump is often
+	// torn down and rebuilt (streaming eviction, re-skin) while the player stays,
+	// and keeping the last known look lets SpawnRemote restore it. It is cleared
+	// on EV_REMOTE_QUIT instead.
 }
 
 static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
@@ -521,8 +542,14 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 		return;
 	if(!NetPosSane(x, y, z, "ped spawn"))
 		return; // ApplyRemote retries on the next sane state
+	// the look the server told us this player uses (default until MSG_APPEARANCE)
+	int model = MI_MALE01;
+	{
+		auto mit = s_remoteModel.find(id);
+		if(mit != s_remoteModel.end()) model = ResolvePedModel(mit->second);
+	}
 	RemoveRemote(id);
-	CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
+	CStreaming::RequestModel(model, STREAMFLAGS_KEEP_IN_MEMORY);
 	CStreaming::LoadAllRequestedModels(false);
 
 	// CPed::operator new returns nil when the ped pool is full and the
@@ -536,7 +563,7 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 		return;
 	}
 
-	CCivilianPed* ped = new CCivilianPed(PEDTYPE_CIVMALE, MI_MALE01);
+	CCivilianPed* ped = new CCivilianPed(PEDTYPE_CIVMALE, model);
 	if(!ped)
 		return;
 	// puppets are positioned directly each frame; letting them collide makes
@@ -562,7 +589,35 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 	rp.ped = ped;
 	rp.smoothX = x; rp.smoothY = y; rp.smoothZ = z;
 	rp.init = true;
-	fprintf(stderr, "[NET] remote ped id=%d created at (%.1f, %.1f, %.1f)\n", (int)id, x, y, z);
+	rp.model = model;
+	fprintf(stderr, "[NET] remote ped id=%d created at (%.1f, %.1f, %.1f) model=%d\n",
+	        (int)id, x, y, z, model);
+	fflush(stderr);
+}
+
+// A player's look arrived/changed (MSG_APPEARANCE). Remember the model for the
+// id, and if the ped already exists re-skin it in place: SetModelIndex rebuilds
+// the RenderWare clump, so the puppet instantly renders as the new character.
+// (LCS renders a ped by model index; the component slots are carried for mods.)
+static void ApplyRemoteAppearance(uint8_t id, const rnet::MsgAppearance& ap)
+{
+	int model = ResolvePedModel(ap.model);
+	s_remoteModel[id] = (uint16_t)model;
+	auto it = s_remotes.find(id);
+	if(it == s_remotes.end() || !it->second.ped){
+		// ped not built yet: SpawnRemote will pick up the stored model
+		return;
+	}
+	RemotePed& rp = it->second;
+	if(rp.model == model)
+		return;   // already wearing this look
+	CStreaming::RequestModel(model, STREAMFLAGS_KEEP_IN_MEMORY);
+	CStreaming::LoadAllRequestedModels(false);
+	rp.ped->SetModelIndex(model);   // rebuilds the clump
+	SyncPuppetToRw(rp.ped);
+	rp.model = model;
+	rp.lastAnim = -1;               // re-blend the idle/walk anim on the new clump
+	fprintf(stderr, "[NET] remote ped id=%d re-skinned to model %d\n", (int)id, model);
 	fflush(stderr);
 }
 
@@ -583,12 +638,12 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	// the puppet silently renders as nothing (nametag floats "in the air") —
 	// rebuild it in place
 	if(!ped->m_rwObject){
-		CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
+		CStreaming::RequestModel(rp.model, STREAMFLAGS_KEEP_IN_MEMORY);
 		CStreaming::LoadAllRequestedModels(false);
-		ped->SetModelIndex(MI_MALE01);
+		ped->SetModelIndex(rp.model);
 		SyncPuppetToRw(ped);
 		rp.lastAnim = -1;
-		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt\n", (int)id);
+		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt (model %d)\n", (int)id, rp.model);
 		fflush(stderr);
 	}
 
@@ -843,7 +898,7 @@ static void ConsoleExec(const char* line)
 	CPlayerPed* me = FindPlayerPed();
 	int myId = (int)s_net.MyId();
 	if(is("help")){
-		ConsolePrint("commands: help say broadcast(bc) give spawnbot spawnprop teleport(tp) ride");
+		ConsolePrint("commands: help say broadcast(bc) give spawnbot spawnprop teleport(tp) ride model");
 		ConsolePrint("          fps god noclip nocspeed players worldstats ground status settime setweather res doorchime rcon keybinds clear quit");
 	}else if(is("say")){
 		if(rest[0]) s_net.SendChat(rest);
@@ -1044,6 +1099,32 @@ static void ConsoleExec(const char* line)
 	}else if(is("rcon")){
 		if(rest[0]) s_net.SendRconCmd(rest);
 		else ConsolePrint("usage: rcon <server command>");
+	}else if(is("model") || is("appearance") || is("skin")){
+		// customization entry point: choose the character/outfit the other
+		// players see you as. "model <pedModelId> [c0 c1 ...]" sets the ped model
+		// (and optional clothing/component slots); "model" alone prints the current.
+		if(!rest[0]){
+			ConsolePrint("your model=%d (components %d %d %d %d %d %d %d %d)",
+			             (int)s_myAppearance.model,
+			             s_myAppearance.components[0], s_myAppearance.components[1],
+			             s_myAppearance.components[2], s_myAppearance.components[3],
+			             s_myAppearance.components[4], s_myAppearance.components[5],
+			             s_myAppearance.components[6], s_myAppearance.components[7]);
+			ConsolePrint("usage: model <pedModelId> [c0..c7]  (e.g. model 9=taxi-driver, 11=criminal, 78=gang)");
+		}else{
+			int mdl = 0, c[rnet::MAX_APPEARANCE_COMPONENTS] = {};
+			int n = sscanf(rest, "%d %d %d %d %d %d %d %d %d",
+			               &mdl, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+			if(n < 1 || mdl <= 0){
+				ConsolePrint("usage: model <pedModelId> [c0..c7]");
+			}else{
+				uint8_t comps[rnet::MAX_APPEARANCE_COMPONENTS];
+				for(int i = 0; i < rnet::MAX_APPEARANCE_COMPONENTS; i++)
+					comps[i] = (uint8_t)(c[i] & 0xFF);
+				SetMyAppearance((uint16_t)mdl, comps);
+				ConsolePrint("appearance set to model %d — sending to server", mdl);
+			}
+		}
 	}else if(is("clear")){
 		s_consoleLog.clear();
 	}else if(is("doorchime")){
@@ -1105,6 +1186,13 @@ static void CefQueryHandler(const char* request, void*)
 	if(cmd == "chat"){
 		std::string text = arg("text");
 		if(!text.empty()) s_net.SendChat(text.c_str());
+	}else if(cmd == "model" || cmd == "appearance"){
+		// UI customization entry point: the overlay sends ?model=<pedModelId>
+		std::string m = arg("model");
+		if(!m.empty()){
+			int mdl = atoi(m.c_str());
+			if(mdl > 0) SetMyAppearance((uint16_t)mdl, nullptr);
+		}
 	}else if(cmd == "console"){
 		std::string c = arg("cmd");
 		if(!c.empty()) ConsoleExec(c.c_str());
@@ -1709,6 +1797,24 @@ static double s_lastLog = 0.0;
 // flagged teleport and the server resets its movement reference instead of
 // anti-cheat kicking us (snap-back used to ping-pong with the game at 20 Hz)
 static CVector s_lastSentPos(0.0f, 0.0f, 0.0f);
+
+// --- appearance sync: the local player's chosen look (model + components) ----
+// Default = MI_MALE01. The player customizes via the `model` console command;
+// the server restores a saved look on join (EV_APPEARANCE for our own id).
+static rnet::MsgAppearance s_myAppearance;
+static bool   s_appearanceDirty = false;   // needs sending to the server
+static bool   s_appearanceServerKnown = false; // the server has echoed our look at least once
+
+// queue our look for sending (console command / server restore -> re-send)
+static void SetMyAppearance(uint16_t model, const uint8_t* comps /*8 or null*/)
+{
+	s_myAppearance.playerId = s_net.MyId();
+	if(model != 0) s_myAppearance.model = model;
+	if(comps)
+		for(int i = 0; i < rnet::MAX_APPEARANCE_COMPONENTS; i++)
+			s_myAppearance.components[i] = comps[i];
+	s_appearanceDirty = true;
+}
 
 // --- persistent profile sync: wallet + weapon table -------------------------
 static rnet::MsgInventory s_invLast;
@@ -2363,6 +2469,24 @@ void NetGame_Frame(void)
 			break;
 		case NetClient::EV_REMOTE_QUIT:
 			RemoveRemote(ev.id);
+			s_remoteModel.erase(ev.id);   // forget the departed player's look
+			break;
+		case NetClient::EV_APPEARANCE:
+			if(ev.id == s_net.MyId()){
+				// the server restored our saved look (join) or echoed our change.
+				// Adopt it as our baseline so we don't immediately re-send/fight it;
+				// LCS keeps the local PlayerPed as MI_PLAYER, so we don't re-skin self.
+				s_myAppearance = ev.appearance;
+				s_myAppearance.playerId = s_net.MyId();
+				s_appearanceServerKnown = true;
+				s_appearanceDirty = false;
+				fprintf(stderr, "[NET] own appearance from server: model=%d\n",
+				        (int)ev.appearance.model);
+				fflush(stderr);
+			}else{
+				// a remote player's look: re-skin their puppet (or store for spawn)
+				ApplyRemoteAppearance(ev.id, ev.appearance);
+			}
 			break;
 		case NetClient::EV_VEH_SPAWN:{
 			float vx = ev.state.xMm / 1000.0f, vy = ev.state.yMm / 1000.0f, vz = ev.state.zMm / 1000.0f;
@@ -2686,6 +2810,18 @@ void NetGame_Frame(void)
 			s_invHave = true;
 			s_invLastSend = now;
 			s_invForce = false;
+		}
+
+		// appearance: send our chosen look whenever it changed (the `model`
+		// console command sets s_appearanceDirty). The server persists it and
+		// rebroadcasts so every other client re-skins our puppet.
+		if(s_appearanceDirty){
+			s_appearanceDirty = false;
+			s_myAppearance.playerId = s_net.MyId();
+			s_net.SendAppearance(s_myAppearance);
+			fprintf(stderr, "[NET] sent appearance model=%d
+", (int)s_myAppearance.model);
+			fflush(stderr);
 		}
 
 		// the driver streams the vehicle (seat 0 is authoritative for the car)

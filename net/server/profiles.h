@@ -24,6 +24,15 @@ struct PassHash {
 	uint8_t hash[32] = {};
 };
 
+// A player's saved appearance: the ped character/outfit model plus a fixed set
+// of clothing/component variation slots. Mirrors rnet::MsgAppearance but kept
+// sqlite-only here so profiles.h stays free of the protocol headers.
+constexpr int PROFILE_APPEARANCE_COMPONENTS = 8;
+struct ProfileAppearance {
+	uint16_t model = 7;   // rnet::APPEARANCE_MODEL_DEFAULT (MI_MALE01)
+	uint8_t  components[PROFILE_APPEARANCE_COMPONENTS] = {};
+};
+
 struct PlayerProfile {
 	int32_t money = 0;
 	uint8_t currentWeapon = 0;
@@ -34,6 +43,10 @@ struct PlayerProfile {
 	// last on-foot position (world metres) + heading (degrees); hasPos gates it
 	bool hasPos = false;
 	float x = 0.0f, y = 0.0f, z = 0.0f, heading = 0.0f;
+	// appearance — persisted so a custom look survives a reconnect. hasAppearance
+	// stays false for a legacy/first-join row so the server keeps the default.
+	bool hasAppearance = false;
+	ProfileAppearance appearance;
 };
 
 class ProfileStore {
@@ -65,6 +78,7 @@ private:
 	bool EnsureColumn(const char* table, const char* column, const char* decl);
 	bool EnsureCredentialColumns();
 	bool EnsureStatColumns();
+	bool EnsureAppearanceColumns();
 
 	void* m_db = nullptr;      // sqlite3*
 	std::string m_err;

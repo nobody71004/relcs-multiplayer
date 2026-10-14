@@ -214,6 +214,45 @@ END {
 	exit 0
 }' "$OUT"/alice.log "$OUT"/bob.log "$OUT"/charlie.log "$OUT"/driver.log || FAIL=1
 
+# ---------------------------------------------------------------- phase 1b
+step "phase 1b: appearance sync + persistence (model broadcast, roster, reconnect)"
+APORT=7791
+APPOUT="$OUT/appearance"
+mkdir -p "$APPOUT"; rm -f "$APPOUT"/*.log "$APPOUT"/profiles.db*
+ROOTDIR="$(pwd)"
+( cd "$APPOUT" && "$ROOTDIR/$BIN/reLCS-server.exe" -port $APORT -maxplayers 8 -gamemode freeroam \
+	-lan_discover 0 -hostname "AppServer" > server.log 2>&1 ) &
+APP_SRV_PID=$!
+sleep 1
+
+# Dresser claims a name and sets model 78; it must get its own look echoed back.
+$BIN/relcs-netbot.exe -name Dresser -server 127.0.0.1:$APORT -scenario roam -duration 12 \
+	-password dpw1 -model 78 > "$APPOUT/dresser.log" 2>&1 &
+sleep 2
+# A late joiner must receive the FULL roster's looks (Dresser as model 78).
+$BIN/relcs-netbot.exe -name LateJoiner -server 127.0.0.1:$APORT -scenario roam -duration 8 \
+	-expect-model 78 > "$APPOUT/late.log" 2>&1 &
+wait $APP_SRV_PID 2>/dev/null || true
+for f in dresser late; do wait_result "$APPOUT/$f.log" 30 || FAIL=1; done
+
+DRES=$(grep -o "RESULT: [A-Z]*" "$APPOUT/dresser.log" | head -1)
+LATE=$(grep -o "RESULT: [A-Z]*" "$APPOUT/late.log" | head -1)
+[ "$DRES" = "RESULT: PASS" ] && echo "PASS: dresser own look echoed (model 78)" || { echo "FAIL: dresser (${DRES:-none})"; FAIL=1; }
+[ "$LATE" = "RESULT: PASS" ] && echo "PASS: late joiner received roster appearance (model 78)" || { echo "FAIL: late joiner (${LATE:-none})"; FAIL=1; }
+grep -q "\[APPEARANCE\] Dresser model=78" "$APPOUT/server.log" && echo "PASS: server broadcast appearance" || { echo "FAIL: server appearance log"; FAIL=1; }
+
+# reconnect: Dresser rejoins with the same password; the server restores model 78
+$BIN/relcs-netbot.exe -name Dresser -server 127.0.0.1:$APORT -scenario solo -duration 6 \
+	-password dpw1 > "$APPOUT/dresser2.log" 2>&1
+if grep -q "own_model=78 own_echoed=1" "$APPOUT/dresser2.log"; then
+	echo "PASS: appearance restored across reconnect (sqlite)"
+else
+	echo "FAIL: appearance not restored on reconnect"; cat "$APPOUT/dresser2.log" | grep APPEARANCE; FAIL=1
+fi
+kill $APP_SRV_PID 2>/dev/null
+taskkill //F //IM reLCS-server.exe //IM relcs-netbot.exe > /dev/null 2>&1
+sleep 1
+
 # ---------------------------------------------------------------- phase 2
 step "phase 2: LAN discovery"
 $BIN/relcs-netbot.exe -discover -name Probe > "$OUT/discover.log" 2>&1

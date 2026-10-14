@@ -175,6 +175,17 @@ void NetClient::SendInventory(const MsgInventory& m)
 	enet_host_flush((ENetHost*)m_host);
 }
 
+void NetClient::SendAppearance(const MsgAppearance& m)
+{
+	if(!m_host || !m_peer || !m_connected) return;
+	BitWriter w;
+	BeginMsg(w, MSG_APPEARANCE);
+	WriteAppearance(w, m);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+	enet_peer_send((ENetPeer*)m_peer, CHAN_RELIABLE, pkt);
+	enet_host_flush((ENetHost*)m_host);
+}
+
 void NetClient::SendSpawnRequest()
 {
 	if(!m_host || !m_peer || !m_connected) return;
@@ -401,6 +412,24 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			Event e;
 			e.type = EV_INVENTORY;
 			e.inv = m;
+			m_events.push_back(e);
+		}
+		break;
+	}
+	case MSG_APPEARANCE:{
+		MsgAppearance m;
+		if(ReadAppearance(r, m)){
+			// store it on the remote (own id still flows through so the game layer
+			// can confirm/apply its own restored look)
+			if(m.playerId != m_myId){
+				NetRemotePlayer& rp = remotes[(uint8_t)m.playerId];
+				rp.appearance = m;
+				rp.haveAppearance = true;
+			}
+			Event e;
+			e.type = EV_APPEARANCE;
+			e.id = (uint8_t)m.playerId;
+			e.appearance = m;
 			m_events.push_back(e);
 		}
 		break;

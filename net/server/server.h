@@ -68,6 +68,11 @@ struct ServerPlayer {
 	rnet::MsgInventory inv;           // last known inventory (DB at join <- client reports)
 	bool invSet = false;
 	double invTime = 0;               // last accepted client inventory report
+	// appearance (ped model + clothing/component slots): server-authoritative,
+	// broadcast on join + change and persisted in the profile DB
+	rnet::MsgAppearance appearance;   // current look (DB at join <- client reports)
+	bool appearanceSet = false;       // the player has chosen a custom look this session
+	double appearanceTime = 0;        // last accepted client appearance report (throttle)
 	PlayerProfile savedProfile;       // loaded at join, kept for restore
 	bool hasProfile = false;          // a DB row existed for this name
 	bool profileStranger = false;     // name owned by another account — never save through
@@ -141,6 +146,9 @@ private:
 	void OnConnect(ENetPeer* peer);
 	void HandleInventory(ServerPlayer* p, rnet::BitReader& r);
 	void SendInventory(ServerPlayer* p);    // restore the persisted profile
+	void HandleAppearance(ServerPlayer* p, rnet::BitReader& r); // client reports its look
+	void SendAppearance(ENetPeer* peer, const ServerPlayer* who); // send who's look to one peer
+	void BroadcastAppearance(const ServerPlayer* who); // tell everyone who's look changed
 	void OnDisconnect(ENetPeer* peer);
 	void OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel);
 	void Tick();

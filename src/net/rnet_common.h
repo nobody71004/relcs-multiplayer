@@ -79,6 +79,9 @@ enum MsgType : uint8_t {
 	MSG_VEH_SPAWN       = 32,
 	MSG_VEH_DESPAWN     = 33, // server removed a vehicle (static spawn cleanup)
 	MSG_INVENTORY       = 34, // profile sync: full money+weapon snapshot (both ways)
+	MSG_APPEARANCE      = 35, // player appearance: ped model + clothing/component slots
+	                          // client->server: "this is my look" (server persists + rebroadcasts)
+	                          // server->client: a player's look (own restore on join, remotes on join/change)
 	// world / gamemode
 	MSG_WORLD           = 40,
 	MSG_SCORE_UPDATE    = 41,
@@ -150,6 +153,24 @@ struct MsgInventory {
 	uint8_t  currentWeapon = 0;
 	uint8_t  count = 0;
 	InvEntry entries[MAX_INV_ENTRIES];
+};
+
+// Player appearance (MSG_APPEARANCE): the character model a player renders as,
+// plus a fixed set of clothing/component variation slots.
+//
+// GTA:LCS renders a ped by its *model index* (one model = one look); `model`
+// is the ped model id a player chose (MI_MALE01, MI_GANG01, ...). The component
+// slots are an additive, forward-compatible channel for per-slot clothing/skin
+// variation (hats/torso/legs/...) — a modded build or a future ped variation
+// system can honour them; a stock LCS client applies `model` and ignores the
+// rest. Kept fixed-size so the codec never trusts a wire-supplied length.
+constexpr int MAX_APPEARANCE_COMPONENTS = 8;
+constexpr uint16_t APPEARANCE_MODEL_DEFAULT = 7;  // MI_MALE01 — the stock avatar
+
+struct MsgAppearance {
+	uint16_t playerId = 0;
+	uint16_t model = APPEARANCE_MODEL_DEFAULT;  // ped model index (the character/outfit)
+	uint8_t  components[MAX_APPEARANCE_COMPONENTS] = {}; // per-slot variation (0 = default)
 };
 
 // animFlags bits

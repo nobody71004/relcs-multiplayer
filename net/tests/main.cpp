@@ -543,6 +543,41 @@ static void TestInventoryMessages()
 	CHECK(ValidateMoney(57000, seen, granted, cheated) == 56000 && cheated);
 }
 
+// appearance codec: model + fixed component slots round-trip on the wire
+static void TestAppearanceCodec()
+{
+	MsgAppearance ap;
+	ap.playerId = 42;
+	ap.model = 78;   // a gang model id
+	for(int i = 0; i < MAX_APPEARANCE_COMPONENTS; i++) ap.components[i] = (uint8_t)(i * 11 + 1);
+	BitWriter w; BeginMsg(w, MSG_APPEARANCE); WriteAppearance(w, ap);
+	CHECK(PeekType(w.Data(), w.ByteSize()) == MSG_APPEARANCE);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_APPEARANCE);
+	MsgAppearance out;
+	CHECK(ReadAppearance(r, out));
+	CHECK(out.playerId == 42 && out.model == 78);
+	for(int i = 0; i < MAX_APPEARANCE_COMPONENTS; i++)
+		CHECK(out.components[i] == (uint8_t)(i * 11 + 1));
+	CHECK(r.Ok());
+
+	// a default appearance (stock avatar, no components) round-trips too
+	MsgAppearance def;
+	BitWriter w2; BeginMsg(w2, MSG_APPEARANCE); WriteAppearance(w2, def);
+	BitReader r2(w2.Data(), w2.ByteSize());
+	CHECK((MsgType)r2.ReadU8() == MSG_APPEARANCE);
+	MsgAppearance d2;
+	CHECK(ReadAppearance(r2, d2));
+	CHECK(d2.model == APPEARANCE_MODEL_DEFAULT && d2.components[0] == 0);
+	CHECK(r2.Ok());
+
+	// a truncated appearance payload fails cleanly (no partial component read)
+	uint8_t trunc[3] = { 0, 0, 7 }; // playerId(2) only — model/components missing
+	BitReader r3(trunc, 3);
+	MsgAppearance bad;
+	CHECK(!ReadAppearance(r3, bad));
+}
+
 static void TestProfileStore()
 {
 	ProfileStore db;
@@ -614,6 +649,60 @@ static void TestProfileStore()
 	PlayerProfile h;
 	CHECK(db.Load("nopos", h));
 	CHECK(!h.hasPos && h.score == 0 && h.kills == 0 && h.deaths == 0);
+
+	db.Close();
+	std::remove(path);
+}
+
+// appearance persists across a close/reopen (the reconnect path): a custom look
+// saved to SQLite is restored exactly, and a legacy row reads as "no appearance"
+static void TestProfileAppearance()
+{
+	const char* path = "test-appearance.db";
+	std::remove(path);
+	ProfileStore db;
+	CHECK(db.Open(path));
+
+	// a fresh row with no appearance reads back as default / hasAppearance=false
+	PlayerProfile base;
+	base.money = 100;
+	CHECK(db.Save("noface", base));
+	PlayerProfile b2;
+	CHECK(db.Load("noface", b2));
+	CHECK(!b2.hasAppearance);
+	CHECK(b2.appearance.model == 7);  // default avatar
+
+	// save a custom look and read it back
+	PlayerProfile a;
+	a.money = 500;
+	a.hasAppearance = true;
+	a.appearance.model = 95;   // a gang model id
+	for(int i = 0; i < PROFILE_APPEARANCE_COMPONENTS; i++)
+		a.appearance.components[i] = (uint8_t)(i * 3 + 2);
+	CHECK(db.Save("toni", a));
+	PlayerProfile r;
+	CHECK(db.Load("toni", r));
+	CHECK(r.hasAppearance && r.appearance.model == 95);
+	for(int i = 0; i < PROFILE_APPEARANCE_COMPONENTS; i++)
+		CHECK(r.appearance.components[i] == (uint8_t)(i * 3 + 2));
+
+	// survives close/reopen — the reconnect restore really reaches the disk
+	db.Close();
+	CHECK(db.Open(path));
+	PlayerProfile e;
+	CHECK(db.Load("toni", e));
+	CHECK(e.hasAppearance && e.appearance.model == 95);
+	CHECK(e.appearance.components[0] == 2 && e.appearance.components[7] == (uint8_t)(7 * 3 + 2));
+
+	// changing the look overwrites it wholesale
+	PlayerProfile c;
+	c.money = 500;
+	c.hasAppearance = true;
+	c.appearance.model = 11;   // criminal model
+	CHECK(db.Save("toni", c));
+	PlayerProfile d;
+	CHECK(db.Load("toni", d));
+	CHECK(d.hasAppearance && d.appearance.model == 11);
 
 	db.Close();
 	std::remove(path);
@@ -1212,7 +1301,9 @@ int main()
 	TestToughValidator();
 	TestVehicleMessages();
 	TestInventoryMessages();
+	TestAppearanceCodec();
 	TestProfileStore();
+	TestProfileAppearance();
 	TestProfileAuth();
 	TestProfileLegacyMigration();
 	std::printf("%d checks, %d failures — %s\n", g_checks, g_fails, g_fails ? "FAIL" : "PASS");

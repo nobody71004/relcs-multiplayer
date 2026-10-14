@@ -55,6 +55,8 @@ struct BotConfig {
 	bool masterQuery = false;
 	int vehModel = 0; // vehicle model for self-created cars (0 = guess)
 	bool voice = false; // -voice: send a 440 Hz tone as voice and report relayed voice frames
+	int appearanceModel = 0;     // -model <id>: set a custom appearance (ped model), 0 = leave default
+	int expectAppearanceModel = 0; // -expect-model <id>: assert some OTHER player uses this model
 };
 
 // ---------------------------------------------------------------------------
@@ -179,6 +181,8 @@ int main(int argc, char** argv)
 		else if(a == "-master-query") cfg.masterQuery = true;
 		else if(a == "-vehmodel" && hasNext) cfg.vehModel = atoi(argv[++i]);
 		else if(a == "-voice") cfg.voice = true;
+		else if(a == "-model" && hasNext) cfg.appearanceModel = atoi(argv[++i]);
+		else if(a == "-expect-model" && hasNext) cfg.expectAppearanceModel = atoi(argv[++i]);
 	}
 	if(cfg.seed == 0) cfg.seed = (uint32_t)std::hash<std::string>{}(cfg.name);
 	std::mt19937 rng(cfg.seed);
@@ -211,6 +215,13 @@ int main(int argc, char** argv)
 	int vehStatesSeen = 0, vehEntersSeen = 0; // relayed traffic from other drivers
 	std::string failReasons;
 	std::map<uint8_t, PeerView> peers;
+	// appearance sync: our own restored/echoed look, plus every other player's
+	// look as relayed by the server (MSG_APPEARANCE on join + on change)
+	std::map<uint8_t, MsgAppearance> peerAppearance;
+	MsgAppearance ownAppearance;
+	bool ownAppearanceEchoed = false;   // the server echoed our own look back
+	bool appearanceSent = false;        // we have pushed our custom look
+	int appearanceMsgs = 0;
 	PlayerState self;
 	self.health = 100;
 	bool alive = false;
@@ -477,6 +488,23 @@ int main(int argc, char** argv)
 				case MSG_PLAYER_QUIT:{
 					uint8_t id = r.ReadU8();
 					peers.erase(id);
+					peerAppearance.erase(id);
+					break;
+				}
+				case MSG_APPEARANCE:{
+					MsgAppearance ap;
+					if(ReadAppearance(r, ap)){
+						appearanceMsgs++;
+						if(ap.playerId == selfId){
+							ownAppearance = ap;
+							ownAppearanceEchoed = true;
+						}else{
+							peerAppearance[(uint8_t)ap.playerId] = ap;
+						}
+						if(cfg.verbose)
+							std::printf("[%.3f] APPEARANCE id=%d model=%d\n",
+							            elapsed(), (int)ap.playerId, (int)ap.model);
+					}
 					break;
 				}
 				case MSG_KICK:
@@ -643,6 +671,22 @@ int main(int argc, char** argv)
 			}
 		}
 
+		// appearance: push our custom look once, shortly after spawning. The
+		// server persists it and rebroadcasts to every other client.
+		if(cfg.appearanceModel > 0 && gotSpawn && !appearanceSent && t > 1.0){
+			appearanceSent = true;
+			MsgAppearance ap;
+			ap.playerId = selfId;
+			ap.model = (uint16_t)cfg.appearanceModel;
+			for(int k = 0; k < MAX_APPEARANCE_COMPONENTS; k++) ap.components[k] = (uint8_t)(k + 1);
+			BitWriter w;
+			BeginMsg(w, MSG_APPEARANCE);
+			WriteAppearance(w, ap);
+			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+			enet_peer_send(peer, CHAN_RELIABLE, pkt);
+			std::printf("[%.3f] SET-APPEARANCE model=%d\n", elapsed(), cfg.appearanceModel);
+		}
+
 		// chat every 3s
 		if(t - lastChat >= 3.0 && gotSpawn){
 			lastChat = t;
@@ -806,6 +850,19 @@ int main(int argc, char** argv)
 	if(!rconCmdOk) failReasons += "rcon_cmd_failed ";
 	if(statesSent < (int)(cfg.duration * 10)) failReasons += "too_few_states ";
 	if(kicked) failReasons += "kicked ";
+	// appearance sync assertions
+	if(cfg.appearanceModel > 0){
+		// the server must echo our own chosen look back with the right model
+		if(!ownAppearanceEchoed || ownAppearance.model != cfg.appearanceModel)
+			failReasons += "own_appearance_not_echoed ";
+	}
+	if(cfg.expectAppearanceModel > 0){
+		// some OTHER player must be reported to us with this exact model
+		bool found = false;
+		for(auto& kv : peerAppearance)
+			if(kv.second.model == cfg.expectAppearanceModel){ found = true; break; }
+		if(!found) failReasons += "expected_peer_appearance_missing ";
+	}
 	if(cfg.voice){
 		if(voiceSent == 0) failReasons += "no_voice_sent ";
 		if(voiceOutOfRange > 0) failReasons += "voice_out_of_range ";
@@ -814,6 +871,9 @@ int main(int argc, char** argv)
 	}
 
 	bool pass = failReasons.empty();
+	std::printf("[BOT] APPEARANCE msgs=%d peers=%d own_model=%d own_echoed=%d\n",
+	            appearanceMsgs, (int)peerAppearance.size(),
+	            ownAppearanceEchoed ? (int)ownAppearance.model : 0, ownAppearanceEchoed ? 1 : 0);
 	std::printf("[BOT] RESULT: %s %s| states=%d corrections=%d deaths=%d spawns=%d "
 	            "vehstates=%d vehenters=%d veh=%d\n",
 	            pass ? "PASS" : "FAIL", failReasons.c_str(),
