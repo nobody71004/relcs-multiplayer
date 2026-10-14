@@ -176,6 +176,11 @@ static void AnchorSeatedPuppet(CPed* ped)
 		ped->SetPedPositionInTrain();
 	else
 		ped->SetPedPositionInCar();
+	// a static entity is never re-sectored by the world loop (only
+	// ProcessCollision calls RemoveAndAdd), so the puppet stayed listed in the
+	// sector where it got in: once the car left the renderer's scan range the
+	// player was not drawn at all. Re-sector it with the car.
+	ped->RemoveAndAdd();
 	SyncPuppetToRw(ped);
 }
 
@@ -771,6 +776,7 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	ped->SetOrientation(0.0f, 0.0f, rnet::DequantAngle(st.heading));
 	ped->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 	ped->SetTurnSpeed(0.0f, 0.0f, 0.0f);
+	ped->RemoveAndAdd();   // keep the world sector current (see AnchorSeatedPuppet)
 	SyncPuppetToRw(ped);   // collisionless puppets are skipped by the engine's sync
 
 	// anim from relayed speed
