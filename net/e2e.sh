@@ -232,7 +232,8 @@ sleep 2
 # A late joiner must receive the FULL roster's looks (Dresser as model 78).
 $BIN/relcs-netbot.exe -name LateJoiner -server 127.0.0.1:$APORT -scenario roam -duration 8 \
 	-expect-model 78 > "$APPOUT/late.log" 2>&1 &
-wait $APP_SRV_PID 2>/dev/null || true
+# the server runs for the whole phase (no -duration); wait on the bot results,
+# not the server, then keep it alive for the reconnect check below.
 for f in dresser late; do wait_result "$APPOUT/$f.log" 30 || FAIL=1; done
 
 DRES=$(grep -o "RESULT: [A-Z]*" "$APPOUT/dresser.log" | head -1)

@@ -889,6 +889,24 @@ static void StopDoorChime(void);
 static void PlayRemoteDoorChime(float x, float y, float z);
 static bool s_doorChime = true;
 
+// --- appearance sync: the local player's chosen look (model + components) ----
+// Default = MI_MALE01. The player customizes via the `model` console command;
+// the server restores a saved look on join (EV_APPEARANCE for our own id).
+static rnet::MsgAppearance s_myAppearance;
+static bool   s_appearanceDirty = false;   // needs sending to the server
+static bool   s_appearanceServerKnown = false; // the server has echoed our look at least once
+
+// queue our look for sending (console command / server restore -> re-send)
+static void SetMyAppearance(uint16_t model, const uint8_t* comps /*8 or null*/)
+{
+	s_myAppearance.playerId = s_net.MyId();
+	if(model != 0) s_myAppearance.model = model;
+	if(comps)
+		for(int i = 0; i < rnet::MAX_APPEARANCE_COMPONENTS; i++)
+			s_myAppearance.components[i] = comps[i];
+	s_appearanceDirty = true;
+}
+
 static void ConsoleExec(const char* line)
 {
 	char cmd[32] = {}, rest[160] = {};
@@ -1797,24 +1815,6 @@ static double s_lastLog = 0.0;
 // flagged teleport and the server resets its movement reference instead of
 // anti-cheat kicking us (snap-back used to ping-pong with the game at 20 Hz)
 static CVector s_lastSentPos(0.0f, 0.0f, 0.0f);
-
-// --- appearance sync: the local player's chosen look (model + components) ----
-// Default = MI_MALE01. The player customizes via the `model` console command;
-// the server restores a saved look on join (EV_APPEARANCE for our own id).
-static rnet::MsgAppearance s_myAppearance;
-static bool   s_appearanceDirty = false;   // needs sending to the server
-static bool   s_appearanceServerKnown = false; // the server has echoed our look at least once
-
-// queue our look for sending (console command / server restore -> re-send)
-static void SetMyAppearance(uint16_t model, const uint8_t* comps /*8 or null*/)
-{
-	s_myAppearance.playerId = s_net.MyId();
-	if(model != 0) s_myAppearance.model = model;
-	if(comps)
-		for(int i = 0; i < rnet::MAX_APPEARANCE_COMPONENTS; i++)
-			s_myAppearance.components[i] = comps[i];
-	s_appearanceDirty = true;
-}
 
 // --- persistent profile sync: wallet + weapon table -------------------------
 static rnet::MsgInventory s_invLast;
@@ -2819,8 +2819,7 @@ void NetGame_Frame(void)
 			s_appearanceDirty = false;
 			s_myAppearance.playerId = s_net.MyId();
 			s_net.SendAppearance(s_myAppearance);
-			fprintf(stderr, "[NET] sent appearance model=%d
-", (int)s_myAppearance.model);
+			fprintf(stderr, "[NET] sent appearance model=%d\n", (int)s_myAppearance.model);
 			fflush(stderr);
 		}
 
