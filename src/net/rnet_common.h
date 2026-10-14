@@ -10,7 +10,8 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 5;  // v5: server map + static vehicles + master favorites
+constexpr uint16_t PROTOCOL_VERSION   = 7;  // v7: MsgVehSpawn carries the owner (entering player) id
+// v5: server map + static vehicles + master favorites
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
 constexpr uint16_t DEFAULT_MASTER_PORT= 7800;  // ENet master server
@@ -175,6 +176,9 @@ struct VehicleState {
 	uint8_t  gas = 0, brake = 0;
 	uint8_t  flags = 0;   // VEHFLAG_*
 	uint16_t health = 1000;
+	// door open ratio per eDoors index (bonnet, boot, front L/R, rear L/R):
+	// 0 = closed, 255 = fully open. Non-car vehicles send zeros.
+	uint8_t  doors[6] = {};
 };
 
 // vehicle flags
@@ -288,6 +292,7 @@ struct MsgVehSpawn {
 	uint16_t vehicleId = 0;
 	uint16_t modelId = 0;
 	float    x = 0, y = 0, z = 0, heading = 0;
+	uint8_t  ownerId = 0xFF; // player whose enter allocated it (0xFF = static/admin)
 };
 
 // MSG_VEH_DESPAWN — the server retired a vehicle (admin delcar, static spawn

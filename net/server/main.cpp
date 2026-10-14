@@ -50,6 +50,7 @@ static void ApplyKeyVal(ServerConfig& cfg, const std::string& key, const std::st
 	else if(key == "announce") cfg.announce = (atoi(val.c_str()) != 0);
 	else if(key == "master") cfg.master = val;
 	else if(key == "master_port") cfg.masterPort = (uint16_t)atoi(val.c_str());
+	else if(key == "public_ip") cfg.publicIp = val;
 	else if(key == "lan_discover") cfg.lanDiscover = (atoi(val.c_str()) != 0);
 	else if(key == "rcon_password") cfg.rconPassword = val;
 	else if(key == "stream_distance") cfg.streamDistance = (float)atof(val.c_str());

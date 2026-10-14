@@ -1,7 +1,8 @@
 // net/bot/main.cpp — relcs-netbot: scripted headless client for E2E testing.
 //
 // Usage:
-//   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos]
+//   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos|fight|solo]
+//   solo roams without requiring peer traffic (lone persistence/rejoin checks)
 //                [-duration 30] [-expect-chat SUBSTR] [-rcon PW] [-cmd "RCON CMD"] [-seed N] [-verbose]
 //
 // Prints 1 Hz telemetry lines consumed by the E2E harness:
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <string>
 #include <map>
+#include <set>
 #include <random>
 #include <algorithm>
 
@@ -55,6 +57,9 @@ struct BotConfig {
 	bool masterQuery = false;
 	int vehModel = 0; // vehicle model for self-created cars (0 = guess)
 	bool voice = false; // -voice: send a 440 Hz tone as voice and report relayed voice frames
+	// -expect-world: late-joiner check — the world that existed before we joined
+	// (a spawned player seated in a moving vehicle) must reach us
+	bool expectWorld = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -179,6 +184,7 @@ int main(int argc, char** argv)
 		else if(a == "-master-query") cfg.masterQuery = true;
 		else if(a == "-vehmodel" && hasNext) cfg.vehModel = atoi(argv[++i]);
 		else if(a == "-voice") cfg.voice = true;
+		else if(a == "-expect-world") cfg.expectWorld = true;
 	}
 	if(cfg.seed == 0) cfg.seed = (uint32_t)std::hash<std::string>{}(cfg.name);
 	std::mt19937 rng(cfg.seed);
@@ -204,11 +210,16 @@ int main(int argc, char** argv)
 	// --- assertion state ---
 	bool gotWelcome = false, gotSpawn = false, kicked = false, disconnected = false;
 	bool gotChatExpect = cfg.expectChat.empty();
-	bool sawPeer = false, sawDeath = false, rconOk = cfg.rconPassword.empty();
+	bool sawPeer = false, sawDeath = false, sawScore = false, rconOk = cfg.rconPassword.empty();
 	bool rconCmdOk = cfg.rconPassword.empty();
 	uint8_t selfId = 0;
 	int statesSent = 0, correctionsReceived = 0, deathsSelf = 0, spawnsSeen = 0;
+	int killsMade = 0, myScore = 0; // fight scenario: kills dealt + latest scoreboard score
 	int vehStatesSeen = 0, vehEntersSeen = 0; // relayed traffic from other drivers
+	int otherSpawnsSeen = 0;   // MSG_SPAWN for other players (join roster replay included)
+	int peerSeatedStates = 0;  // relayed player states that carry a vehicle seat
+	bool vehMoved = false;     // some relayed vehicle changed position while we watched
+	std::map<uint16_t, VehicleState> vehFirst;   // first relayed state per vehicle
 	std::string failReasons;
 	std::map<uint8_t, PeerView> peers;
 	PlayerState self;
@@ -232,6 +243,24 @@ int main(int argc, char** argv)
 	double lastVehState = 0;
 	uint16_t seenVehId = 0xFFFF, seenVehModel = 0; // last vehicle that appeared
 	uint16_t ownVehId = 0xFFFF;                    // last car WE drove (seat 0)
+
+	// --- single-entity / occupancy integrity (vehicle-sync regression guards) ---
+	// live vehicle set: SPAWN adds, DESPAWN removes. A correctly behaving server
+	// gives us exactly ONE entity per real car — never a duplicate. We also count
+	// how many distinct ids were ever spawned and whether any single id was
+	// spawned twice without an intervening despawn (the "car gets duplicated" bug).
+	std::set<uint16_t> liveVehicles;
+	std::map<uint16_t, int> vehSpawnCount;         // id -> times SPAWN seen while already live
+	size_t maxLiveVehicles = 0;
+	int dupSpawns = 0;                             // SPAWN for an id already live (duplicate)
+	// occupancy integrity: a VEH_ENTER naming US must be one WE asked for. We set
+	// expectSelfEnter just before sending our own enter; any self-enter arriving
+	// while that flag is clear means the server put us in a car we never entered.
+	bool expectSelfEnter = false;
+	int unexpectedSelfEnters = 0;
+	// how many DISTINCT other players we saw seated via VEH_ENTER (not us). Used to
+	// confirm occupancy stays scoped to the player who actually entered.
+	std::map<uint8_t, uint16_t> otherOccupant;     // playerId -> vehicleId they entered
 
 	// proximity voice (-voice): tone frames out, relayed frames in
 	double lastVoice = 0.0;
@@ -382,6 +411,7 @@ int main(int argc, char** argv)
 						pv.state.zMm = QuantPos(sp.z);
 						pv.lastSeen = elapsed();
 						sawPeer = true;
+						otherSpawnsSeen++;
 						if(cfg.verbose)
 							std::printf("[%.3f] SPAWN-other id=%d at %.1f %.1f %.1f\n",
 							            elapsed(), (int)sp.playerId, sp.x, sp.y, sp.z);
@@ -396,6 +426,8 @@ int main(int argc, char** argv)
 							pv.state = st;
 							pv.lastSeen = elapsed();
 							sawPeer = true;
+							if(st.vehicleId != VEHICLE_NONE && st.vehicleId != VEHICLE_UNSYNCED)
+								peerSeatedStates++;
 						}
 					}
 					break;
@@ -434,9 +466,27 @@ int main(int argc, char** argv)
 							alive = false;
 							deathsSelf++;
 						}
+						if(d.killerId == selfId)
+							killsMade++;
 						if(cfg.verbose)
 							std::printf("[%.3f] DEATH victim=%d killer=%d\n",
 							            elapsed(), (int)d.victimId, (int)d.killerId);
+					}
+					break;
+				}
+				case MSG_SCORE_UPDATE:{
+					MsgScoreUpdate su;
+					if(ReadScoreUpdate(r, su)){
+						for(int i = 0; i < su.count; i++)
+							if(su.entries[i].playerId == selfId){
+								myScore = su.entries[i].score;
+								sawScore = true;
+								if(cfg.verbose)
+										std::printf("[%.3f] SCORE me=%d kills=%d deaths=%d\n",
+										            elapsed(), myScore,
+										            (int)su.entries[i].kills,
+										            (int)su.entries[i].deaths);
+							}
 					}
 					break;
 				}
@@ -459,6 +509,8 @@ int main(int argc, char** argv)
 						correctionsReceived++;
 						self.xMm = fix.xMm; self.yMm = fix.yMm; self.zMm = fix.zMm;
 						self.heading = fix.heading;
+						// a server teleport moves our home too: roam around the new spot
+						homeX = fix.xMm / 1000.0f; homeY = fix.yMm / 1000.0f; homeZ = fix.zMm / 1000.0f;
 						{ // position discontinuity marker for the e2e convergence check
 							double jw = std::chrono::duration_cast<std::chrono::duration<double>>(
 								std::chrono::system_clock::now().time_since_epoch()).count();
@@ -505,9 +557,31 @@ int main(int argc, char** argv)
 					if(ReadVehSpawn(r, vs)){
 						seenVehId = vs.vehicleId;
 						seenVehModel = vs.modelId;
+						// single-entity guard: a SPAWN for a car already in our live
+						// set is a duplicate (the bug under test). Count it, don't
+						// grow the set past one entry for that id.
+						if(liveVehicles.count(vs.vehicleId)){
+							dupSpawns++;
+							vehSpawnCount[vs.vehicleId]++;
+						}else{
+							liveVehicles.insert(vs.vehicleId);
+						}
+						if(liveVehicles.size() > maxLiveVehicles)
+							maxLiveVehicles = liveVehicles.size();
 						if(cfg.verbose)
-							std::printf("[%.3f] VEH_SPAWN id=%d model=%d\n",
-							            elapsed(), (int)vs.vehicleId, (int)vs.modelId);
+							std::printf("[%.3f] VEH_SPAWN id=%d model=%d live=%d\n",
+							            elapsed(), (int)vs.vehicleId, (int)vs.modelId,
+							            (int)liveVehicles.size());
+					}
+					break;
+				}
+				case MSG_VEH_DESPAWN:{
+					MsgVehDespawn vd;
+					if(ReadVehDespawn(r, vd)){
+						liveVehicles.erase(vd.vehicleId);
+						if(cfg.verbose)
+							std::printf("[%.3f] VEH_DESPAWN id=%d live=%d\n",
+							            elapsed(), (int)vd.vehicleId, (int)liveVehicles.size());
 					}
 					break;
 				}
@@ -516,7 +590,17 @@ int main(int argc, char** argv)
 					if(ReadVehEnter(r, m)){
 						if(m.playerId != selfId){
 							vehEntersSeen++;
+							// occupancy stays scoped to the entering player: record
+							// who the server seated and where
+							otherOccupant[m.playerId] = m.vehicleId;
 						}else{
+							// a self-enter we did NOT initiate = the server forced us
+							// into a car (the "other clients get force-spawned into a
+							// duplicate" bug). expectSelfEnter is armed only around our
+							// own enter request.
+							if(!expectSelfEnter)
+								unexpectedSelfEnters++;
+							expectSelfEnter = false;
 							myVehicle = m.vehicleId;
 							mySeat = m.seat;
 							myModel = m.modelId;
@@ -544,6 +628,12 @@ int main(int argc, char** argv)
 					VehicleState vst;
 					if(ReadVehicleState(r, vst)){
 						vehStatesSeen++;
+						auto vf = vehFirst.find(vst.vehicleId);
+						if(vf == vehFirst.end())
+							vehFirst[vst.vehicleId] = vst;
+						else if(DistMm(vf->second.xMm, vf->second.yMm, vf->second.zMm,
+						               vst.xMm, vst.yMm, vst.zMm) > 2.0f)
+							vehMoved = true;
 						if(cfg.verbose && vehStatesSeen % 40 == 1)
 							std::printf("[%.3f] VEH_STATE veh=%d at %.1f %.1f %.1f\n",
 							            elapsed(), (int)vst.vehicleId,
@@ -591,9 +681,22 @@ int main(int argc, char** argv)
 		// final positions exactly across bots
 		if(t - lastWalk >= 0.05 && alive && t < cfg.duration - 5.0){
 			lastWalk = t;
-			std::uniform_real_distribution<float> turn(-0.6f, 0.6f);
-			heading += turn(rng);
-			float speed = (cfg.scenario == "chaos") ? 8.0f : 3.0f;
+			bool fight = (cfg.scenario == "fight");
+			if(fight && !peers.empty()){
+				// converge: run at the nearest peer so damage stays in range
+				float bx = self.xMm / 1000.0f, by = self.yMm / 1000.0f;
+				float bd = 1e30f;
+				for(auto& kv : peers){
+					float dx = kv.second.state.xMm / 1000.0f - bx;
+					float dy = kv.second.state.yMm / 1000.0f - by;
+					float d = dx * dx + dy * dy;
+					if(d < bd){ bd = d; heading = std::atan2(dy, dx); }
+				}
+			}else{
+				std::uniform_real_distribution<float> turn(-0.6f, 0.6f);
+				heading += turn(rng);
+			}
+			float speed = (cfg.scenario == "chaos" || fight) ? 8.0f : 3.0f;
 			if(cfg.scenario == "chaos"){
 				std::uniform_real_distribution<float> jump(-40.0f, 40.0f);
 				if(rng() % 40 == 0){ // occasional wild move — expects server correction
@@ -651,8 +754,9 @@ int main(int argc, char** argv)
 			sendChat(msg);
 		}
 
-		// combat: damage a random other player every 0.5s
-		if(cfg.scenario == "combat" && t - lastDamage >= 0.5 && alive && !peers.empty()){
+		// combat/fight: damage a random other player every 0.5s
+		if((cfg.scenario == "combat" || cfg.scenario == "fight") &&
+		   t - lastDamage >= 0.5 && alive && !peers.empty()){
 			lastDamage = t;
 			auto it = peers.begin();
 			std::uniform_int_distribution<size_t> d(0, peers.size() - 1);
@@ -671,8 +775,12 @@ int main(int argc, char** argv)
 
 		// drive: cycle enter/drive/exit — join a vehicle someone else created
 		// when one exists (passenger flow), otherwise spawn our own and drive
-		if(cfg.scenario == "drive" && gotSpawn && t - lastVehCycle >= 8.0){
+		// cruise: take our own car once, 2 s in, and keep driving it to the end
+		bool cruise = (cfg.scenario == "cruise");
+		if((cfg.scenario == "drive" && gotSpawn && t - lastVehCycle >= 8.0) ||
+		   (cruise && gotSpawn && myVehicle == 0xFFFF && t - lastVehCycle >= 2.0)){
 			lastVehCycle = t;
+			if(cruise) seenVehId = 0xFFFF;   // always our own car, never a passenger seat
 			if(myVehicle == 0xFFFF){
 				BitWriter w;
 				BeginMsg(w, MSG_VEH_ENTER);					MsgVehEnter ve;
@@ -692,6 +800,7 @@ int main(int argc, char** argv)
 				WriteVehEnter(w, ve);
 				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 				enet_peer_send(peer, CHAN_RELIABLE, pkt);
+				expectSelfEnter = true; // the server's VEH_ENTER echo for us is expected
 				myVehicle = 0x1234; // provisional; the server's VEH_ENTER echo confirms
 			}else{
 				BitWriter w;
@@ -802,10 +911,41 @@ int main(int argc, char** argv)
 	if(!sawPeer && cfg.scenario != "solo") failReasons += "no_peer_state ";
 	if(cfg.scenario == "combat" && !sawDeath) failReasons += "no_death ";
 	if(cfg.scenario == "combat" && deathsSelf == 0 && !failReasons.empty()) {}
+	// fight: someone died, the scoreboard covered us, and we dealt damage.
+	// kills are not required per-bot: with two fighters only the winner scores.
+	if(cfg.scenario == "fight" && !sawDeath) failReasons += "no_death ";
+	if(cfg.scenario == "fight" && !sawScore) failReasons += "no_score ";
 	if(!rconOk) failReasons += "rcon_auth_failed ";
 	if(!rconCmdOk) failReasons += "rcon_cmd_failed ";
 	if(statesSent < (int)(cfg.duration * 10)) failReasons += "too_few_states ";
 	if(kicked) failReasons += "kicked ";
+
+	// --- vehicle-sync integrity assertions ---
+	// no car was ever duplicated (same id spawned twice without a despawn)
+	if(dupSpawns > 0) failReasons += "duplicate_vehicle_spawn ";
+	// we were never forced into a car we did not enter
+	if(unexpectedSelfEnters > 0) failReasons += "forced_into_vehicle ";
+	// the drive scenario must have actually exercised an enter-and-drive cycle
+	if(cfg.scenario == "drive"){
+		if(ownVehId == 0xFFFF && vehStatesSeen == 0 && statesSent > 0)
+			failReasons += "drive_never_entered ";
+	}
+	// machine-readable integrity line for the e2e harness (single-entity check)
+	std::printf("[BOT] VEHSUMMARY live_now=%d max_live=%d dup_spawns=%d "
+	            "forced_self_enters=%d other_occupants=%d own_veh=%d\n",
+	            (int)liveVehicles.size(), (int)maxLiveVehicles, dupSpawns,
+	            unexpectedSelfEnters, (int)otherOccupant.size(), (int)ownVehId);
+	if(cfg.scenario == "cruise" && ownVehId == 0xFFFF) failReasons += "cruise_never_drove ";
+	if(cfg.expectWorld){
+		if(otherSpawnsSeen == 0) failReasons += "no_roster_spawn ";
+		if(liveVehicles.empty()) failReasons += "no_vehicle ";
+		if(otherOccupant.empty()) failReasons += "no_occupant ";
+		if(peerSeatedStates == 0) failReasons += "no_seated_state ";
+		if(vehStatesSeen == 0) failReasons += "no_vehicle_state ";
+		else if(!vehMoved) failReasons += "vehicle_never_moved ";
+	}
+	std::printf("[BOT] WORLDSUMMARY other_spawns=%d seated_states=%d veh_states=%d veh_moved=%d\n",
+	            otherSpawnsSeen, peerSeatedStates, vehStatesSeen, (int)vehMoved);
 	if(cfg.voice){
 		if(voiceSent == 0) failReasons += "no_voice_sent ";
 		if(voiceOutOfRange > 0) failReasons += "voice_out_of_range ";
@@ -815,9 +955,9 @@ int main(int argc, char** argv)
 
 	bool pass = failReasons.empty();
 	std::printf("[BOT] RESULT: %s %s| states=%d corrections=%d deaths=%d spawns=%d "
-	            "vehstates=%d vehenters=%d veh=%d\n",
+	            "vehstates=%d vehenters=%d veh=%d kills=%d score=%d\n",
 	            pass ? "PASS" : "FAIL", failReasons.c_str(),
 	            statesSent, correctionsReceived, deathsSelf, spawnsSeen,
-	            vehStatesSeen, vehEntersSeen, (int)myVehicle);
+	            vehStatesSeen, vehEntersSeen, (int)myVehicle, killsMade, myScore);
 	return pass ? 0 : 1;
 }

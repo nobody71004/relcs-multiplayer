@@ -377,3 +377,5 @@ codewarrior/Debug/
 src/extras/GitSHA1.cpp
 # runtime data
 profiles.db*
+net/master.db
+net/*.db
