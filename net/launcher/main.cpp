@@ -1078,14 +1078,18 @@ static void HandleQuery(const char* request, void*)
 				GameDirOk(d, data2, cefOk);
 			}
 		}
+		// NOTE: boolean/numeric fields must NOT be wrapped in quotes. The next
+		// segment after such a value starts with ,\" (not \",\") — otherwise the
+		// value becomes a malformed string (e.g. gameData:true") and the whole
+		// init reply fails to parse in the browser.
 		Reply("{\"reply\":\"init\",\"nick\":\"" + Jesc(g_nick) +
 		      "\",\"game\":\"" + Jesc(gameShown) +
 		      "\",\"gameHow\":\"" + Jesc(how) +
 		      "\",\"gameData\":" + (dataOk ? "true" : "false") +
-		      "\",\"gameCef\":" + (cefOk ? "true" : "false") +
-		      "\",\"gameError\":\"" + Jesc(gErr) +
+		      ",\"gameCef\":" + (cefOk ? "true" : "false") +
+		      ",\"gameError\":\"" + Jesc(gErr) +
 		      "\",\"version\":" + std::to_string((int)PROTOCOL_VERSION) +
-		      "\",\"master\":\"" + Jesc(g_masterHost + ":" + std::to_string(g_masterPort)) +
+		      ",\"master\":\"" + Jesc(g_masterHost + ":" + std::to_string(g_masterPort)) +
 		      "\",\"rcon\":\"" + Jesc(g_rconPw) +
 		      "\",\"pass\":\"" + Jesc(g_pass) +
 		      "\",\"profiles\":" + ProfilesToJson() + "}");
@@ -1241,7 +1245,7 @@ static void HandleQuery(const char* request, void*)
 			Reply("{\"reply\":\"game\",\"ok\":" + std::string(exe.empty() ? "false" : "true") +
 			      ",\"path\":\"" + Jesc(exe) + "\",\"how\":\"" + Jesc(how) +
 			      "\",\"data\":" + (dataOk ? "true" : "false") +
-			      "\",\"cef\":" + (cefOk ? "true" : "false") +
+			      ",\"cef\":" + (cefOk ? "true" : "false") +
 			      ",\"error\":\"" + Jesc(err) + "\"}");
 		}).detach();
 	}else if(cmd == "diag"){
