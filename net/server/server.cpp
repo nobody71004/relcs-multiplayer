@@ -577,6 +577,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			ve.vehicleId = v.id;
 			ve.seat = (uint8_t)s;
 			ve.modelId = v.modelId;
+			ve.x = vs.x; ve.y = vs.y; ve.z = vs.z; ve.heading = vs.heading;
 			WriteVehEnter(we, ve);
 			SendTo(peer, we, CHAN_RELIABLE, true);
 		}
@@ -657,20 +658,31 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 
 	// admins adopt every move: no validation flags, no rubber-band, no kick
 	uint8_t flags = admin ? 0 : ValidateMove(p->state, st, dt);
-	if(!admin && p->lastStateTime > 0.0 && (flags & (VAL_TOO_FAST | VAL_TELEPORT))){
+	bool failed = !admin && p->lastStateTime > 0.0 && (flags & (VAL_TOO_FAST | VAL_TELEPORT));
+	// a streak of refusals means the client really is somewhere the server never
+	// accepted (a flagged teleport lost in transit, a correction the client did
+	// not or could not apply): re-anchor instead of freezing the player for
+	// everyone until the violation kick
+	RefVerdict verdict = p->moveRef.Judge(failed);
+	if(failed){
 		p->violations++;
 		Log("violation #%d %s n=%d dt=%.3f (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f) flags=%02x",
 		    p->id, p->name.c_str(), p->violations, dt,
 		    p->state.xMm/1000.0f, p->state.yMm/1000.0f, p->state.zMm/1000.0f,
 		    st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f, (unsigned)flags);
-		// rubber-band: push the client back to the last server-accepted state
-		BitWriter w;
-		BeginMsg(w, MSG_CORRECTION);
-		PlayerState fix = p->state;
-		fix.health = p->health;
-		fix.armour = p->armour;
-		WritePlayerState(w, fix);
-		SendTo(p->peer, w, CHAN_RELIABLE, true);
+		if(verdict == REF_RESYNC){
+			Log("[resync] %s re-anchored at (%.1f,%.1f,%.1f) after %d refused moves",
+			    p->name.c_str(), st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f, MOVE_RESYNC_REJECTS);
+		}else{
+			// rubber-band: push the client back to the last server-accepted state
+			BitWriter w;
+			BeginMsg(w, MSG_CORRECTION);
+			PlayerState fix = p->state;
+			fix.health = p->health;
+			fix.armour = p->armour;
+			WritePlayerState(w, fix);
+			SendTo(p->peer, w, CHAN_RELIABLE, true);
+		}
 		if(p->violations > VIOLATION_KICK){
 			KickPlayer(p->id, "movement validation failed");
 			return;
@@ -707,11 +719,11 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	st.health = p->health;
 	st.armour = p->armour;
 
-	// never adopt a failed move: the correction we send points at the last good
+	// never adopt a refused move: the correction we send points at the last good
 	// state, so adopting the bad one would make client and server swap reference
 	// frames every tick (a 20 Hz rubber-band oscillation — seen as alternating
-	// positions in the violation log)
-	if(!(flags & (VAL_TOO_FAST | VAL_TELEPORT))){
+	// positions in the violation log). A re-anchor (REF_RESYNC) is adopted.
+	if(verdict != REF_REJECT){
 		// occupancy is server-side truth (HandleVehEnter/Exit): relay that, not
 		// the client's claim, so remotes can reconcile seating from any state
 		st.vehicleId = p->state.vehicleId;
@@ -1012,8 +1024,11 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 		// allocate a new vehicle at the player's position. The spawn is tagged
 		// with the entering player as owner: that client binds the car it already
 		// has locally instead of materializing a duplicate puppet.
-		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
-		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false, p->id);
+		// v8: placed where the client says its car is (bounded by the player's
+		// accepted position), not where the player last stood on foot
+		float vx, vy, vz, vh;
+		PlaceNewVehicle(p->state, m, vx, vy, vz, vh);
+		v = SpawnVehicle(m.modelId, vx, vy, vz, vh, false, p->id);
 		if(!v){
 			Log("[VEHSYNC] enter DENIED player=%d: could not spawn model %d", (int)p->id, (int)m.modelId);
 			return;
@@ -1056,6 +1071,10 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	out.vehicleId = vid;
 	out.seat = seat;   // the ASSIGNED seat (may differ from the request)
 	out.modelId = v->modelId;
+	out.x = DequantPos(v->state.xMm);
+	out.y = DequantPos(v->state.yMm);
+	out.z = DequantPos(v->state.zMm);
+	out.heading = DequantAngle(v->state.heading);
 	WriteVehEnter(w, out);
 	Broadcast(w, CHAN_RELIABLE, true);
 }
@@ -1352,6 +1371,7 @@ void Server::SpawnPlayer(uint8_t playerId, float x, float y, float z, float head
 	p->respawnAt = 0.0;
 
 	PlayerState& st = p->state;
+	p->moveRef = MoveReference();
 	st.playerId = playerId;
 	st.xMm = QuantPos(x); st.yMm = QuantPos(y); st.zMm = QuantPos(z);
 	st.velX = st.velY = st.velZ = 0;
@@ -1453,6 +1473,7 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 	p->state.xMm = QuantPos(x); p->state.yMm = QuantPos(y); p->state.zMm = QuantPos(z);
 	p->state.heading = QuantAngle(heading);
 	p->lastStateTime = Now();
+	p->moveRef = MoveReference();
 
 	BitWriter w;
 	BeginMsg(w, MSG_CORRECTION);

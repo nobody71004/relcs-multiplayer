@@ -1,9 +1,30 @@
 // net/bot/main.cpp — relcs-netbot: scripted headless client for E2E testing.
 //
 // Usage:
-//   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos|fight|solo]
-//   solo roams without requiring peer traffic (lone persistence/rejoin checks)
+//   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos|fight|solo|cruise|watch]
 //                [-duration 30] [-expect-chat SUBSTR] [-rcon PW] [-cmd "RCON CMD"] [-seed N] [-verbose]
+//   solo roams without requiring peer traffic (lone persistence/rejoin checks)
+//
+// Vehicle-sync scenarios (late-join / reference-freeze / parked-car coverage):
+//   cruise  — spawn a car of our own (VEH_ENTER 0xFFFF, like the game's `ride`
+//             console cheat) and drive it as the authoritative driver.
+//             -speed M/S         cruise speed (default 12)
+//             -jump-at T -jump-dist D [-drop-jump]
+//                                at T s relocate the car D m (a scripted warp);
+//                                -drop-jump loses the flagged state packets in
+//                                transit, exactly like a dropped unreliable packet
+//             -ignore-corrections  never act on MSG_CORRECTION (a client that
+//                                cannot move the car back: the server must
+//                                re-anchor instead of freezing / kicking us)
+//             -drive-to X,Y,Z    drive straight there, park, get out and stay
+//   watch   — stand still and observe the other players' cars.
+//             -goto-at T -goto X,Y,Z   relocate (flagged teleport) at T s
+//             -expect-driver     at the end another player must be seen seated
+//                                as driver of a live vehicle that is moving, with
+//                                fresh vehicle + player state and a MSG_SPAWN for
+//                                every peer we received states from
+//             -expect-vehicle-near X,Y,Z,R
+//                                at the end a live vehicle must be known within R m
 //
 // Prints 1 Hz telemetry lines consumed by the E2E harness:
 //   [<unix t>] IAM <x> <y> <z>       — this bot's authoritative position
@@ -57,10 +78,37 @@ struct BotConfig {
 	bool masterQuery = false;
 	int vehModel = 0; // vehicle model for self-created cars (0 = guess)
 	bool voice = false; // -voice: send a 440 Hz tone as voice and report relayed voice frames
+	// cruise / watch scenarios (see header)
+	float speed = 12.0f;
+	double jumpAt = -1.0;
+	float jumpDist = 150.0f;
+	bool dropJump = false;
+	bool ignoreCorrections = false;   // a client that cannot act on MSG_CORRECTION
+	bool driveTo = false;
+	float driveX = 0, driveY = 0, driveZ = 0;
+	double gotoAt = -1.0;
+	float gotoX = 0, gotoY = 0, gotoZ = 0;
+	bool expectDriver = false;
+	bool expectNear = false;
+	float nearX = 0, nearY = 0, nearZ = 0, nearR = 3.0f;
 	// -expect-world: late-joiner check — the world that existed before we joined
 	// (a spawned player seated in a moving vehicle) must reach us
 	bool expectWorld = false;
 };
+
+// "x,y,z[,w]" -> floats; returns the number parsed
+static int ParseFloats(const char* s, float* out, int n)
+{
+	int got = 0;
+	while(got < n && s && *s){
+		char* end = nullptr;
+		float v = std::strtof(s, &end);
+		if(end == s) break;
+		out[got++] = v;
+		s = (*end == ',') ? end + 1 : end;
+	}
+	return got;
+}
 
 // ---------------------------------------------------------------------------
 // Utility modes (no game session)
@@ -184,6 +232,27 @@ int main(int argc, char** argv)
 		else if(a == "-master-query") cfg.masterQuery = true;
 		else if(a == "-vehmodel" && hasNext) cfg.vehModel = atoi(argv[++i]);
 		else if(a == "-voice") cfg.voice = true;
+		else if(a == "-speed" && hasNext) cfg.speed = (float)atof(argv[++i]);
+		else if(a == "-jump-at" && hasNext) cfg.jumpAt = atof(argv[++i]);
+		else if(a == "-jump-dist" && hasNext) cfg.jumpDist = (float)atof(argv[++i]);
+		else if(a == "-drop-jump") cfg.dropJump = true;
+		else if(a == "-ignore-corrections") cfg.ignoreCorrections = true;
+		else if(a == "-drive-to" && hasNext){
+			float v[3];
+			cfg.driveTo = ParseFloats(argv[++i], v, 3) == 3;
+			cfg.driveX = v[0]; cfg.driveY = v[1]; cfg.driveZ = v[2];
+		}
+		else if(a == "-goto-at" && hasNext) cfg.gotoAt = atof(argv[++i]);
+		else if(a == "-goto" && hasNext){
+			float v[3];
+			if(ParseFloats(argv[++i], v, 3) == 3){ cfg.gotoX = v[0]; cfg.gotoY = v[1]; cfg.gotoZ = v[2]; }
+		}
+		else if(a == "-expect-driver") cfg.expectDriver = true;
+		else if(a == "-expect-vehicle-near" && hasNext){
+			float v[4] = { 0, 0, 0, 3.0f };
+			cfg.expectNear = ParseFloats(argv[++i], v, 4) >= 3;
+			cfg.nearX = v[0]; cfg.nearY = v[1]; cfg.nearZ = v[2]; cfg.nearR = v[3];
+		}
 		else if(a == "-expect-world") cfg.expectWorld = true;
 	}
 	if(cfg.seed == 0) cfg.seed = (uint32_t)std::hash<std::string>{}(cfg.name);
@@ -261,6 +330,30 @@ int main(int argc, char** argv)
 	// how many DISTINCT other players we saw seated via VEH_ENTER (not us). Used to
 	// confirm occupancy stays scoped to the player who actually entered.
 	std::map<uint8_t, uint16_t> otherOccupant;     // playerId -> vehicleId they entered
+
+	// --- watch scenario: what this client knows about the world's vehicles ---
+	struct VehView {
+		bool hasPos = false;
+		float x = 0, y = 0, z = 0;
+		double lastState = -1.0;   // elapsed() of the last MSG_VEHICLE_STATE
+		int states = 0;
+		float minX = 0, maxX = 0, minY = 0, maxY = 0;
+	};
+	std::map<uint16_t, VehView> vehView;
+	std::map<uint8_t, std::pair<uint16_t, uint8_t>> seatOf; // other player -> (vehicle, seat) per VEH_ENTER/EXIT
+	std::set<uint8_t> peerSpawnSeen;                // other players we got a MSG_SPAWN for
+	std::set<uint8_t> peerStateSeen;                // other players we got relayed states for
+
+	// --- cruise scenario: our own car ---
+	bool carRequested = false;
+	double spawnedAt = -1.0;
+	float circleCX = 0, circleCY = 0, circleA = 0, circleR = 25.0f;
+	bool jumped = false, dropState = false, dropVehState = false;
+	bool parked = false;
+	uint16_t parkedId = 0xFFFF;
+	float parkX = 0, parkY = 0, parkZ = 0;
+	int carCorrections = 0;                         // corrections applied to our car
+	bool gone = false;                               // watch: -goto relocation done
 
 	// proximity voice (-voice): tone frames out, relayed frames in
 	double lastVoice = 0.0;
@@ -340,6 +433,13 @@ int main(int argc, char** argv)
 		}
 		lastSentT = elapsed();
 		sentX = px; sentY = py; sentZ = pz;
+		if(dropState){
+			// simulated loss: the client believes it sent this state (its own
+			// reference moves on) but the packet never reaches the server
+			dropState = false;
+			statesSent++;
+			return;
+		}
 		BitWriter w;
 		BeginMsg(w, MSG_PLAYER_STATE);
 		self.playerId = selfId;
@@ -394,6 +494,7 @@ int main(int argc, char** argv)
 						self.heading = QuantAngle(sp.heading);
 						homeX = sp.x; homeY = sp.y; homeZ = sp.z;
 						heading = sp.heading;
+						spawnedAt = elapsed();
 						{ // position discontinuity marker for the e2e convergence check
 							double jw = std::chrono::duration_cast<std::chrono::duration<double>>(
 								std::chrono::system_clock::now().time_since_epoch()).count();
@@ -411,6 +512,7 @@ int main(int argc, char** argv)
 						pv.state.zMm = QuantPos(sp.z);
 						pv.lastSeen = elapsed();
 						sawPeer = true;
+						peerSpawnSeen.insert(sp.playerId);
 						otherSpawnsSeen++;
 						if(cfg.verbose)
 							std::printf("[%.3f] SPAWN-other id=%d at %.1f %.1f %.1f\n",
@@ -426,6 +528,7 @@ int main(int argc, char** argv)
 							pv.state = st;
 							pv.lastSeen = elapsed();
 							sawPeer = true;
+							peerStateSeen.insert(st.playerId);
 							if(st.vehicleId != VEHICLE_NONE && st.vehicleId != VEHICLE_UNSYNCED)
 								peerSeatedStates++;
 						}
@@ -507,6 +610,15 @@ int main(int argc, char** argv)
 					PlayerState fix;
 					if(ReadPlayerState(r, fix)){
 						correctionsReceived++;
+						if(cfg.ignoreCorrections)
+							break;
+						// like the game client, a seated correction moves the car we
+						// sit in (and us with it): keep driving the same loop from there
+						if(cfg.scenario == "cruise" && self.vehicleId != VEHICLE_NONE){
+							carCorrections++;
+							circleCX += fix.xMm / 1000.0f - self.xMm / 1000.0f;
+							circleCY += fix.yMm / 1000.0f - self.yMm / 1000.0f;
+						}
 						self.xMm = fix.xMm; self.yMm = fix.yMm; self.zMm = fix.zMm;
 						self.heading = fix.heading;
 						// a server teleport moves our home too: roam around the new spot
@@ -529,6 +641,7 @@ int main(int argc, char** argv)
 				case MSG_PLAYER_QUIT:{
 					uint8_t id = r.ReadU8();
 					peers.erase(id);
+					seatOf.erase(id);
 					break;
 				}
 				case MSG_KICK:
@@ -568,6 +681,12 @@ int main(int argc, char** argv)
 						}
 						if(liveVehicles.size() > maxLiveVehicles)
 							maxLiveVehicles = liveVehicles.size();
+						VehView& vv = vehView[vs.vehicleId];
+						if(!vv.hasPos){
+							vv.hasPos = true;
+							vv.x = vs.x; vv.y = vs.y; vv.z = vs.z;
+							vv.minX = vv.maxX = vs.x; vv.minY = vv.maxY = vs.y;
+						}
 						if(cfg.verbose)
 							std::printf("[%.3f] VEH_SPAWN id=%d model=%d live=%d\n",
 							            elapsed(), (int)vs.vehicleId, (int)vs.modelId,
@@ -579,6 +698,7 @@ int main(int argc, char** argv)
 					MsgVehDespawn vd;
 					if(ReadVehDespawn(r, vd)){
 						liveVehicles.erase(vd.vehicleId);
+						vehView.erase(vd.vehicleId);
 						if(cfg.verbose)
 							std::printf("[%.3f] VEH_DESPAWN id=%d live=%d\n",
 							            elapsed(), (int)vd.vehicleId, (int)liveVehicles.size());
@@ -593,6 +713,7 @@ int main(int argc, char** argv)
 							// occupancy stays scoped to the entering player: record
 							// who the server seated and where
 							otherOccupant[m.playerId] = m.vehicleId;
+							seatOf[m.playerId] = std::make_pair(m.vehicleId, m.seat);
 						}else{
 							// a self-enter we did NOT initiate = the server forced us
 							// into a car (the "other clients get force-spawned into a
@@ -615,7 +736,9 @@ int main(int argc, char** argv)
 				}
 				case MSG_VEH_EXIT:{
 					MsgVehExit m;
-					if(ReadVehExit(r, m) && m.playerId == selfId){
+					if(ReadVehExit(r, m) && m.playerId != selfId)
+						seatOf.erase(m.playerId);
+					else if(r.Ok() && m.playerId == selfId){
 						myVehicle = 0xFFFF;
 						mySeat = 0xFF;
 						self.vehicleId = VEHICLE_NONE;
@@ -628,6 +751,16 @@ int main(int argc, char** argv)
 					VehicleState vst;
 					if(ReadVehicleState(r, vst)){
 						vehStatesSeen++;
+						VehView& vv = vehView[vst.vehicleId];
+						vv.x = vst.xMm / 1000.0f; vv.y = vst.yMm / 1000.0f; vv.z = vst.zMm / 1000.0f;
+						if(!vv.hasPos){
+							vv.minX = vv.maxX = vv.x; vv.minY = vv.maxY = vv.y;
+						}
+						vv.hasPos = true;
+						vv.lastState = elapsed();
+						vv.states++;
+						vv.minX = std::min(vv.minX, vv.x); vv.maxX = std::max(vv.maxX, vv.x);
+						vv.minY = std::min(vv.minY, vv.y); vv.maxY = std::max(vv.maxY, vv.y);
 						auto vf = vehFirst.find(vst.vehicleId);
 						if(vf == vehFirst.end())
 							vehFirst[vst.vehicleId] = vst;
@@ -679,7 +812,8 @@ int main(int argc, char** argv)
 
 		// random walk — settle (park) for the last 5 s so the harness can compare
 		// final positions exactly across bots
-		if(t - lastWalk >= 0.05 && alive && t < cfg.duration - 5.0){
+		bool walks = cfg.scenario != "cruise" && cfg.scenario != "watch";
+		if(walks && t - lastWalk >= 0.05 && alive && t < cfg.duration - 5.0){
 			lastWalk = t;
 			bool fight = (cfg.scenario == "fight");
 			if(fight && !peers.empty()){
@@ -716,6 +850,104 @@ int main(int argc, char** argv)
 			self.heading = QuantAngle(heading);
 			self.velX = QuantVel(std::cos(heading) * speed);
 			self.velY = QuantVel(std::sin(heading) * speed);
+		}
+
+		// cruise: take a car of our own (like the game's `ride` cheat: the car
+		// exists locally first, the server learns about it from VEH_ENTER 0xFFFF)
+		// and drive it as the authoritative driver
+		if(cfg.scenario == "cruise" && gotSpawn && alive && !carRequested && !parked &&
+		   spawnedAt >= 0.0 && t - spawnedAt >= 1.0){
+			carRequested = true;
+			// the car appears 4 m ahead and the player is seated in it
+			self.xMm = QuantPos(self.xMm / 1000.0f + std::cos(heading) * 4.0f);
+			self.yMm = QuantPos(self.yMm / 1000.0f + std::sin(heading) * 4.0f);
+			self.vehicleId = VEHICLE_UNSYNCED;   // riding, no net id yet
+			self.seat = 0;
+			circleA = heading - 1.5707963f;      // drive tangentially from here
+			circleCX = self.xMm / 1000.0f - std::cos(circleA) * circleR;
+			circleCY = self.yMm / 1000.0f - std::sin(circleA) * circleR;
+			BitWriter w;
+			BeginMsg(w, MSG_VEH_ENTER);
+			MsgVehEnter ve;
+			ve.playerId = selfId;
+			ve.vehicleId = 0xFFFF;
+			ve.seat = 0;
+			ve.modelId = (uint16_t)(cfg.vehModel > 0 ? cfg.vehModel : 151);
+			ve.x = self.xMm / 1000.0f; ve.y = self.yMm / 1000.0f; ve.z = self.zMm / 1000.0f;
+			ve.heading = heading;
+			WriteVehEnter(w, ve);
+			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+			enet_peer_send(peer, CHAN_RELIABLE, pkt);
+			expectSelfEnter = true;
+			myVehicle = 0x1234; // provisional until the VEH_ENTER echo
+			double jw = std::chrono::duration_cast<std::chrono::duration<double>>(
+				std::chrono::system_clock::now().time_since_epoch()).count();
+			std::printf("[%.3f] CAR %.2f %.2f %.2f\n", jw,
+			            self.xMm / 1000.0f, self.yMm / 1000.0f, self.zMm / 1000.0f);
+		}
+		if(cfg.scenario == "cruise" && carRequested && !parked && self.vehicleId != VEHICLE_NONE &&
+		   t - lastWalk >= 0.05){
+			float step = cfg.speed * (float)(t - lastWalk);
+			if(step > cfg.speed * 0.1f) step = cfg.speed * 0.1f;
+			lastWalk = t;
+			float px = self.xMm / 1000.0f, py = self.yMm / 1000.0f, pz = self.zMm / 1000.0f;
+			float nx, ny, nz = pz;
+			if(cfg.driveTo){
+				float dx = cfg.driveX - px, dy = cfg.driveY - py, dz = cfg.driveZ - pz;
+				float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+				heading = std::atan2(dy, dx);
+				if(d <= step){
+					nx = cfg.driveX; ny = cfg.driveY; nz = cfg.driveZ;
+				}else{
+					nx = px + dx / d * step; ny = py + dy / d * step; nz = pz + dz / d * step;
+				}
+			}else{
+				circleA += step / circleR;
+				nx = circleCX + std::cos(circleA) * circleR;
+				ny = circleCY + std::sin(circleA) * circleR;
+				heading = circleA + 1.5707963f;
+			}
+			if(cfg.jumpAt >= 0.0 && !jumped && t >= cfg.jumpAt){
+				// scripted relocation of the car (and us in it)
+				jumped = true;
+				circleCX += cfg.jumpDist;
+				nx += cfg.jumpDist;
+				dropState = dropVehState = cfg.dropJump;
+				std::printf("[%.3f] RELOCATE +%.0f m%s\n", elapsed(), cfg.jumpDist,
+				            cfg.dropJump ? " (flagged packets lost)" : "");
+			}
+			self.velX = QuantVel((nx - px) / std::max(0.001f, (float)TICK_DT));
+			self.velY = QuantVel((ny - py) / std::max(0.001f, (float)TICK_DT));
+			self.xMm = QuantPos(nx); self.yMm = QuantPos(ny); self.zMm = QuantPos(nz);
+			self.heading = QuantAngle(heading);
+			if(cfg.driveTo && nx == cfg.driveX && ny == cfg.driveY && nz == cfg.driveZ && myVehicle != 0x1234 &&
+			   myVehicle != 0xFFFF){
+				// arrived: park, get out, stay next to the car
+				parked = true;
+				parkedId = myVehicle;
+				parkX = nx; parkY = ny; parkZ = nz;
+				self.velX = self.velY = 0;
+				BitWriter w;
+				BeginMsg(w, MSG_VEH_EXIT);
+				MsgVehExit vx;
+				vx.playerId = selfId;
+				vx.vehicleId = myVehicle;
+				WriteVehExit(w, vx);
+				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+				enet_peer_send(peer, CHAN_RELIABLE, pkt);
+				myVehicle = 0xFFFF;
+				mySeat = 0xFF;
+				self.vehicleId = VEHICLE_NONE;
+				self.seat = 0xFF;
+				std::printf("[%.3f] PARKED %d %.2f %.2f %.2f\n", elapsed(), (int)parkedId, parkX, parkY, parkZ);
+			}
+		}
+
+		// watch: optional relocation (a flagged teleport, like an admin warp)
+		if(cfg.scenario == "watch" && cfg.gotoAt >= 0.0 && !gone && gotSpawn && t >= cfg.gotoAt){
+			gone = true;
+			self.xMm = QuantPos(cfg.gotoX); self.yMm = QuantPos(cfg.gotoY); self.zMm = QuantPos(cfg.gotoZ);
+			std::printf("[%.3f] GOTO %.1f %.1f %.1f\n", elapsed(), cfg.gotoX, cfg.gotoY, cfg.gotoZ);
 		}
 
 		// state send at tick rate
@@ -797,6 +1029,9 @@ int main(int argc, char** argv)
 					}
 					ve.modelId = seenVehModel ? seenVehModel
 					             : (uint16_t)(cfg.vehModel > 0 ? cfg.vehModel : 151);
+					// v8: where the car is (the bot's car rides on its own position)
+					ve.x = self.xMm / 1000.0f; ve.y = self.yMm / 1000.0f; ve.z = self.zMm / 1000.0f;
+					ve.heading = heading;
 				WriteVehEnter(w, ve);
 				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 				enet_peer_send(peer, CHAN_RELIABLE, pkt);
@@ -830,11 +1065,15 @@ int main(int argc, char** argv)
 			vs.velX = self.velX; vs.velY = self.velY;
 			vs.flags = VEH_ENGINE;
 			vs.health = 1000;
-			BitWriter w;
-			BeginMsg(w, MSG_VEHICLE_STATE);
-			WriteVehicleState(w, vs);
-			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);
-			enet_peer_send(peer, CHAN_STATE, pkt);
+			if(dropVehState){
+				dropVehState = false;   // lost in transit (cruise -drop-jump)
+			}else{
+				BitWriter w;
+				BeginMsg(w, MSG_VEHICLE_STATE);
+				WriteVehicleState(w, vs);
+				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);
+				enet_peer_send(peer, CHAN_STATE, pkt);
+			}
 		}
 
 		// ping every 5s
@@ -873,6 +1112,22 @@ int main(int argc, char** argv)
 				std::chrono::system_clock::now().time_since_epoch()).count();
 			std::printf("[%.3f] IAM %.2f %.2f %.2f hp=%d\n",
 			            wall, self.xMm / 1000.0f, self.yMm / 1000.0f, self.zMm / 1000.0f,            (int)self.health);
+			if(cfg.scenario == "cruise"){
+				if(myVehicle != 0xFFFF && myVehicle != 0x1234 && mySeat == 0)
+					std::printf("[%.3f] IAMVEH %d %.2f %.2f %.2f\n", wall, (int)myVehicle,
+					            self.xMm / 1000.0f, self.yMm / 1000.0f, self.zMm / 1000.0f);
+				else if(parked)
+					std::printf("[%.3f] IAMVEH %d %.2f %.2f %.2f\n", wall, (int)parkedId, parkX, parkY, parkZ);
+			}
+			if(cfg.scenario == "watch"){
+				for(auto& kv : vehView){
+					if(!kv.second.hasPos) continue;
+					std::printf("[%.3f] SEESVEH %d %.2f %.2f %.2f age=%.2f states=%d\n", wall, (int)kv.first,
+					            kv.second.x, kv.second.y, kv.second.z,
+					            kv.second.lastState >= 0.0 ? (float)(t - kv.second.lastState) : -1.0f,
+					            kv.second.states);
+				}
+			}
 			if(cfg.voice){
 				for(auto& kv : heard)
 					std::printf("[%.3f] HEARD %d frames=%d maxdist=%.2f\n", wall, (int)kv.first,
@@ -890,6 +1145,78 @@ int main(int argc, char** argv)
 
 		Sleep(1);
 	}
+
+	// --- watch assertions: evaluated on the live view, before disconnecting ---
+	std::string watchSummary;
+	if(cfg.scenario == "watch" && (cfg.expectDriver || cfg.expectNear)){
+		double endT = elapsed();
+		char line[512];
+		if(cfg.expectDriver){
+			// a peer seated as driver (seat 0) of a vehicle we know, per the
+			// relayed player state or per VEH_ENTER bookkeeping
+			int driver = -1, vehicle = -1;
+			bool byState = false, byEnter = false;
+			for(auto& kv : peers){
+				const PlayerState& st = kv.second.state;
+				if(st.vehicleId != VEHICLE_NONE && st.vehicleId != VEHICLE_UNSYNCED && st.seat == 0 &&
+				   vehView.count(st.vehicleId)){
+					driver = kv.first; vehicle = st.vehicleId; byState = true;
+				}
+			}
+			for(auto& kv : seatOf){
+				if(kv.second.second == 0 && vehView.count(kv.second.first)){
+					if(driver < 0){ driver = kv.first; vehicle = kv.second.first; }
+					if(driver == kv.first && vehicle == kv.second.first) byEnter = true;
+				}
+			}
+			if(driver < 0){
+				failReasons += "no_driver_seen ";
+				snprintf(line, sizeof line, "driver=none peers=%d vehicles=%d",
+				         (int)peers.size(), (int)vehView.size());
+			}else{
+				const VehView& vv = vehView[(uint16_t)vehicle];
+				const PeerView& pv = peers[(uint8_t)driver];
+				float span = std::max(vv.maxX - vv.minX, vv.maxY - vv.minY);
+				float vehAge = vv.lastState >= 0.0 ? (float)(endT - vv.lastState) : 999.0f;
+				float pedAge = peers.count((uint8_t)driver) ? (float)(endT - pv.lastSeen) : 999.0f;
+				float dx = pv.state.xMm / 1000.0f - vv.x, dy = pv.state.yMm / 1000.0f - vv.y,
+				      dz = pv.state.zMm / 1000.0f - vv.z;
+				float gap = std::sqrt(dx * dx + dy * dy + dz * dz);
+				if(!liveVehicles.count((uint16_t)vehicle)) failReasons += "vehicle_never_spawned ";
+				if(vv.states < 20 || span < 5.0f) failReasons += "vehicle_not_moving ";
+				if(vehAge > 2.0f) failReasons += "vehicle_state_stale ";
+				if(pedAge > 2.0f) failReasons += "driver_state_stale ";
+				if(gap > 6.0f) failReasons += "driver_not_in_vehicle ";
+				snprintf(line, sizeof line,
+				         "driver=%d veh=%d by_state=%d by_enter=%d veh_states=%d span=%.1f veh_age=%.2f ped_age=%.2f ped_veh_gap=%.2f",
+				         driver, vehicle, (int)byState, (int)byEnter, vv.states, span, vehAge, pedAge, gap);
+			}
+			watchSummary += line;
+			int missing = 0;
+			for(uint8_t id : peerStateSeen)
+				if(!peerSpawnSeen.count(id) && peers.count(id)) missing++;
+			if(missing) failReasons += "peer_spawn_missing ";
+			snprintf(line, sizeof line, " peers_without_spawn=%d", missing);
+			watchSummary += line;
+		}
+		if(cfg.expectNear){
+			float best = 1e9f;
+			int bestId = -1;
+			for(auto& kv : vehView){
+				if(!kv.second.hasPos) continue;
+				float dx = kv.second.x - cfg.nearX, dy = kv.second.y - cfg.nearY, dz = kv.second.z - cfg.nearZ;
+				float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+				if(d < best){ best = d; bestId = kv.first; }
+			}
+			if(best > cfg.nearR) failReasons += "no_vehicle_near_expected ";
+			snprintf(line, sizeof line, " nearest_veh=%d dist=%.2f (want <= %.1f)", bestId, best, cfg.nearR);
+			watchSummary += line;
+		}
+		std::printf("[BOT] WATCH %s\n", watchSummary.c_str());
+	}
+	if(cfg.scenario == "cruise")
+		std::printf("[BOT] CRUISE veh=%d parked=%d car_corrections=%d\n",
+		            (int)(parked ? parkedId : myVehicle), (int)parked, carCorrections);
 
 	enet_peer_disconnect(peer, 0);
 	{

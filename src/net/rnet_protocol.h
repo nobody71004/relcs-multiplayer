@@ -249,10 +249,12 @@ inline bool ReadKick(BitReader& r, MsgKick& m)
 inline void WriteVehEnter(BitWriter& w, const MsgVehEnter& m)
 {
 	w.WriteU8(m.playerId); w.WriteU16(m.vehicleId); w.WriteU8(m.seat); w.WriteU16(m.modelId);
+	w.WriteF32(m.x); w.WriteF32(m.y); w.WriteF32(m.z); w.WriteF32(m.heading);   // v8
 }
 inline bool ReadVehEnter(BitReader& r, MsgVehEnter& m)
 {
 	m.playerId = r.ReadU8(); m.vehicleId = r.ReadU16(); m.seat = r.ReadU8(); m.modelId = r.ReadU16();
+	m.x = r.ReadF32(); m.y = r.ReadF32(); m.z = r.ReadF32(); m.heading = r.ReadF32();
 	return r.Ok();
 }
 

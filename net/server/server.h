@@ -58,6 +58,7 @@ struct ServerPlayer {
 	int violations = 0;
 	int teleportBurst = 0;            // client-flagged teleports in the current window
 	double teleportWindowStart = 0.0;
+	rnet::MoveReference moveRef;      // refused-move streak (re-anchor, rnet_validator.h)
 	// tough validator state (rnet_validator.h)
 	rnet::RateLimiter msgRate;        // every packet — flood defence
 	rnet::RateLimiter chatRate;       // chat lines — spam defence

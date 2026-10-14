@@ -614,6 +614,141 @@ static void TestVehicleOccupancy()
 	CHECK(reg.spawnCount == 2);
 }
 
+// ---------------------------------------------------------------------------
+// v8 MSG_VEH_ENTER: the vehicle position rides along (placement of client-
+// created cars, and where the server has the car for late joiners)
+static void TestVehEnterPosition()
+{
+	CHECK(PROTOCOL_VERSION == 8);
+	MsgVehEnter ve;
+	ve.playerId = 3; ve.vehicleId = 0xFFFF; ve.seat = 0; ve.modelId = 151;
+	ve.x = 1122.125f; ve.y = -562.5f; ve.z = 25.0f; ve.heading = 1.25f;
+	BitWriter w; BeginMsg(w, MSG_VEH_ENTER); WriteVehEnter(w, ve);
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK((MsgType)r.ReadU8() == MSG_VEH_ENTER);
+	MsgVehEnter got;
+	CHECK(ReadVehEnter(r, got));
+	CHECK(got.playerId == 3 && got.vehicleId == 0xFFFF && got.seat == 0 && got.modelId == 151);
+	CHECK(got.x == ve.x && got.y == ve.y && got.z == ve.z && got.heading == ve.heading);
+	CHECK(r.BitsLeft() < 8);
+
+	// a pre-v8 enter (no position) is a short read: refused, never half-applied
+	BitWriter w5;
+	w5.WriteU8(3); w5.WriteU16(0xFFFF); w5.WriteU8(0); w5.WriteU16(151);
+	BitReader r5(w5.Data(), w5.ByteSize());
+	MsgVehEnter old;
+	CHECK(!ReadVehEnter(r5, old));
+}
+
+// the refused-move streak: a one-off discontinuity re-anchors, a valid move
+// resets the streak
+static void TestMoveReference()
+{
+	MoveReference ref;
+	CHECK(ref.Judge(false) == REF_ADOPT);
+	for(int i = 1; i < MOVE_RESYNC_REJECTS; i++)
+		CHECK(ref.Judge(true) == REF_REJECT);
+	CHECK(ref.Judge(true) == REF_RESYNC);
+	CHECK(ref.rejects == 0);
+	// a valid move in the middle of a streak resets it
+	for(int i = 0; i < MOVE_RESYNC_REJECTS - 1; i++) ref.Judge(true);
+	CHECK(ref.Judge(false) == REF_ADOPT);
+	CHECK(ref.Judge(true) == REF_REJECT);
+}
+
+// The server's player-state rule (ValidateMove + MoveReference + adopt unless
+// REF_REJECT + violation ledger), replayed on the reported scenario: a seated
+// driver whose flagged warp packet was lost. Before this every later state was
+// refused against the stale reference: the player froze for everyone and was
+// kicked unless the client could act on the corrections. Now the server
+// re-anchors well before the kick threshold.
+struct RefSim {
+	PlayerState ref;
+	MoveReference streak;
+	int violations = 0;
+	int refused = 0;
+	bool Feed(const PlayerState& st)   // true = adopted
+	{
+		bool failed = (ValidateMove(ref, st, TICK_DT * 2.0f) & (VAL_TOO_FAST | VAL_TELEPORT)) != 0;
+		RefVerdict v = streak.Judge(failed);
+		if(failed){ violations++; refused++; }
+		else if(violations > 0) violations--;
+		if(v != REF_REJECT){ ref = st; return true; }
+		return false;
+	}
+};
+
+static void TestLostTeleportResync()
+{
+	RefSim sim;
+	sim.ref.xMm = QuantPos(1100.0f); sim.ref.yMm = QuantPos(-600.0f); sim.ref.zMm = QuantPos(23.0f);
+	sim.ref.vehicleId = 7; sim.ref.seat = 0;
+	PlayerState st = sim.ref;
+	float x = 1100.0f;
+	// drive at 20 m/s (1 m per tick): all adopted
+	for(int i = 0; i < 20; i++){
+		x += 1.0f; st.xMm = QuantPos(x);
+		CHECK(sim.Feed(st));
+	}
+	// warp +150 m: the flagged state is lost; the client keeps driving from there
+	x += 150.0f;
+	int adoptedAt = -1;
+	for(int i = 0; i < 60; i++){
+		x += 1.0f; st.xMm = QuantPos(x); st.moveFlags = 0;
+		if(sim.Feed(st) && adoptedAt < 0) adoptedAt = i;
+	}
+	CHECK(adoptedAt == MOVE_RESYNC_REJECTS - 1);   // re-anchored after the streak
+	CHECK(sim.ref.xMm == QuantPos(x));             // and following the car again
+	CHECK(sim.refused == MOVE_RESYNC_REJECTS);
+	CHECK(sim.violations < VIOLATION_KICK);        // never kicked for it
+
+	// a sustained speedhack (3x the on-foot budget every tick) still fails each
+	// step: the re-anchor never lets the violation ledger recover
+	RefSim cheat;
+	PlayerState c = cheat.ref;
+	float cx = 0.0f;
+	bool kicked = false;
+	for(int i = 0; i < 200 && !kicked; i++){
+		cx += MAX_SPEED_ONFOOT * TICK_DT * 2.0f * 3.0f;
+		c.xMm = QuantPos(cx);
+		cheat.Feed(c);
+		kicked = cheat.violations > VIOLATION_KICK;
+	}
+	CHECK(kicked);
+}
+
+// client-created car placement: the client's position when sane and close to
+// the player's accepted state, else the player's state
+static void TestPlaceNewVehicle()
+{
+	PlayerState ref;
+	ref.xMm = QuantPos(1120.0f); ref.yMm = QuantPos(-566.0f); ref.zMm = QuantPos(25.0f);
+	ref.heading = QuantAngle(0.5f);
+	MsgVehEnter m;
+	float x, y, z, h;
+
+	m.x = 1122.1f; m.y = -562.6f; m.z = 25.0f; m.heading = 2.0f;   // 4 m ahead
+	CHECK(PlaceNewVehicle(ref, m, x, y, z, h));
+	CHECK(x == m.x && y == m.y && z == m.z && h == m.heading);
+
+	m.x = 1120.0f + NEW_VEHICLE_MAX_OFFSET + 1.0f; m.y = -566.0f;   // too far
+	CHECK(!PlaceNewVehicle(ref, m, x, y, z, h));
+	CHECK_NEAR(x, 1120.0f, 0.001f); CHECK_NEAR(y, -566.0f, 0.001f); CHECK_NEAR(z, 25.0f, 0.001f);
+	CHECK_NEAR(h, DequantAngle(ref.heading), 0.0001f);
+
+	m.x = NAN; m.y = -566.0f;                                       // garbage
+	CHECK(!PlaceNewVehicle(ref, m, x, y, z, h));
+	CHECK_NEAR(x, 1120.0f, 0.001f);
+	m.x = 1120.0f; m.y = -566.0f; m.z = 25.0f; m.heading = INFINITY; // bad heading only
+	CHECK(PlaceNewVehicle(ref, m, x, y, z, h));
+	CHECK_NEAR(h, DequantAngle(ref.heading), 0.0001f);
+
+	// a zeroed enter far from the player falls back to the player position
+	MsgVehEnter zero;
+	CHECK(!PlaceNewVehicle(ref, zero, x, y, z, h));
+	CHECK_NEAR(x, 1120.0f, 0.001f);
+}
+
 static void TestInventoryMessages()
 {
 	// full snapshot round trip
@@ -1334,6 +1469,10 @@ int main()
 	TestToughValidator();
 	TestVehicleMessages();
 	TestVehicleOccupancy();
+	TestVehEnterPosition();
+	TestMoveReference();
+	TestLostTeleportResync();
+	TestPlaceNewVehicle();
 	TestInventoryMessages();
 	TestProfileStore();
 	TestProfileAuth();

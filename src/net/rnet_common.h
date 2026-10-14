@@ -10,7 +10,8 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 7;  // v7: MsgVehSpawn carries the owner (entering player) id
+constexpr uint16_t PROTOCOL_VERSION   = 8;  // v8: MSG_VEH_ENTER carries the vehicle position
+// v7: MsgVehSpawn carries the owner (entering player) id
 // v5: server map + static vehicles + master favorites
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
@@ -50,6 +51,17 @@ constexpr float MAX_SPEED_VEHICLE  = 95.0f;  // m/s
 constexpr float STREAM_DISTANCE    = 200.0f; // m, AOI radius
 constexpr float TELEPORT_WINDOW_SEC  = 5.0f;  // flood-guard window for client-flagged teleports
 constexpr int   MAX_TELEPORTS_PER_WINDOW = 200; // >20 Hz sustained is impossible from a real client
+// A refused move keeps the server's movement reference where it was. When the
+// client genuinely is elsewhere (a flagged teleport lost in transit, a
+// correction it did not or could not apply) every later state is refused too
+// and the player freezes for everyone until the violation kick. After this
+// many consecutive refusals the server re-anchors on the client's state
+// instead (still counted as violations, so a sustained speedhack is kicked
+// exactly as before).
+constexpr int   MOVE_RESYNC_REJECTS   = 10;   // ~0.5 s at 20 Hz
+// A car a client created locally (VEH_ENTER 0xFFFF) is placed where the client
+// says it is, if that is within this distance of the player's accepted state.
+constexpr float NEW_VEHICLE_MAX_OFFSET = 30.0f;
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -281,6 +293,9 @@ struct MsgVehEnter {
 	uint16_t vehicleId = 0xFFFF; // 0xFFFF = server assigns new id
 	uint8_t  seat = 0;
 	uint16_t modelId = 0;
+	// v8: client -> server: where the car is (places a new 0xFFFF vehicle);
+	//     server -> client: the vehicle's current server position
+	float    x = 0, y = 0, z = 0, heading = 0;
 };
 
 struct MsgVehExit {

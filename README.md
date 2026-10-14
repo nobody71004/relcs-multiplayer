@@ -45,11 +45,12 @@ This fork adds a full multiplayer stack on top of the port:
 | Launcher (CEF GUI) | `net/launcher/` | Chromium/CEF launcher: server browser (master list + per-username favorites), settings, join flow, in-game UI host |
 | Dedicated server | `net/server/` | 20 Hz authoritative server: movement anticheat, ped/vehicle puppets, gamemodes, resource packs, static vehicle spawns, in-band RCON, SQLite player profiles |
 | Master server | `net/master/` | server list (30 s announce, 90 s expiry) + favorites in SQLite (`master.db`), so a player's list follows the nickname across machines |
-| Bot / test client | `net/bot/` | scriptable scenario bot (roam/combat/drive/chaos/solo), `-master-query`, `-rcon`/`-cmd` |
+| Bot / test client | `net/bot/` | scriptable scenario bot (roam/combat/drive/chaos/fight/solo/cruise/watch), `-master-query`, `-rcon`/`-cmd` |
 | Agent | `net/agent/` | tracing/telemetry harness |
 | Game hooks | `src/net/` | nethooks (HUD/chat/console/admin, ped + vehicle puppets), netclient, CEF HUD glue |
 | Tests | `net/tests/` | 3287-check unit suite (protocol codecs, validator, profile store, resources) |
-| E2E run book | `net/e2e.sh` | 21-check end-to-end script |
+| E2E run book | `net/e2e.sh` | 21-check end-to-end script (Windows: game client, discovery, master, net-shaper) |
+| E2E server + bots | `net/e2e-bots.sh` | portable (Linux / Git Bash) server + bot phases incl. late-join, lost-warp and stream-in vehicle sync |
 | Internet run book | `net/internet-test/` | NAT/VPS deployment run-book, staging configs, systemd units, dry-run report |
 | Proxmox deploy | `net/deploy/proxmox/` | start/stop scripts for a 5-instance, 32-player LAN host |
 

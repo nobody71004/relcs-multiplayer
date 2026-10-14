@@ -17,6 +17,7 @@ struct NetRemotePlayer {
 	rnet::PlayerState state;
 	std::string name;
 	bool spawned = false;
+	bool relayed = false;    // state came from MSG_PLAYER_STATE: vehicleId/seat are the server's
 	double lastUpdate = 0.0;
 };
 
@@ -37,7 +38,8 @@ public:
 		EV_RCON_RESP,      // text = rcon response line
 		EV_PICKUP,         // synced prop: kind=type amount=qty arg=weapon, pos in state
 		// vehicle events: arg = vehicleId, model = modelId, id = playerId,
-		// kind = seat, veh = VehicleState (EV_VEH_STATE / EV_VEH_SPAWN pos)
+		// kind = seat, veh = VehicleState (EV_VEH_STATE), state = position
+		// (EV_VEH_SPAWN, and EV_VEH_ENTER: where the server has the vehicle)
 		EV_VEH_SPAWN,      // a net vehicle exists (state carries spawn pos/heading, id = owner)
 		EV_VEH_ENTER,      // a player took a seat (kind = seat)
 		EV_VEH_EXIT,       // a player left a vehicle
@@ -71,7 +73,9 @@ public:
 	void SendSpawnRequest();
 	void SendRconAuth(const char* password);
 	void SendRconCmd(const char* command);
-	void SendVehEnter(uint16_t vehicleId, uint8_t seat, uint16_t modelId); // 0xFFFF = new
+	// 0xFFFF = new; x/y/z/heading = where the car is (places a new one)
+	void SendVehEnter(uint16_t vehicleId, uint8_t seat, uint16_t modelId,
+	                  float x, float y, float z, float heading);
 	void SendVehExit(uint16_t vehicleId);
 	void SendVehState(const rnet::VehicleState& s); // unreliable, 20 Hz, driver only
 	void SendInventory(const rnet::MsgInventory& m); // reliable snapshot (profile sync)

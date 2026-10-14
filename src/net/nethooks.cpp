@@ -372,13 +372,25 @@ static NetVehicle& NetVehicleAt(uint16_t netId, uint16_t modelId,
 			nv.smoothX = x; nv.smoothY = y; nv.smoothZ = z; nv.smoothH = heading;
 		}
 		if(!nv.rejected && !ModelIsVehicle(nv.modelId)){
-			nv.rejected = true;
-			fprintf(stderr, "[NET] veh model %d is not a vehicle — net vehicle %d dropped\n",
-			        (int)nv.modelId, (int)netId);
-			fflush(stderr);
-			// say so in-game too: otherwise the other player just "has no car"
-			ConsolePrint("net vehicle %d uses model %d, which this install does not have - it stays invisible here",
-			             (int)netId, (int)nv.modelId);
+			// a model this install does not have (an add-on car such as the
+			// i8road on the driver's install): show a stock stand-in instead of
+			// nothing — the car and the player seated in it must be visible
+			if(ModelIsVehicle(MI_KURUMA)){
+				fprintf(stderr, "[NET] veh model %d is not a vehicle here — net vehicle %d shown as model %d\n",
+				        (int)nv.modelId, (int)netId, (int)MI_KURUMA);
+				fflush(stderr);
+				ConsolePrint("net vehicle %d uses model %d, which this install does not have - shown as a stand-in",
+				             (int)netId, (int)nv.modelId);
+				nv.modelId = MI_KURUMA;
+			}else{
+				nv.rejected = true;
+				fprintf(stderr, "[NET] veh model %d is not a vehicle — net vehicle %d dropped\n",
+				        (int)nv.modelId, (int)netId);
+				fflush(stderr);
+				// say so in-game too: otherwise the other player just "has no car"
+				ConsolePrint("net vehicle %d uses model %d, which this install does not have - it stays invisible here",
+				             (int)netId, (int)nv.modelId);
+			}
 		}
 		if(!nv.rejected){
 			nv.veh = CreatePuppetVehicle(nv.modelId, nv.smoothX, nv.smoothY, nv.smoothZ, nv.smoothH);
@@ -639,7 +651,9 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 	fflush(stderr);
 }
 
-static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
+// relayed: st came from MSG_PLAYER_STATE (its seat is the server's), not only
+// from MSG_SPAWN (which knows nothing about seats)
+static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt, bool relayed)
 {
 	float tx = st.xMm / 1000.0f, ty = st.yMm / 1000.0f, tz = st.zMm / 1000.0f;
 	// never move or materialize a puppet from an out-of-world position
@@ -670,7 +684,9 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 	// for this player. The reliable enter/exit events normally get there first;
 	// when one was missed or raced (late join, ped built after the enter), a
 	// disagreement that outlives any in-flight event is repaired from the state.
-	{
+	// A state known only from MSG_SPAWN (late-join roster replay) says nothing
+	// about seats: it must not unseat a driver the snapshot's VEH_ENTER seated.
+	if(relayed){
 		bool wantSeat = st.vehicleId != rnet::VEHICLE_NONE && st.vehicleId != rnet::VEHICLE_UNSYNCED;
 		bool seated = ped->bInVehicle && ped->m_pMyVehicle;
 		bool agree = wantSeat ? (seated && NetIdOfVehicle(ped->m_pMyVehicle) == st.vehicleId)
@@ -2544,12 +2560,11 @@ void NetGame_Frame(void)
 				auto vit = s_vehicles.find(ev.arg);
 				if(vit != s_vehicles.end()) veh = vit->second.veh;
 				if(!veh){
-					// enter raced the spawn — materialize on the spot
-					NetRemotePlayer& rp = s_net.remotes[ev.id];
+					// enter raced the spawn — materialize where the server has the car
 					veh = NetVehicleAt(ev.arg, ev.model,
-					                   rp.state.xMm / 1000.0f, rp.state.yMm / 1000.0f,
-					                   rp.state.zMm / 1000.0f,
-					                   rnet::DequantAngle(rp.state.heading)).veh;
+					                   ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
+					                   ev.state.zMm / 1000.0f,
+					                   rnet::DequantAngle(ev.state.heading)).veh;
 				}
 				auto it = s_remotes.find(ev.id);
 				if(it != s_remotes.end() && it->second.ped && veh){
@@ -2655,7 +2670,7 @@ void NetGame_Frame(void)
 	// apply remote states
 	for(auto& kv : s_net.remotes)
 		if(kv.second.spawned)
-			ApplyRemote(kv.first, kv.second.state, dt);
+			ApplyRemote(kv.first, kv.second.state, dt, kv.second.relayed);
 
 	// vehicles: interpolation, freeze/unfreeze, puppet retries
 	UpdateNetVehicles(dt);
@@ -2714,16 +2729,19 @@ void NetGame_Frame(void)
 					if(seat == 0xFF) seat = 0;
 				}
 				s_mySeat = seat;
+				// where the car is: the server places a new net vehicle here
+				CVector cp = cur->GetPosition();
+				float ch = std::atan2(-cur->GetForward().x, cur->GetForward().y);
 				uint16_t existing = NetIdOfVehicle(cur);
 				if(existing != rnet::VEHICLE_NONE){
 					// entering a vehicle that is already a net entity (someone's car)
 					s_myVehNet = existing;
-					s_net.SendVehEnter(existing, seat, (uint16_t)cur->GetModelIndex());
+					s_net.SendVehEnter(existing, seat, (uint16_t)cur->GetModelIndex(), cp.x, cp.y, cp.z, ch);
 				}else{
 					// new net vehicle: the server allocates the id
 					s_pendingVeh = cur;
 					s_pendingModel = (uint16_t)cur->GetModelIndex();
-					s_net.SendVehEnter(rnet::VEHICLE_NONE, seat, s_pendingModel);
+					s_net.SendVehEnter(rnet::VEHICLE_NONE, seat, s_pendingModel, cp.x, cp.y, cp.z, ch);
 				}
 				fprintf(stderr, "[VEHSYNC] self ENTER model=%d seat=%d netId=%d (%s)\n",
 				        (int)cur->GetModelIndex(), (int)seat, (int)s_myVehNet,
