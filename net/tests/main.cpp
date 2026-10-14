@@ -157,6 +157,7 @@ static void TestStateCodecs()
 	vs.velX = 500; vs.velY = -500; vs.velZ = 0;
 	vs.steer = -128; vs.gas = 200; vs.brake = 0;
 	vs.flags = VEH_ENGINE | VEH_SIREN; vs.health = 999;
+	vs.doors[0] = 0; vs.doors[1] = 255; vs.doors[2] = 128; vs.doors[3] = 64; vs.doors[4] = 1; vs.doors[5] = 200;
 
 	BitWriter w2; WriteVehicleState(w2, vs);
 	BitReader r2(w2.Data(), w2.ByteSize());
@@ -168,6 +169,7 @@ static void TestStateCodecs()
 	CHECK(vout.velX == vs.velX && vout.velY == vs.velY && vout.velZ == vs.velZ);
 	CHECK(vout.steer == vs.steer && vout.gas == vs.gas && vout.brake == vs.brake);
 	CHECK(vout.flags == vs.flags && vout.health == vs.health);
+	for(int i = 0; i < 6; i++) CHECK(vout.doors[i] == vs.doors[i]);
 	CHECK(r2.Ok());
 }
 
@@ -464,6 +466,7 @@ static void TestVehicleMessages()
 	MsgVehSpawn vs;
 	vs.vehicleId = 1; vs.modelId = 401;
 	vs.x = 100.5f; vs.y = -200.25f; vs.z = 12.0f; vs.heading = 1.5f;
+	vs.ownerId = 7;
 	BitWriter w3; BeginMsg(w3, MSG_VEH_SPAWN); WriteVehSpawn(w3, vs);
 	BitReader r3(w3.Data(), w3.ByteSize());
 	CHECK((MsgType)r3.ReadU8() == MSG_VEH_SPAWN);
@@ -471,6 +474,7 @@ static void TestVehicleMessages()
 	CHECK(ReadVehSpawn(r3, vs2));
 	CHECK(vs2.vehicleId == 1 && vs2.modelId == 401);
 	CHECK(vs2.x == 100.5f && vs2.y == -200.25f && vs2.z == 12.0f && vs2.heading == 1.5f);
+	CHECK(vs2.ownerId == 7);
 	CHECK(r3.Ok());
 
 	// seat math: passenger slots are seat-1 (0 = driver)

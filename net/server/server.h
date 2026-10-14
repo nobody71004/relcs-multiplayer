@@ -23,6 +23,7 @@ struct ServerConfig {
 	std::string gamemode = "survivor";     // survivor | freeroam
 	bool announce = false;                 // list on master server
 	std::string master = "127.0.0.1";      // master server host
+	std::string publicIp;                  // WAN address to list (port-forwarded LAN box); empty = LAN IP
 	uint16_t masterPort = rnet::DEFAULT_MASTER_PORT;
 	bool lanDiscover = true;
 	std::string rconPassword = "";
@@ -87,6 +88,7 @@ struct ServerVehicle {
 	uint16_t modelId = 0;
 	rnet::VehicleState state;
 	uint8_t driverId = 0xFF;
+	uint8_t ownerId = 0xFF;            // player whose enter allocated it (0xFF = static/admin)
 	uint8_t occupants[8];            // seat -> playerId (0xFF = free)
 	float lastStateTime = 0.0;
 };
@@ -120,12 +122,7 @@ public:
 	                 uint16_t skin, uint8_t health, uint8_t armour);
 	void KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId);
 	void TeleportPlayer(uint8_t playerId, float x, float y, float z, float heading);
-	// excludeId: a player who already holds this car locally (it entered a car it
-	// spawned itself) must NOT receive the MSG_VEH_SPAWN echo — it adopts its own
-	// local entity from the MSG_VEH_ENTER echo instead. Broadcasting the spawn to
-	// that player would make it build a duplicate puppet of a car it already owns.
-	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading,
-	                            bool permanent, uint8_t excludeId = 0);
+	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent, uint8_t ownerId = 0xFF);
 	void RemoveVehicle(uint16_t vehicleId);
 	void SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour);
 	void BroadcastScores();

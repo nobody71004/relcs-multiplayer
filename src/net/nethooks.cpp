@@ -159,20 +159,38 @@ static void UnseatNetPed(CPed* ped)
 	ped->SetPedState(PED_IDLE);
 }
 
-static void SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
+// a seated puppet is static (CWorld::Add, not on the moving-entity list), so
+// the world loop never re-anchors it. Put it back in its seat from the car's
+// current matrix: called on seat and every frame while the car moves.
+static void AnchorSeatedPuppet(CPed* ped)
 {
-	if(!ped || !veh || ped->m_pMyVehicle == veh) return;
+	CVehicle* veh = ped->m_pMyVehicle;
+	if(!veh) return;
+	// trains seat through their own node alignment — the generic car path
+	// assumes car doors/seats that a train clump does not have
+	if(veh->IsTrain())
+		ped->SetPedPositionInTrain();
+	else
+		ped->SetPedPositionInCar();
+	SyncPuppetToRw(ped);
+}
+
+// returns false when the seat is already held by someone else (logged by the caller)
+static bool SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
+{
+	if(!ped || !veh) return false;
+	if(ped->m_pMyVehicle == veh) return true;
 	if(ped->m_pMyVehicle) UnseatNetPed(ped);
 	if(seat == 0){
-		if(veh->pDriver && veh->pDriver != ped) return; // seat taken locally
+		if(veh->pDriver && veh->pDriver != ped) return false; // seat taken locally
 		if(!veh->pDriver){
 			veh->pDriver = ped;
 			ped->RegisterReference((CEntity**)&veh->pDriver);
 		}
 	}else{
 		int i = (int)seat - 1;
-		if(i >= 8) return;
-		if(veh->pPassengers[i] && veh->pPassengers[i] != ped) return;
+		if(i >= 8) return false;
+		if(veh->pPassengers[i] && veh->pPassengers[i] != ped) return false;
 		if(!veh->pPassengers[i]){
 			veh->pPassengers[i] = ped;
 			ped->RegisterReference((CEntity**)&veh->pPassengers[i]);
@@ -183,17 +201,12 @@ static void SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
 	veh->RegisterReference((CEntity**)&ped->m_pMyVehicle);
 	ped->bInVehicle = true;
 	ped->SetPedState(PED_DRIVING);
-	// trains seat through their own node alignment — the generic car path
-	// assumes car doors/seats that a train clump does not have
-	if(veh->IsTrain())
-		ped->SetPedPositionInTrain();
-	else
-		ped->SetPedPositionInCar();
-	SyncPuppetToRw(ped);
-	// hold the seated pose; the world loop keeps the ped in its seat from here
+	AnchorSeatedPuppet(ped);
+	// hold the seated pose; the frame pass keeps the ped in its seat from here
 	RpClump* clump = (RpClump*)ped->m_rwObject;
 	if(clump)
 		CAnimManager::BlendAnimation(clump, ASSOCGRP_STD, ANIM_STD_CAR_SIT, 8.0f);
+	return true;
 }
 
 static bool ModelIsVehicle(int modelId)
@@ -436,6 +449,28 @@ static void ClearAllVehicles(void)
 	s_lastMyVeh = nil;
 }
 
+// Door sync: the driver streams each car door's open ratio and a remote puppet
+// applies it straight to the door frame. This is the pose math of
+// CAutomobile::OpenDoor without its sounds and body hide/show side effects.
+static void ApplyNetDoors(CAutomobile* car, const uint8_t* ratios)
+{
+	// eDoors order: bonnet, boot, front left, front right, rear left, rear right
+	static const int32 s_comps[6] = { CAR_BONNET, CAR_BOOT, CAR_DOOR_LF, CAR_DOOR_RF, CAR_DOOR_LR, CAR_DOOR_RR };
+	for(int i = 0; i < 6; i++){
+		RwFrame* node = car->m_aCarNodes[s_comps[i]];
+		if(!node) continue; // this model has no such door
+		CDoor& door = car->Doors[i];
+		door.Open(ratios[i] / 255.0f);
+		float axes[3] = { 0.0f, 0.0f, 0.0f };
+		axes[door.m_nAxis] = door.m_fAngle;
+		CMatrix mat(RwFrameGetMatrix(node));
+		CVector pos = mat.GetPosition();
+		mat.SetRotate(axes[0], axes[1], axes[2]);
+		mat.Translate(pos);
+		mat.UpdateRW();
+	}
+}
+
 // per-frame: puppet creation retries, clump rebuild, interpolation, and
 // freeze/unfreeze based on who drives
 static void UpdateNetVehicles(float dt)
@@ -487,6 +522,8 @@ static void UpdateNetVehicles(float dt)
 		veh->SetMoveSpeed(0.0f, 0.0f, 0.0f);
 		veh->SetTurnSpeed(0.0f, 0.0f, 0.0f);
 		SyncPuppetToRw(veh);
+		if(veh->IsCar() && nv.hasTarget)
+			ApplyNetDoors((CAutomobile*)veh, nv.target.doors);
 	}
 }
 
@@ -521,7 +558,13 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 		return;
 	if(!NetPosSane(x, y, z, "ped spawn"))
 		return; // ApplyRemote retries on the next sane state
+	// RemoveRemote drops the pending seat; keep it so the frame pass can seat
+	// the ped once it (and its car) exist, whichever arrives last
+	auto pit = s_pendingSeat.find(id);
+	bool hadSeat = pit != s_pendingSeat.end();
+	auto pendingSeat = hadSeat ? pit->second : std::make_pair((uint16_t)rnet::VEHICLE_NONE, (uint8_t)0xFF);
 	RemoveRemote(id);
+	if(hadSeat) s_pendingSeat[id] = pendingSeat;
 	CStreaming::RequestModel(MI_MALE01, STREAMFLAGS_KEEP_IN_MEMORY);
 	CStreaming::LoadAllRequestedModels(false);
 
@@ -2345,18 +2388,6 @@ void NetGame_Frame(void)
 		case NetClient::EV_REMOTE_SPAWN:
 			SpawnRemote(ev.id, ev.state.xMm / 1000.0f, ev.state.yMm / 1000.0f,
 			            ev.state.zMm / 1000.0f, rnet::DequantAngle(ev.state.heading));
-			// seat arrived before the ped existed — apply it now
-			{
-				auto pit = s_pendingSeat.find(ev.id);
-				if(pit != s_pendingSeat.end()){
-					auto vit = s_vehicles.find(pit->second.first);
-					auto rit = s_remotes.find(ev.id);
-					if(vit != s_vehicles.end() && vit->second.veh &&
-					   rit != s_remotes.end() && rit->second.ped)
-						SeatNetPed(rit->second.ped, vit->second.veh, pit->second.second);
-					s_pendingSeat.erase(pit);
-				}
-			}
 			break;
 		case NetClient::EV_VOICE:
 			VoiceOnFrame(ev.id, ev.text);
@@ -2367,17 +2398,14 @@ void NetGame_Frame(void)
 		case NetClient::EV_VEH_SPAWN:{
 			float vx = ev.state.xMm / 1000.0f, vy = ev.state.yMm / 1000.0f, vz = ev.state.zMm / 1000.0f;
 			float vh = rnet::DequantAngle(ev.state.heading);
-			// Reconciliation guard: a spawn for an id we already track is a
-			// late/duplicate echo (e.g. a re-sent reliable packet). Never build a
-			// second puppet over an entity we already own — that was the "car gets
-			// duplicated" bug. The server no longer echoes our own enter's spawn
-			// back to us (SpawnVehicle excludeId), so s_pendingVeh is adopted from
-			// the VEH_ENTER echo instead; this branch only guards stragglers.
+			// a spawn for an id we already track is a duplicate echo: never build
+			// a second puppet over an entity we already hold
 			if(s_vehicles.find(ev.arg) != s_vehicles.end())
 				break;
-			if(s_pendingVeh){
-				// a spawn still carrying OUR pending enter (older server, or our
-				// enter raced the spawn): bind our local car instead of duplicating
+			if(s_pendingVeh && ev.id == s_net.MyId()){
+				// this spawn is OUR enter being allocated (owner-tagged by the
+				// server): bind our local car. The owner check is what stops us
+				// adopting someone else's same-model car parked next to ours.
 				CVector pp = s_pendingVeh->GetPosition();
 				bool match = (ev.model == s_pendingModel) &&
 				             std::fabs(pp.x - vx) < 30.0f && std::fabs(pp.y - vy) < 30.0f;
@@ -2389,6 +2417,10 @@ void NetGame_Frame(void)
 					break;
 				}
 			}
+			fprintf(stderr, "[VEHSYNC] spawn veh=%d model=%d owner=%d me=%d known=%d at (%.1f,%.1f,%.1f) -> puppet\n",
+			        (int)ev.arg, (int)ev.model, (int)ev.id, (int)s_net.MyId(),
+			        (int)(s_vehicles.find(ev.arg) != s_vehicles.end()), vx, vy, vz);
+			fflush(stderr);
 			NetVehicleAt(ev.arg, ev.model, vx, vy, vz, vh);
 			break;
 		}
@@ -2396,22 +2428,21 @@ void NetGame_Frame(void)
 			if(ev.id == s_net.MyId()){
 				s_myVehNet = ev.arg;
 				s_mySeat = ev.kind;
-				// Adopt our local car as THE net entity for this id. This is now the
-				// single reconciliation point for a self-initiated enter (the server
-				// no longer echoes the spawn to us), so a client-initiated enter and
-				// the server's authoritative id resolve to exactly one entity — no
-				// duplicate puppet. Prefer s_pendingVeh (the exact car we drove into);
-				// fall back to the player's current/last vehicle.
+				// bind our local car object if the spawn didn't match it: prefer
+				// s_pendingVeh (the exact car we got into), else our current/last car
 				CVehicle* pending = s_pendingVeh;
 				s_pendingVeh = nil;
+				bool bound = false;
 				CPlayerPed* me2 = FindPlayerPed();
 				CVehicle* local = pending;
 				if(!local) local = (me2 && me2->bInVehicle) ? me2->m_pMyVehicle : s_lastMyVeh;
 				if(local && NetIdOfVehicle(local) == rnet::VEHICLE_NONE){
 					RemoveNetVehicle(ev.arg); // drop any half-made puppet for this id
 					AdoptNetVehicle(ev.arg, local, (uint16_t)local->GetModelIndex());
+					bound = true;
 				}
-				fprintf(stderr, "[NET] we are in net vehicle %d seat %d\n", (int)ev.arg, (int)ev.kind);
+				fprintf(stderr, "[VEHSYNC] self SEATED veh=%d seat=%d local-car-bound=%d\n",
+				        (int)ev.arg, (int)ev.kind, (int)bound);
 				fflush(stderr);
 			}else{
 				// remote player took a seat
@@ -2428,18 +2459,28 @@ void NetGame_Frame(void)
 				}
 				auto it = s_remotes.find(ev.id);
 				if(it != s_remotes.end() && it->second.ped && veh){
-					SeatNetPed(it->second.ped, veh, ev.kind);
-					fprintf(stderr, "[NET] remote player %d seated in veh %d seat %d\n",
-					        (int)ev.id, (int)ev.arg, (int)ev.kind);
+					bool ok = SeatNetPed(it->second.ped, veh, ev.kind);
+					fprintf(stderr, "[VEHSYNC] remote player %d %s veh=%d seat=%d (ped=%p veh-known=%d)\n",
+					        (int)ev.id, ok ? "SEATED" : "REJECTED seat taken",
+					        (int)ev.arg, (int)ev.kind, (void*)it->second.ped, (int)(vit != s_vehicles.end()));
 					fflush(stderr);
-					CVector vp = veh->GetPosition();
-					PlayRemoteDoorChime(vp.x, vp.y, vp.z);
-				}else
+					if(ok){
+						CVector vp = veh->GetPosition();
+						PlayRemoteDoorChime(vp.x, vp.y, vp.z);
+					}
+				}else{
+					fprintf(stderr, "[VEHSYNC] remote player %d PENDING veh=%d seat=%d (ped=%d car=%d)\n",
+					        (int)ev.id, (int)ev.arg, (int)ev.kind,
+					        (int)(it != s_remotes.end() && it->second.ped != nil), (int)(veh != nil));
+					fflush(stderr);
 					s_pendingSeat[ev.id] = std::make_pair(ev.arg, ev.kind);
+				}
 			}
 			break;
 		case NetClient::EV_VEH_EXIT:
 			if(ev.id == s_net.MyId()){
+				fprintf(stderr, "[VEHSYNC] self EXIT veh=%d\n", (int)ev.arg);
+				fflush(stderr);
 				s_myVehNet = rnet::VEHICLE_NONE;
 				s_mySeat = 0xFF;
 				s_pendingVeh = nil;
@@ -2451,6 +2492,9 @@ void NetGame_Frame(void)
 						CVector lp = leaving->GetPosition();
 						PlayRemoteDoorChime(lp.x, lp.y, lp.z);
 					}
+					fprintf(stderr, "[VEHSYNC] remote player %d EXIT veh=%d was-seated=%d\n",
+					        (int)ev.id, (int)ev.arg, (int)(it->second.ped->m_pMyVehicle != nil));
+					fflush(stderr);
 					UnseatNetPed(it->second.ped);
 				}
 				s_pendingSeat.erase(ev.id);
@@ -2522,6 +2566,27 @@ void NetGame_Frame(void)
 	// vehicles: interpolation, freeze/unfreeze, puppet retries
 	UpdateNetVehicles(dt);
 
+	// seat remote players whose ped and car arrived in either order
+	for(auto it = s_pendingSeat.begin(); it != s_pendingSeat.end(); ){
+		auto rit = s_remotes.find(it->first);
+		auto vit = s_vehicles.find(it->second.first);
+		if(rit != s_remotes.end() && rit->second.ped &&
+		   vit != s_vehicles.end() && vit->second.veh){
+			bool ok = SeatNetPed(rit->second.ped, vit->second.veh, it->second.second);
+			fprintf(stderr, "[VEHSYNC] pending seat applied player=%d veh=%d seat=%d ok=%d\n",
+			        (int)it->first, (int)it->second.first, (int)it->second.second, (int)ok);
+			fflush(stderr);
+			it = s_pendingSeat.erase(it);
+		}else
+			++it;
+	}
+	// keep every seated remote player in its seat as its net vehicle moves
+	for(auto& kv : s_remotes){
+		CPed* ped = kv.second.ped;
+		if(ped && ped->bInVehicle && ped->m_pMyVehicle)
+			AnchorSeatedPuppet(ped);
+	}
+
 	// sample + send local state at 20 Hz
 	double now = NowSec();
 	CPlayerPed* me = FindPlayerPed();
@@ -2566,8 +2631,9 @@ void NetGame_Frame(void)
 					s_pendingModel = (uint16_t)cur->GetModelIndex();
 					s_net.SendVehEnter(rnet::VEHICLE_NONE, seat, s_pendingModel);
 				}
-				fprintf(stderr, "[NET] entered vehicle model=%d seat=%d\n",
-				        (int)cur->GetModelIndex(), (int)seat);
+				fprintf(stderr, "[VEHSYNC] self ENTER model=%d seat=%d netId=%d (%s)\n",
+				        (int)cur->GetModelIndex(), (int)seat, (int)s_myVehNet,
+				        existing != rnet::VEHICLE_NONE ? "existing car" : "new car, server spawns it");
 				fflush(stderr);
 			}
 			s_lastMyVeh = cur;
@@ -2729,6 +2795,15 @@ void NetGame_Frame(void)
 			vs.flags = cv->bEngineOn ? rnet::VEH_ENGINE : 0;
 			if(cv->bLightsOn) vs.flags |= rnet::VEH_LIGHTS;
 			vs.health = (uint16_t)(cv->m_fHealth < 0.0f ? 0 : cv->m_fHealth);
+			if(cv->IsCar()){
+				CAutomobile* car = (CAutomobile*)cv;
+				for(int i = 0; i < 6; i++){
+					float r = car->Doors[i].GetAngleOpenRatio();
+					if(r < 0.0f) r = 0.0f;
+					if(r > 1.0f) r = 1.0f;
+					vs.doors[i] = (uint8_t)(r * 255.0f + 0.5f);
+				}
+			}
 			s_net.SendVehState(vs);
 		}
 	}

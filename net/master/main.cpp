@@ -176,7 +176,13 @@ int main(int argc, char** argv)
 						uint32_t ip = ev.peer->address.host;   // observed IP (NAT-safe)
 						// server + master on the same box observe loopback, which is
 						// unreachable from other machines — trust the advertised LAN IP
-						if((ip & 0xFF) == 127 && a.advertisedIp) ip = a.advertisedIp;
+						// a private source (LAN box, or loopback) is not reachable from outside its
+						// LAN: use the address the server advertises (its public_ip when set)
+						uint32_t first = ip & 0xFF, second = (ip >> 8) & 0xFF;   // network order
+						bool priv = first == 127 || first == 10 ||
+						            (first == 172 && second >= 16 && second <= 31) ||
+						            (first == 192 && second == 168);
+						if(priv && a.advertisedIp) ip = a.advertisedIp;
 						uint64_t key = Key(ip, a.gamePort);
 						Entry& e = g_entries[key];
 						e.ip = ip;

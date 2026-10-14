@@ -1,7 +1,8 @@
 // net/bot/main.cpp — relcs-netbot: scripted headless client for E2E testing.
 //
 // Usage:
-//   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos]
+//   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos|fight|solo]
+//   solo roams without requiring peer traffic (lone persistence/rejoin checks)
 //                [-duration 30] [-expect-chat SUBSTR] [-rcon PW] [-cmd "RCON CMD"] [-seed N] [-verbose]
 //
 // Prints 1 Hz telemetry lines consumed by the E2E harness:
@@ -205,10 +206,11 @@ int main(int argc, char** argv)
 	// --- assertion state ---
 	bool gotWelcome = false, gotSpawn = false, kicked = false, disconnected = false;
 	bool gotChatExpect = cfg.expectChat.empty();
-	bool sawPeer = false, sawDeath = false, rconOk = cfg.rconPassword.empty();
+	bool sawPeer = false, sawDeath = false, sawScore = false, rconOk = cfg.rconPassword.empty();
 	bool rconCmdOk = cfg.rconPassword.empty();
 	uint8_t selfId = 0;
 	int statesSent = 0, correctionsReceived = 0, deathsSelf = 0, spawnsSeen = 0;
+	int killsMade = 0, myScore = 0; // fight scenario: kills dealt + latest scoreboard score
 	int vehStatesSeen = 0, vehEntersSeen = 0; // relayed traffic from other drivers
 	std::string failReasons;
 	std::map<uint8_t, PeerView> peers;
@@ -453,9 +455,27 @@ int main(int argc, char** argv)
 							alive = false;
 							deathsSelf++;
 						}
+						if(d.killerId == selfId)
+							killsMade++;
 						if(cfg.verbose)
 							std::printf("[%.3f] DEATH victim=%d killer=%d\n",
 							            elapsed(), (int)d.victimId, (int)d.killerId);
+					}
+					break;
+				}
+				case MSG_SCORE_UPDATE:{
+					MsgScoreUpdate su;
+					if(ReadScoreUpdate(r, su)){
+						for(int i = 0; i < su.count; i++)
+							if(su.entries[i].playerId == selfId){
+								myScore = su.entries[i].score;
+								sawScore = true;
+								if(cfg.verbose)
+										std::printf("[%.3f] SCORE me=%d kills=%d deaths=%d\n",
+										            elapsed(), myScore,
+										            (int)su.entries[i].kills,
+										            (int)su.entries[i].deaths);
+							}
 					}
 					break;
 				}
@@ -642,9 +662,22 @@ int main(int argc, char** argv)
 		// final positions exactly across bots
 		if(t - lastWalk >= 0.05 && alive && t < cfg.duration - 5.0){
 			lastWalk = t;
-			std::uniform_real_distribution<float> turn(-0.6f, 0.6f);
-			heading += turn(rng);
-			float speed = (cfg.scenario == "chaos") ? 8.0f : 3.0f;
+			bool fight = (cfg.scenario == "fight");
+			if(fight && !peers.empty()){
+				// converge: run at the nearest peer so damage stays in range
+				float bx = self.xMm / 1000.0f, by = self.yMm / 1000.0f;
+				float bd = 1e30f;
+				for(auto& kv : peers){
+					float dx = kv.second.state.xMm / 1000.0f - bx;
+					float dy = kv.second.state.yMm / 1000.0f - by;
+					float d = dx * dx + dy * dy;
+					if(d < bd){ bd = d; heading = std::atan2(dy, dx); }
+				}
+			}else{
+				std::uniform_real_distribution<float> turn(-0.6f, 0.6f);
+				heading += turn(rng);
+			}
+			float speed = (cfg.scenario == "chaos" || fight) ? 8.0f : 3.0f;
 			if(cfg.scenario == "chaos"){
 				std::uniform_real_distribution<float> jump(-40.0f, 40.0f);
 				if(rng() % 40 == 0){ // occasional wild move — expects server correction
@@ -702,8 +735,9 @@ int main(int argc, char** argv)
 			sendChat(msg);
 		}
 
-		// combat: damage a random other player every 0.5s
-		if(cfg.scenario == "combat" && t - lastDamage >= 0.5 && alive && !peers.empty()){
+		// combat/fight: damage a random other player every 0.5s
+		if((cfg.scenario == "combat" || cfg.scenario == "fight") &&
+		   t - lastDamage >= 0.5 && alive && !peers.empty()){
 			lastDamage = t;
 			auto it = peers.begin();
 			std::uniform_int_distribution<size_t> d(0, peers.size() - 1);
@@ -854,6 +888,10 @@ int main(int argc, char** argv)
 	if(!sawPeer && cfg.scenario != "solo") failReasons += "no_peer_state ";
 	if(cfg.scenario == "combat" && !sawDeath) failReasons += "no_death ";
 	if(cfg.scenario == "combat" && deathsSelf == 0 && !failReasons.empty()) {}
+	// fight: someone died, the scoreboard covered us, and we dealt damage.
+	// kills are not required per-bot: with two fighters only the winner scores.
+	if(cfg.scenario == "fight" && !sawDeath) failReasons += "no_death ";
+	if(cfg.scenario == "fight" && !sawScore) failReasons += "no_score ";
 	if(!rconOk) failReasons += "rcon_auth_failed ";
 	if(!rconCmdOk) failReasons += "rcon_cmd_failed ";
 	if(statesSent < (int)(cfg.duration * 10)) failReasons += "too_few_states ";
@@ -883,9 +921,9 @@ int main(int argc, char** argv)
 
 	bool pass = failReasons.empty();
 	std::printf("[BOT] RESULT: %s %s| states=%d corrections=%d deaths=%d spawns=%d "
-	            "vehstates=%d vehenters=%d veh=%d\n",
+	            "vehstates=%d vehenters=%d veh=%d kills=%d score=%d\n",
 	            pass ? "PASS" : "FAIL", failReasons.c_str(),
 	            statesSent, correctionsReceived, deathsSelf, spawnsSeen,
-	            vehStatesSeen, vehEntersSeen, (int)myVehicle);
+	            vehStatesSeen, vehEntersSeen, (int)myVehicle, killsMade, myScore);
 	return pass ? 0 : 1;
 }

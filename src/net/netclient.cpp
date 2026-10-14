@@ -449,6 +449,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			fflush(stderr);
 			Event e;
 			e.type = EV_VEH_SPAWN;
+			e.id = vs.ownerId;
 			e.arg = vs.vehicleId;
 			e.model = vs.modelId;
 			e.state.xMm = QuantPos(vs.x);
