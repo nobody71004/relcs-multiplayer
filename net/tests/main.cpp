@@ -1373,11 +1373,89 @@ static void TestAdminGiveRouting()
 	CHECK(!g.ok);
 }
 
+// ---------------------------------------------------------------------------
+// Admin authorization gate. Faithful port of Server::HandleRcon's two-state
+// machine (net/server/server.cpp:1067) so the gate is pinned without a live
+// server: a peer must send MSG_RCON_AUTH with the exact configured password
+// before ANY MSG_RCON_CMD is dispatched. The live proof is e2e phase 7
+// (-expect-rcon-deny); this is the deterministic unit-level guard.
+// ---------------------------------------------------------------------------
+struct RconPeer { bool authed = false; };   // mirrors ServerPlayer::rconAuthed
+
+// returns the server's reply to an MSG_RCON_AUTH; mutates peer.authed like the
+// server does (p->rconAuthed = ok).
+static const char* RconAuth(RconPeer& peer, const std::string& serverPw,
+                            const std::string& attempt)
+{
+	bool ok = !serverPw.empty() && serverPw == attempt;
+	peer.authed = ok;
+	return ok ? "RCON_OK" : "RCON: wrong password";
+}
+
+// returns what the server does with an MSG_RCON_CMD from this peer: either the
+// refusal string (gate held) or "DISPATCH" (command reaches HandleCommand).
+static const char* RconCmd(const RconPeer& peer)
+{
+	if(!peer.authed) return "RCON: not authenticated";
+	return "DISPATCH";
+}
+
+static void TestAdminAuthGate()
+{
+	const std::string PW = "s3cret-pw";
+
+	// a peer that never authenticated: every admin command is refused -----
+	{
+		RconPeer p;
+		CHECK(!p.authed);
+		CHECK(std::string(RconCmd(p)) == "RCON: not authenticated");
+		// the gate is stateful, not per-command: still denied on a second try
+		CHECK(std::string(RconCmd(p)) == "RCON: not authenticated");
+	}
+
+	// wrong password: gate stays closed -----------------------------------
+	{
+		RconPeer p;
+		CHECK(std::string(RconAuth(p, PW, "hunter2")) == "RCON: wrong password");
+		CHECK(!p.authed);
+		CHECK(std::string(RconCmd(p)) == "RCON: not authenticated");
+	}
+
+	// server with NO password configured: auth can never succeed (RCON is
+	// effectively disabled — an empty attempt must NOT match an empty pw) --
+	{
+		RconPeer p;
+		CHECK(std::string(RconAuth(p, "", "")) == "RCON: wrong password");
+		CHECK(!p.authed);
+		CHECK(std::string(RconCmd(p)) == "RCON: not authenticated");
+	}
+
+	// correct password: gate opens, admin commands dispatch ----------------
+	{
+		RconPeer p;
+		CHECK(std::string(RconAuth(p, PW, PW)) == "RCON_OK");
+		CHECK(p.authed);
+		CHECK(std::string(RconCmd(p)) == "DISPATCH");
+	}
+
+	// a later wrong-password attempt REVOKES a previously-authed session ---
+	// (server unconditionally sets p->rconAuthed = ok on every auth msg)
+	{
+		RconPeer p;
+		CHECK(std::string(RconAuth(p, PW, PW)) == "RCON_OK");
+		CHECK(std::string(RconCmd(p)) == "DISPATCH");
+		CHECK(std::string(RconAuth(p, PW, "oops")) == "RCON: wrong password");
+		CHECK(!p.authed);
+		CHECK(std::string(RconCmd(p)) == "RCON: not authenticated");
+	}
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
 	TestAdminRconCodecs();
 	TestAdminGiveRouting();
+	TestAdminAuthGate();
 	TestVoiceCodec();
 	TestWelcomeLiveInfo();
 	TestVehDespawnCodec();
