@@ -121,6 +121,15 @@ ipch/
 *.VC.db
 *.VC.VC.opendb
 
+# reLCS multiplayer runtime SQLite databases (server profiles, master list)
+net/master.db
+net/*.db
+net/**/*.db
+net/*.db-wal
+net/*.db-shm
+net/**/*.db-wal
+net/**/*.db-shm
+
 # Visual Studio profiler
 *.psess
 *.vsp

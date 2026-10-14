@@ -333,6 +333,7 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 	case MSG_VEH_ENTER:   if(p) HandleVehEnter(p, r); break;
 	case MSG_VEH_EXIT:    if(p) HandleVehExit(p, r); break;
 	case MSG_INVENTORY:   if(p) HandleInventory(p, r); break;
+	case MSG_APPEARANCE:  if(p) HandleAppearance(p, r); break;
 	case MSG_RCON_AUTH:   if(p) HandleRcon(p, r, true); break;
 	case MSG_RCON_CMD:    if(p) HandleRcon(p, r, false); break;
 	case MSG_PING: {
@@ -469,9 +470,19 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		np.kills = np.savedProfile.kills;
 		np.deaths = np.savedProfile.deaths;
 		np.resumePos = np.savedProfile.hasPos;
-		Log("[PROFILE] loaded name=%s money=%d weapons=%d score=%d kills=%u deaths=%u", np.name.c_str(),
-		    np.savedProfile.money, (int)np.inv.count, np.score, (unsigned)np.kills, (unsigned)np.deaths);
+		// restore the saved look (default avatar stays if the row predates it)
+		np.appearance.playerId = np.id;
+		if(np.savedProfile.hasAppearance){
+			np.appearance.model = np.savedProfile.appearance.model;
+			for(int i = 0; i < MAX_APPEARANCE_COMPONENTS && i < PROFILE_APPEARANCE_COMPONENTS; i++)
+				np.appearance.components[i] = np.savedProfile.appearance.components[i];
+			np.appearanceSet = true;
+		}
+		Log("[PROFILE] loaded name=%s money=%d weapons=%d score=%d kills=%u deaths=%u model=%d", np.name.c_str(),
+		    np.savedProfile.money, (int)np.inv.count, np.score, (unsigned)np.kills, (unsigned)np.deaths,
+		    (int)np.appearance.model);
 	}
+	np.appearance.playerId = np.id;
 	// Only the account that owns a name may write to its row. An unclaimed name
 	// with an existing row (e.g. a legacy profile, or the owner claimed it
 	// mid-session) must not be overwritten by a same-named stranger.
@@ -509,6 +520,9 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		SendInventory(&np);
 	}
 
+	// restore the newcomer's own saved look so its client can apply it locally
+	SendAppearance(peer, &np);
+
 	// tell the newcomer about everyone already here
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& other = m_players[i];
@@ -521,6 +535,9 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			CopyStr(j.name, sizeof j.name, other.name.c_str());
 			WritePlayerJoin(w2, j);
 			SendTo(peer, w2, CHAN_RELIABLE, true);
+			// ...and each existing player's current look, so the newcomer renders
+			// the whole roster with the right models from the first frame
+			SendAppearance(peer, &other);
 			// already in the world: the newcomer missed their MSG_SPAWN, so
 			// replay it from the last accepted state (ahead of the vehicle
 			// snapshot below, so occupants have a body to seat)
@@ -549,6 +566,9 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	CopyStr(j.name, sizeof j.name, np.name.c_str());
 	WritePlayerJoin(w3, j);
 	Broadcast(w3, CHAN_RELIABLE, true, np.id);
+
+	// announce the newcomer's look to everyone else (default or restored)
+	BroadcastAppearance(&np);
 
 	// vehicle snapshot: live vehicles + occupants + last driver state, so a
 	// late joiner sees the same traffic as everyone else
@@ -883,6 +903,57 @@ void Server::SendInventory(ServerPlayer* p)
 	SendTo(p->peer, w, CHAN_RELIABLE, true);
 }
 
+// A client telling the server "this is my look". Server-authoritative-lite:
+// the model id is bounded (0 is refused — an unset/invalid model), the result
+// is persisted and rebroadcast so every client re-skins the puppet.
+void Server::HandleAppearance(ServerPlayer* p, BitReader& r)
+{
+	MsgAppearance m;
+	if(!ReadAppearance(r, m)) return;
+	if(Now() - p->appearanceTime < 0.5) return;   // report throttle (anti-flood)
+	p->appearanceTime = Now();
+
+	// a model of 0 is never a valid ped look; keep the current one
+	if(m.model == 0) return;
+
+	bool changed = (m.model != p->appearance.model) || !p->appearanceSet;
+	for(int i = 0; i < MAX_APPEARANCE_COMPONENTS; i++){
+		if(p->appearance.components[i] != m.components[i]) changed = true;
+		p->appearance.components[i] = m.components[i];
+	}
+	p->appearance.model = m.model;
+	p->appearance.playerId = p->id;
+	p->appearanceSet = true;
+	p->profileDirty = true;          // persist the new look
+
+	if(changed){
+		Log("[APPEARANCE] %s model=%d", p->name.c_str(), (int)m.model);
+		BroadcastAppearance(p);      // every client (incl. the sender's own echo)
+	}
+}
+
+void Server::SendAppearance(ENetPeer* peer, const ServerPlayer* who)
+{
+	if(!peer || !who) return;
+	BitWriter w;
+	BeginMsg(w, MSG_APPEARANCE);
+	MsgAppearance m = who->appearance;
+	m.playerId = who->id;
+	WriteAppearance(w, m);
+	SendTo(peer, w, CHAN_RELIABLE, true);
+}
+
+void Server::BroadcastAppearance(const ServerPlayer* who)
+{
+	if(!who) return;
+	BitWriter w;
+	BeginMsg(w, MSG_APPEARANCE);
+	MsgAppearance m = who->appearance;
+	m.playerId = who->id;
+	WriteAppearance(w, m);
+	Broadcast(w, CHAN_RELIABLE, true);   // sender included: confirms its own look
+}
+
 void Server::SaveProfile(ServerPlayer* p)
 {
 	if(!m_profiles.IsOpen() || !p || p->name.empty()) return;
@@ -913,6 +984,19 @@ void Server::SaveProfile(ServerPlayer* p)
 		prof.hasPos = p->savedProfile.hasPos;
 		prof.x = p->savedProfile.x; prof.y = p->savedProfile.y;
 		prof.z = p->savedProfile.z; prof.heading = p->savedProfile.heading;
+	}
+
+	// appearance: persist the chosen look. If the player never customized it
+	// this session, carry forward whatever the profile already had so a save
+	// triggered by something else (wallet move) never wipes a saved look.
+	if(p->appearanceSet){
+		prof.hasAppearance = true;
+		prof.appearance.model = p->appearance.model;
+		for(int i = 0; i < PROFILE_APPEARANCE_COMPONENTS && i < MAX_APPEARANCE_COMPONENTS; i++)
+			prof.appearance.components[i] = p->appearance.components[i];
+	}else if(p->hasProfile){
+		prof.hasAppearance = p->savedProfile.hasAppearance;
+		prof.appearance = p->savedProfile.appearance;
 	}
 
 	if(p->profileStranger){
@@ -1732,7 +1816,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 	};
 
 	if(cmd == "help"){
-		respond("commands: help status players say kick ban banip unban setr getr settime setweather res gmx loadmode respawn teleport spawncar delcar cars exec uptime version netstats quit");
+		respond("commands: help status players say kick ban banip unban setr getr settime setweather res gmx loadmode respawn teleport spawncar delcar cars setmodel exec uptime version netstats quit");
 		respond("res: list info enable disable reload run install uninstall log");
 		return true;
 	}
@@ -2010,6 +2094,35 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 			respond("health set to %d for %s", a1, tp->name.c_str());
 		}else
 			respond("usage: give <id|name> money|weapon|god|health <value> [ammo]");
+		return true;
+	}
+	if(cmd == "setmodel" || cmd == "skin"){
+		// setmodel <id|name> <pedModel> [c0 c1 ...] — set a player's appearance
+		// (character/outfit model + optional clothing/component slots)
+		char who[40] = {};
+		int model = 0;
+		int c[MAX_APPEARANCE_COMPONENTS] = {};
+		int n = sscanf(rest.c_str(), "%39s %d %d %d %d %d %d %d %d %d",
+		               who, &model, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+		if(n < 2 || model <= 0){
+			respond("usage: setmodel <id|name> <pedModel> [c0..c7]");
+			return true;
+		}
+		ServerPlayer* tp = FindPlayer((uint8_t)atoi(who));
+		if(!tp || !tp->active){
+			tp = nullptr;
+			for(int i = 0; i < MAX_PLAYERS; i++)
+				if(m_players[i].active && m_players[i].name == who){ tp = &m_players[i]; break; }
+		}
+		if(!tp || !tp->active){ respond("no such player: %s", who); return true; }
+		tp->appearance.playerId = tp->id;
+		tp->appearance.model = (uint16_t)model;
+		for(int i = 0; i < MAX_APPEARANCE_COMPONENTS; i++)
+			tp->appearance.components[i] = (uint8_t)(c[i] & 0xFF);
+		tp->appearanceSet = true;
+		tp->profileDirty = true;
+		BroadcastAppearance(tp);
+		respond("set %s model=%d", tp->name.c_str(), model);
 		return true;
 	}
 	if(cmd == "spawnbot"){
