@@ -23,6 +23,7 @@
 #include <chrono>
 #include <string>
 #include <map>
+#include <set>
 #include <random>
 #include <algorithm>
 
@@ -232,6 +233,24 @@ int main(int argc, char** argv)
 	double lastVehState = 0;
 	uint16_t seenVehId = 0xFFFF, seenVehModel = 0; // last vehicle that appeared
 	uint16_t ownVehId = 0xFFFF;                    // last car WE drove (seat 0)
+
+	// --- single-entity / occupancy integrity (vehicle-sync regression guards) ---
+	// live vehicle set: SPAWN adds, DESPAWN removes. A correctly behaving server
+	// gives us exactly ONE entity per real car — never a duplicate. We also count
+	// how many distinct ids were ever spawned and whether any single id was
+	// spawned twice without an intervening despawn (the "car gets duplicated" bug).
+	std::set<uint16_t> liveVehicles;
+	std::map<uint16_t, int> vehSpawnCount;         // id -> times SPAWN seen while already live
+	size_t maxLiveVehicles = 0;
+	int dupSpawns = 0;                             // SPAWN for an id already live (duplicate)
+	// occupancy integrity: a VEH_ENTER naming US must be one WE asked for. We set
+	// expectSelfEnter just before sending our own enter; any self-enter arriving
+	// while that flag is clear means the server put us in a car we never entered.
+	bool expectSelfEnter = false;
+	int unexpectedSelfEnters = 0;
+	// how many DISTINCT other players we saw seated via VEH_ENTER (not us). Used to
+	// confirm occupancy stays scoped to the player who actually entered.
+	std::map<uint8_t, uint16_t> otherOccupant;     // playerId -> vehicleId they entered
 
 	// proximity voice (-voice): tone frames out, relayed frames in
 	double lastVoice = 0.0;
@@ -505,9 +524,31 @@ int main(int argc, char** argv)
 					if(ReadVehSpawn(r, vs)){
 						seenVehId = vs.vehicleId;
 						seenVehModel = vs.modelId;
+						// single-entity guard: a SPAWN for a car already in our live
+						// set is a duplicate (the bug under test). Count it, don't
+						// grow the set past one entry for that id.
+						if(liveVehicles.count(vs.vehicleId)){
+							dupSpawns++;
+							vehSpawnCount[vs.vehicleId]++;
+						}else{
+							liveVehicles.insert(vs.vehicleId);
+						}
+						if(liveVehicles.size() > maxLiveVehicles)
+							maxLiveVehicles = liveVehicles.size();
 						if(cfg.verbose)
-							std::printf("[%.3f] VEH_SPAWN id=%d model=%d\n",
-							            elapsed(), (int)vs.vehicleId, (int)vs.modelId);
+							std::printf("[%.3f] VEH_SPAWN id=%d model=%d live=%d\n",
+							            elapsed(), (int)vs.vehicleId, (int)vs.modelId,
+							            (int)liveVehicles.size());
+					}
+					break;
+				}
+				case MSG_VEH_DESPAWN:{
+					MsgVehDespawn vd;
+					if(ReadVehDespawn(r, vd)){
+						liveVehicles.erase(vd.vehicleId);
+						if(cfg.verbose)
+							std::printf("[%.3f] VEH_DESPAWN id=%d live=%d\n",
+							            elapsed(), (int)vd.vehicleId, (int)liveVehicles.size());
 					}
 					break;
 				}
@@ -516,7 +557,17 @@ int main(int argc, char** argv)
 					if(ReadVehEnter(r, m)){
 						if(m.playerId != selfId){
 							vehEntersSeen++;
+							// occupancy stays scoped to the entering player: record
+							// who the server seated and where
+							otherOccupant[m.playerId] = m.vehicleId;
 						}else{
+							// a self-enter we did NOT initiate = the server forced us
+							// into a car (the "other clients get force-spawned into a
+							// duplicate" bug). expectSelfEnter is armed only around our
+							// own enter request.
+							if(!expectSelfEnter)
+								unexpectedSelfEnters++;
+							expectSelfEnter = false;
 							myVehicle = m.vehicleId;
 							mySeat = m.seat;
 							myModel = m.modelId;
@@ -692,6 +743,7 @@ int main(int argc, char** argv)
 				WriteVehEnter(w, ve);
 				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 				enet_peer_send(peer, CHAN_RELIABLE, pkt);
+				expectSelfEnter = true; // the server's VEH_ENTER echo for us is expected
 				myVehicle = 0x1234; // provisional; the server's VEH_ENTER echo confirms
 			}else{
 				BitWriter w;
@@ -806,6 +858,22 @@ int main(int argc, char** argv)
 	if(!rconCmdOk) failReasons += "rcon_cmd_failed ";
 	if(statesSent < (int)(cfg.duration * 10)) failReasons += "too_few_states ";
 	if(kicked) failReasons += "kicked ";
+
+	// --- vehicle-sync integrity assertions ---
+	// no car was ever duplicated (same id spawned twice without a despawn)
+	if(dupSpawns > 0) failReasons += "duplicate_vehicle_spawn ";
+	// we were never forced into a car we did not enter
+	if(unexpectedSelfEnters > 0) failReasons += "forced_into_vehicle ";
+	// the drive scenario must have actually exercised an enter-and-drive cycle
+	if(cfg.scenario == "drive"){
+		if(ownVehId == 0xFFFF && vehStatesSeen == 0 && statesSent > 0)
+			failReasons += "drive_never_entered ";
+	}
+	// machine-readable integrity line for the e2e harness (single-entity check)
+	std::printf("[BOT] VEHSUMMARY live_now=%d max_live=%d dup_spawns=%d "
+	            "forced_self_enters=%d other_occupants=%d own_veh=%d\n",
+	            (int)liveVehicles.size(), (int)maxLiveVehicles, dupSpawns,
+	            unexpectedSelfEnters, (int)otherOccupant.size(), (int)ownVehId);
 	if(cfg.voice){
 		if(voiceSent == 0) failReasons += "no_voice_sent ";
 		if(voiceOutOfRange > 0) failReasons += "voice_out_of_range ";

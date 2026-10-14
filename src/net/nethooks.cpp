@@ -2367,8 +2367,17 @@ void NetGame_Frame(void)
 		case NetClient::EV_VEH_SPAWN:{
 			float vx = ev.state.xMm / 1000.0f, vy = ev.state.yMm / 1000.0f, vz = ev.state.zMm / 1000.0f;
 			float vh = rnet::DequantAngle(ev.state.heading);
+			// Reconciliation guard: a spawn for an id we already track is a
+			// late/duplicate echo (e.g. a re-sent reliable packet). Never build a
+			// second puppet over an entity we already own — that was the "car gets
+			// duplicated" bug. The server no longer echoes our own enter's spawn
+			// back to us (SpawnVehicle excludeId), so s_pendingVeh is adopted from
+			// the VEH_ENTER echo instead; this branch only guards stragglers.
+			if(s_vehicles.find(ev.arg) != s_vehicles.end())
+				break;
 			if(s_pendingVeh){
-				// this spawn is OUR enter being allocated: bind our local car
+				// a spawn still carrying OUR pending enter (older server, or our
+				// enter raced the spawn): bind our local car instead of duplicating
 				CVector pp = s_pendingVeh->GetPosition();
 				bool match = (ev.model == s_pendingModel) &&
 				             std::fabs(pp.x - vx) < 30.0f && std::fabs(pp.y - vy) < 30.0f;
@@ -2387,15 +2396,20 @@ void NetGame_Frame(void)
 			if(ev.id == s_net.MyId()){
 				s_myVehNet = ev.arg;
 				s_mySeat = ev.kind;
+				// Adopt our local car as THE net entity for this id. This is now the
+				// single reconciliation point for a self-initiated enter (the server
+				// no longer echoes the spawn to us), so a client-initiated enter and
+				// the server's authoritative id resolve to exactly one entity — no
+				// duplicate puppet. Prefer s_pendingVeh (the exact car we drove into);
+				// fall back to the player's current/last vehicle.
+				CVehicle* pending = s_pendingVeh;
 				s_pendingVeh = nil;
-				// bind our local car object if the spawn didn't match it
-				{
-					CPlayerPed* me2 = FindPlayerPed();
-					CVehicle* local = (me2 && me2->bInVehicle) ? me2->m_pMyVehicle : s_lastMyVeh;
-					if(local && NetIdOfVehicle(local) == rnet::VEHICLE_NONE){
-						RemoveNetVehicle(ev.arg); // drop any half-made puppet
-						AdoptNetVehicle(ev.arg, local, (uint16_t)local->GetModelIndex());
-					}
+				CPlayerPed* me2 = FindPlayerPed();
+				CVehicle* local = pending;
+				if(!local) local = (me2 && me2->bInVehicle) ? me2->m_pMyVehicle : s_lastMyVeh;
+				if(local && NetIdOfVehicle(local) == rnet::VEHICLE_NONE){
+					RemoveNetVehicle(ev.arg); // drop any half-made puppet for this id
+					AdoptNetVehicle(ev.arg, local, (uint16_t)local->GetModelIndex());
 				}
 				fprintf(stderr, "[NET] we are in net vehicle %d seat %d\n", (int)ev.arg, (int)ev.kind);
 				fflush(stderr);

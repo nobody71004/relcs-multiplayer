@@ -964,9 +964,12 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	uint16_t vid = m.vehicleId;
 
 	if(vid == 0xFFFF){
-		// allocate a new vehicle at the player's position
+		// allocate a new vehicle at the player's position. The enterer already has
+		// the car locally (it drove into one it spawned) and adopts it from the
+		// MSG_VEH_ENTER echo below, so exclude it from the spawn broadcast — else
+		// it would materialize a duplicate puppet of a car it already owns.
 		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
-		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false);
+		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false, p->id);
 		if(!v) return;
 		vid = v->id;
 		Log("[VEH] player %d spawned vehicle id=%d model=%d", p->id, vid, (int)m.modelId);
@@ -1368,7 +1371,7 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 // after its driver walks away, exactly like a car parked on the street.
 // ---------------------------------------------------------------------------
 ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
-                                    float heading, bool permanent)
+                                    float heading, bool permanent, uint8_t excludeId)
 {
 	if(modelId == 0){
 		Log("[VEH] refusing model 0");
@@ -1406,7 +1409,9 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	vs.modelId = modelId;
 	vs.x = x; vs.y = y; vs.z = z; vs.heading = heading;
 	WriteVehSpawn(w, vs);
-	Broadcast(w, CHAN_RELIABLE, true);
+	// the player that entered its own car adopts the local entity from the
+	// MSG_VEH_ENTER echo — never send it a spawn it would duplicate
+	Broadcast(w, CHAN_RELIABLE, true, excludeId);
 
 	Log("[VEH] spawn id=%d model=%d at (%.1f, %.1f, %.1f) heading=%.0f%s",
 	    (int)v->id, (int)modelId, x, y, z, heading, permanent ? " [static]" : "");
