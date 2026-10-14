@@ -326,6 +326,62 @@ check "llm harness mock pipeline" grep -q "RESULT: PASS" "$OUT/harness.log"
 kill $AGENT_PID 2>/dev/null
 AGENT_PID=0
 
+# ---------------------------------------------------------------- phase 7
+# Admin panel end-to-end: drive every admin action through the same RCON path
+# the in-game panel / agent bridge / launcher use, and assert BOTH the effect
+# (a target client actually receives it) AND the authorization gate (an
+# unauthenticated peer's command is refused).
+step "phase 7: admin panel (effects applied + authorization gate)"
+AGENT_PID=0
+"$BIN/reLCS-agentd.exe" -http 7812 -server 127.0.0.1:$PORT -rcon $RCON \
+	-bot_exe "$BIN/relcs-netbot.exe" > "$OUT/agentd7.log" 2>&1 &
+AGENT_PID=$!
+sleep 1
+
+# admin helper: POST a command to the bridge and echo the server's answer lines
+adm() { # adm <rcon-command>
+	curl -sf -X POST http://127.0.0.1:7812/v1/rcon \
+		-H "X-Rcon: $RCON" -H 'Content-Type: application/json' \
+		-d "{\"command\":\"$1\"}"
+}
+
+# a target that stays connected long enough to receive an admin `give money`,
+# and a non-admin that fires an RCON command with NO auth and expects refusal
+ABOTS=()
+ABOTS+=($(spawn_bot "$OUT/admtarget.log" $BIN/relcs-netbot.exe -name AdminTarget -server 127.0.0.1:$PORT -scenario solo -duration 12 -expect-give money -seed 77))
+ABOTS+=($(spawn_bot "$OUT/noadmin.log"   $BIN/relcs-netbot.exe -name NoAdmin     -server 127.0.0.1:$PORT -scenario solo -duration 12 -expect-rcon-deny -seed 88))
+sleep 3   # let both join + spawn before we issue admin actions
+
+# effect: give the named target money — the bot asserts it received MSG_GIVE
+check "admin give money reaches target" \
+	sh -c "adm 'give AdminTarget money 25000' | grep -q 'gave'"
+# effect: world clock + weather broadcast accepted by the server
+check "admin settime accepted"    sh -c "adm 'settime 21 15' | grep -q 'time set'"
+check "admin setweather accepted" sh -c "adm 'setweather 3' | grep -q 'weather set'"
+# effect: server-wide broadcast
+check "admin broadcast accepted"  sh -c "adm 'broadcast E2E-ADMIN-BCAST' | grep -q 'broadcast sent'"
+# player list reflects the admin session
+check "admin players lists target" sh -c "adm 'players' | grep -q 'AdminTarget'"
+
+for f in admtarget noadmin; do
+	wait_result "$OUT/$f.log" 30 || FAIL=1
+done
+for pid in "${ABOTS[@]}"; do
+	[ "$pid" != "-1" ] && wait $pid 2>/dev/null
+done
+
+# effect confirmed client-side: the give actually landed on AdminTarget
+RESULT=$(grep -o "RESULT: [A-Z]*" "$OUT/admtarget.log" 2>/dev/null | head -1)
+[ "$RESULT" = "RESULT: PASS" ] && echo "PASS: give applied to target (client confirmed)" \
+	|| { echo "FAIL: give not confirmed by target (${RESULT:-none})"; FAIL=1; }
+# authorization gate: the unauthenticated command was refused
+RESULT=$(grep -o "RESULT: [A-Z]*" "$OUT/noadmin.log" 2>/dev/null | head -1)
+[ "$RESULT" = "RESULT: PASS" ] && echo "PASS: unauthenticated RCON refused (gate holds)" \
+	|| { echo "FAIL: authorization gate did not refuse (${RESULT:-none})"; FAIL=1; }
+
+kill $AGENT_PID 2>/dev/null
+AGENT_PID=0
+
 # ---------------------------------------------------------------- teardown
 step "teardown"
 cleanup

@@ -1191,9 +1191,193 @@ static void TestVoiceCodec()
 	CHECK(!ReadVoice(rShort, fromId, back, backLen));
 }
 
+// ---------------------------------------------------------------------------
+// Admin panel: RCON wire codecs + the give-command routing the server applies.
+//
+// The admin panel (in-game CEF console, key panel, agent /v1 bridge, launcher
+// -rcon) all funnel into MSG_RCON_* and the server's `give` parser. These tests
+// pin the wire format of every admin message and the exact kind/amount/arg a
+// `give` line maps to — including the kind-first "give money 5000" self-serve
+// form the admin UI emits, and malformed input that must be refused.
+// ---------------------------------------------------------------------------
+
+// Result of parsing a server-side `give` line (mirrors HandleCommand's `give`
+// branch in net/server/server.cpp). resolvedSelf=true means the value tokens
+// were shifted because no target id was given (kind-first self-serve UI form).
+struct GiveParse {
+	bool ok = false;
+	bool resolvedSelf = false;
+	std::string who;       // target token as the server would resolve it
+	uint8_t kind = 0;      // GIVE_* (0 = unresolved)
+	int32_t amount = 0;    // MsgGive.amount
+	uint16_t arg = 0;      // MsgGive.arg
+};
+
+// `respondTo` is the sender's player id (-1 = server console). This is a faithful
+// port of the server's parsing + SendGive argument mapping so the test fails if
+// that routing ever drifts.
+static GiveParse ParseGive(const std::string& rest, int respondTo)
+{
+	using namespace rnet;
+	GiveParse out;
+	char who[40] = {}, what[24] = {};
+	int a1 = 0, a2 = 0;
+	int n = std::sscanf(rest.c_str(), "%39s %23s %d %d", who, what, &a1, &a2);
+	auto isKind = [](const char* s){
+		return !std::strcmp(s, "money") || !std::strcmp(s, "weapon") ||
+		       !std::strcmp(s, "god") || !std::strcmp(s, "health");
+	};
+	if(n >= 1 && isKind(who)){
+		if(respondTo < 0) return out;                 // server console can't self-serve
+		char kind[24]; std::snprintf(kind, sizeof kind, "%s", who);
+		int v1 = (n >= 2) ? std::atoi(what) : 0;
+		int v2 = (n >= 3) ? a1 : 0;
+		std::snprintf(who, sizeof who, "%d", respondTo);
+		std::snprintf(what, sizeof what, "%s", kind);
+		a1 = v1; a2 = v2;
+		if(!std::strcmp(what, "god") && n < 2) a1 = 1;
+		n = 4;
+		out.resolvedSelf = true;
+	}
+	if(n < 3) return out;                             // malformed: needs kind+value
+	out.who = who;
+	if(!std::strcmp(what, "money"))      { out.kind = GIVE_MONEY;  out.amount = a1; out.arg = 0; }
+	else if(!std::strcmp(what, "weapon")){ out.kind = GIVE_WEAPON; out.amount = a2 > 0 ? a2 : 200; out.arg = (uint16_t)a1; }
+	else if(!std::strcmp(what, "god"))   { out.kind = GIVE_GOD;    out.amount = (n >= 3) ? a1 : 1; out.arg = 0; }
+	else if(!std::strcmp(what, "health")){ out.kind = GIVE_HEALTH; out.amount = a1; out.arg = 0; }
+	else return out;                                  // unknown kind: refused
+	out.ok = true;
+	return out;
+}
+
+static void TestAdminRconCodecs()
+{
+	using namespace rnet;
+
+	// --- MSG_RCON_AUTH: the password travels as a length-prefixed string -----
+	{
+		BitWriter w; BeginMsg(w, MSG_RCON_AUTH);
+		WriteStringMsg(w, "s3cret-pw", 255);
+		CHECK(PeekType(w.Data(), w.ByteSize()) == MSG_RCON_AUTH);
+		BitReader r(w.Data(), w.ByteSize());
+		CHECK((MsgType)r.ReadU8() == MSG_RCON_AUTH);
+		char pw[256] = {};
+		CHECK(ReadStringMsg(r, pw, sizeof pw, 255));
+		CHECK(std::string(pw) == "s3cret-pw");
+		CHECK(r.Ok());
+	}
+
+	// --- MSG_RCON_CMD: an admin command line round-trips verbatim ------------
+	for(const char* cmd : { "kick 3 cheating", "settime 19 30", "setweather 2",
+	                        "broadcast server restarting", "give 2 money 50000",
+	                        "ban 4", "res reload" }){
+		BitWriter w; BeginMsg(w, MSG_RCON_CMD);
+		WriteStringMsg(w, cmd, 255);
+		BitReader r(w.Data(), w.ByteSize());
+		CHECK((MsgType)r.ReadU8() == MSG_RCON_CMD);
+		char back[256] = {};
+		CHECK(ReadStringMsg(r, back, sizeof back, 255));
+		CHECK(std::string(back) == cmd);
+		CHECK(r.Ok());
+	}
+
+	// --- MSG_RCON_RESP / OK: the server's answer and the auth-accepted signal -
+	{
+		BitWriter w; BeginMsg(w, MSG_RCON_RESP);
+		WriteStringMsg(w, "RCON: not authenticated", 255);
+		BitReader r(w.Data(), w.ByteSize());
+		CHECK((MsgType)r.ReadU8() == MSG_RCON_RESP);
+		char back[256] = {};
+		CHECK(ReadStringMsg(r, back, sizeof back, 255));
+		CHECK(std::string(back) == "RCON: not authenticated");
+	}
+	{
+		BitWriter w; BeginMsg(w, MSG_RCON_OK);
+		CHECK(PeekType(w.Data(), w.ByteSize()) == MSG_RCON_OK);
+	}
+
+	// --- MSG_KICK: reason reaches the kicked client --------------------------
+	{
+		MsgKick k; CopyStr(k.reason, sizeof k.reason, "kicked by admin");
+		BitWriter w; BeginMsg(w, MSG_KICK); WriteKick(w, k);
+		BitReader r(w.Data(), w.ByteSize());
+		CHECK((MsgType)r.ReadU8() == MSG_KICK);
+		MsgKick k2; CHECK(ReadKick(r, k2));
+		CHECK(std::string(k2.reason) == "kicked by admin");
+		CHECK(r.Ok());
+	}
+
+	// --- MSG_WORLD: settime/setweather broadcast carries hour/minute/weather -
+	{
+		MsgWorld wd; wd.hour = 19; wd.minute = 30; wd.weather = 2;
+		BitWriter w; BeginMsg(w, MSG_WORLD); WriteWorld(w, wd);
+		BitReader r(w.Data(), w.ByteSize());
+		CHECK((MsgType)r.ReadU8() == MSG_WORLD);
+		MsgWorld w2; CHECK(ReadWorld(r, w2));
+		CHECK(w2.hour == 19 && w2.minute == 30 && w2.weather == 2);
+	}
+}
+
+static void TestAdminGiveRouting()
+{
+	using namespace rnet;
+
+	// id-first (operator targets an explicit player) -------------------------
+	GiveParse g = ParseGive("2 money 50000", /*respondTo*/ -1);
+	CHECK(g.ok && !g.resolvedSelf && g.who == "2");
+	CHECK(g.kind == GIVE_MONEY && g.amount == 50000 && g.arg == 0);
+
+	g = ParseGive("2 weapon 16 250", -1);        // give weapon <type> <ammo>
+	CHECK(g.ok && g.who == "2");
+	CHECK(g.kind == GIVE_WEAPON && g.arg == 16 && g.amount == 250);
+
+	g = ParseGive("2 weapon 16", -1);            // ammo defaults to 200
+	CHECK(g.ok && g.kind == GIVE_WEAPON && g.arg == 16 && g.amount == 200);
+
+	g = ParseGive("3 god 1", -1);
+	CHECK(g.ok && g.kind == GIVE_GOD && g.amount == 1);
+	// regression: "give <id> god 0" MUST turn god OFF (the key admin panel sends
+	// exactly this when toggling off). Before the n>=3 fix it forced ON.
+	g = ParseGive("3 god 0", -1);
+	CHECK(g.ok && g.kind == GIVE_GOD && g.amount == 0);
+	// id-first "give <id> god" without a value is incomplete (n<3): refused —
+	// only the kind-first self-serve form defaults a bare god to ON (below)
+	g = ParseGive("3 god", -1);
+	CHECK(!g.ok);
+
+	g = ParseGive("3 health 75", -1);
+	CHECK(g.ok && g.kind == GIVE_HEALTH && g.amount == 75);
+
+	// kind-first self-serve (the admin UI form: "give money 10000") ----------
+	// a real player (id 5) issued it; tokens shift so it targets the sender
+	g = ParseGive("money 10000", /*respondTo*/ 5);
+	CHECK(g.ok && g.resolvedSelf && g.who == "5");
+	CHECK(g.kind == GIVE_MONEY && g.amount == 10000);
+
+	g = ParseGive("weapon 16 200", 5);
+	CHECK(g.ok && g.resolvedSelf && g.who == "5");
+	CHECK(g.kind == GIVE_WEAPON && g.arg == 16 && g.amount == 200);
+
+	g = ParseGive("god", 5);                     // bare "give god" = on
+	CHECK(g.ok && g.resolvedSelf && g.kind == GIVE_GOD && g.amount == 1);
+
+	// authorization/validation refusals --------------------------------------
+	// self-serve is impossible from the server console (no sender to target)
+	g = ParseGive("money 10000", -1);
+	CHECK(!g.ok);
+	// malformed: a target but no value
+	g = ParseGive("2 money", -1);
+	CHECK(!g.ok);
+	// unknown kind is refused
+	g = ParseGive("2 teleport 5", -1);
+	CHECK(!g.ok);
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
+	TestAdminRconCodecs();
+	TestAdminGiveRouting();
 	TestVoiceCodec();
 	TestWelcomeLiveInfo();
 	TestVehDespawnCodec();

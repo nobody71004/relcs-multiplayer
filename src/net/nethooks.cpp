@@ -1042,8 +1042,12 @@ static void ConsoleExec(const char* line)
 		if(rest[0]) SendRconFmt("%s %s", cmd, rest);
 		else        SendRconFmt("%s", cmd);
 	}else if(is("rcon")){
-		if(rest[0]) s_net.SendRconCmd(rest);
-		else ConsolePrint("usage: rcon <server command>");
+		if(!rest[0]) ConsolePrint("usage: rcon <server command>");
+		else if(s_rconPw.empty())
+			// consistent with SendRconFmt: don't fire an unauthenticated command
+			// the server will only bounce with "not authenticated"
+			ConsolePrint("rcon not configured — '%s' NOT sent (set RCON in launcher settings or -rcon PW)", rest);
+		else s_net.SendRconCmd(rest);
 	}else if(is("clear")){
 		s_consoleLog.clear();
 	}else if(is("doorchime")){

@@ -1892,7 +1892,11 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 			SendGive(tp->id, GIVE_WEAPON, a2 > 0 ? a2 : 200, (uint16_t)a1);
 			respond("gave weapon %d (%d ammo) to %s", a1, a2 > 0 ? a2 : 200, tp->name.c_str());
 		}else if(!strcmp(what, "god")){
-			int on = (n >= 4) ? a1 : 1;
+			// id-form "give <id> god 0" tokenises to n=3 (id, "god", value): the
+			// value lives in a1, so n>=3 (not 4) — otherwise an explicit 0 is lost
+			// and godmode can never be turned OFF from the admin panel. A bare
+			// "give <id> god" (n==2) still defaults to ON.
+			int on = (n >= 3) ? a1 : 1;
 			SendGive(tp->id, GIVE_GOD, on, 0);
 			respond("godmode %s for %s", on ? "on" : "off", tp->name.c_str());
 		}else if(!strcmp(what, "health")){

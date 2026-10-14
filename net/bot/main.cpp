@@ -4,6 +4,13 @@
 //   relcs-netbot -name BotA -server 127.0.0.1:7777 [-scenario roam|combat|drive|chaos]
 //                [-duration 30] [-expect-chat SUBSTR] [-rcon PW] [-cmd "RCON CMD"] [-seed N] [-verbose]
 //
+// Admin end-to-end assertions:
+//   -expect-give money|weapon|health|god  fail unless an admin MSG_GIVE of that
+//                                          kind targeted this bot (effect applied)
+//   -expect-rcon-deny                      send an RCON command with NO auth and
+//                                          fail unless the server refuses it
+//                                          (authorization gate must hold)
+//
 // Prints 1 Hz telemetry lines consumed by the E2E harness:
 //   [<unix t>] IAM <x> <y> <z>       — this bot's authoritative position
 //   [<unix t>] SEES <id> <x> <y> <z> age=<s> — last relayed state of another
@@ -46,6 +53,10 @@ struct BotConfig {
 	std::string scenario = "roam";
 	double duration = 30.0;
 	std::string expectChat;
+	std::string expectGive;      // assert an admin MSG_GIVE of this kind reached us
+	                             // (money|weapon|health|god) — end-to-end admin effect proof
+	std::string expectRconDeny;  // assert an RCON command without auth is rejected
+	                             // (the server replies "RCON: not authenticated")
 	std::string password;        // profile password (claims/restores the name)
 	std::string rconPassword;
 	std::vector<std::string> rconCmds;   // extra RCON commands after auth (repeatable)
@@ -170,6 +181,8 @@ int main(int argc, char** argv)
 		else if(a == "-scenario" && hasNext) cfg.scenario = argv[++i];
 		else if(a == "-duration" && hasNext) cfg.duration = atof(argv[++i]);
 		else if(a == "-expect-chat" && hasNext) cfg.expectChat = argv[++i];
+		else if(a == "-expect-give" && hasNext) cfg.expectGive = argv[++i];
+		else if(a == "-expect-rcon-deny") cfg.expectRconDeny = "1";
 		else if(a == "-password" && hasNext) cfg.password = argv[++i];
 		else if(a == "-rcon" && hasNext) cfg.rconPassword = argv[++i];
 		else if(a == "-cmd" && hasNext) cfg.rconCmds.push_back(argv[++i]);
@@ -204,6 +217,10 @@ int main(int argc, char** argv)
 	// --- assertion state ---
 	bool gotWelcome = false, gotSpawn = false, kicked = false, disconnected = false;
 	bool gotChatExpect = cfg.expectChat.empty();
+	// admin end-to-end: proof that an admin `give` of the requested kind landed
+	bool gotGiveExpect = cfg.expectGive.empty();
+	// authorization gate: proof the server rejects an unauthenticated RCON command
+	bool rconDenied = cfg.expectRconDeny.empty();
 	bool sawPeer = false, sawDeath = false, rconOk = cfg.rconPassword.empty();
 	bool rconCmdOk = cfg.rconPassword.empty();
 	uint8_t selfId = 0;
@@ -348,6 +365,10 @@ int main(int argc, char** argv)
 							ENetPacket* p2 = enet_packet_create(w2.Data(), w2.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 							enet_peer_send(peer, CHAN_RELIABLE, p2);
 							rconTimer = elapsed() + 1.0;
+						}else if(!cfg.expectRconDeny.empty()){
+							// negative auth test: fire an RCON command with NO auth and
+							// expect the server to refuse it (authorization gate)
+							rconTimer = elapsed() + 1.0;
 						}
 					}
 					break;
@@ -414,15 +435,20 @@ int main(int argc, char** argv)
 				case MSG_GIVE:{
 					MsgGive g;
 					if(ReadGive(r, g) && g.targetId == selfId){
+						const char* kindName = "?";
 						switch(g.kind){
-						case GIVE_MONEY:  self.money += g.amount; break;
-						case GIVE_WEAPON: self.weapon = (uint8_t)g.arg; self.ammo = (uint16_t)g.amount; break;
-						case GIVE_HEALTH: self.health = (uint8_t)g.amount; break;
+						case GIVE_MONEY:  self.money += g.amount; kindName = "money"; break;
+						case GIVE_WEAPON: self.weapon = (uint8_t)g.arg; self.ammo = (uint16_t)g.amount; kindName = "weapon"; break;
+						case GIVE_HEALTH: self.health = (uint8_t)g.amount; kindName = "health"; break;
+						case GIVE_GOD:    kindName = "god"; break;
 						default: break;
 						}
+						// end-to-end admin proof: an admin `give <kind>` reached us
+						if(!cfg.expectGive.empty() && cfg.expectGive == kindName)
+							gotGiveExpect = true;
 						if(cfg.verbose)
-							std::printf("[%.3f] GIVE kind=%d amount=%d arg=%d\n",
-							            elapsed(), (int)g.kind, g.amount, (int)g.arg);
+							std::printf("[%.3f] GIVE kind=%s(%d) amount=%d arg=%d\n",
+							            elapsed(), kindName, (int)g.kind, g.amount, (int)g.arg);
 					}
 					break;
 				}
@@ -498,6 +524,10 @@ int main(int argc, char** argv)
 					if(cfg.verbose) std::printf("[%.3f] RCON: %s\n", elapsed(), text);
 					if(std::string(text).find("hostname=") != std::string::npos)
 						rconCmdOk = true;
+					// authorization gate: the server refuses commands from a peer
+					// that never sent (or failed) RCON auth
+					if(std::string(text).find("not authenticated") != std::string::npos)
+						rconDenied = true;
 					break;
 				}
 				case MSG_VEH_SPAWN:{
@@ -799,6 +829,8 @@ int main(int argc, char** argv)
 	if(!gotWelcome) failReasons += "no_welcome ";
 	if(!gotSpawn) failReasons += "no_spawn ";
 	if(!gotChatExpect) failReasons += "no_expected_chat ";
+	if(!gotGiveExpect) failReasons += "no_expected_give ";
+	if(!rconDenied) failReasons += "rcon_not_denied ";
 	if(!sawPeer && cfg.scenario != "solo") failReasons += "no_peer_state ";
 	if(cfg.scenario == "combat" && !sawDeath) failReasons += "no_death ";
 	if(cfg.scenario == "combat" && deathsSelf == 0 && !failReasons.empty()) {}
