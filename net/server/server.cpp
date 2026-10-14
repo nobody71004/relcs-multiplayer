@@ -533,8 +533,32 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	WritePlayerJoin(w3, j);
 	Broadcast(w3, CHAN_RELIABLE, true, np.id);
 
+	// everyone already spawned and alive, where they are now: the client builds
+	// a remote player only from MSG_SPAWN (or lazily from the first relayed
+	// state, which only comes while in streaming range), and a seat (VEH_ENTER
+	// below) needs that player to exist. Players waiting to respawn are covered
+	// by their respawn broadcast.
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& other = m_players[i];
+		if(!other.active || other.id == np.id || !other.spawned || !other.alive) continue;
+		BitWriter ws;
+		BeginMsg(ws, MSG_SPAWN);
+		MsgSpawn sp;
+		sp.playerId = other.id;
+		sp.skinModel = other.skin;
+		sp.x = DequantPos(other.state.xMm);
+		sp.y = DequantPos(other.state.yMm);
+		sp.z = DequantPos(other.state.zMm);
+		sp.heading = DequantAngle(other.state.heading);
+		sp.health = other.health;
+		sp.armour = other.armour;
+		WriteSpawn(ws, sp);
+		SendTo(peer, ws, CHAN_RELIABLE, true);
+	}
+
 	// vehicle snapshot: live vehicles + occupants + last driver state, so a
-	// late joiner sees the same traffic as everyone else
+	// late joiner sees the same traffic as everyone else (StreamVehicles keeps
+	// re-sending the state of every vehicle in range from here on)
 	for(int i = 0; i < MAX_VEHICLES; i++){
 		ServerVehicle& v = m_vehicles[i];
 		if(!v.active) continue;
@@ -559,6 +583,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			ve.vehicleId = v.id;
 			ve.seat = (uint8_t)s;
 			ve.modelId = v.modelId;
+			ve.x = vs.x; ve.y = vs.y; ve.z = vs.z; ve.heading = vs.heading;
 			WriteVehEnter(we, ve);
 			SendTo(peer, we, CHAN_RELIABLE, true);
 		}
@@ -628,20 +653,32 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 
 	// admins adopt every move: no validation flags, no rubber-band, no kick
 	uint8_t flags = admin ? 0 : ValidateMove(p->state, st, dt);
-	if(!admin && p->lastStateTime > 0.0 && (flags & (VAL_TOO_FAST | VAL_TELEPORT))){
+	bool failed = !admin && p->lastStateTime > 0.0 && (flags & (VAL_TOO_FAST | VAL_TELEPORT));
+	// a streak of refusals means the client really is somewhere the server never
+	// accepted (lost flagged teleport, seated player that cannot apply a
+	// correction): re-anchor instead of freezing the player for everyone
+	RefVerdict verdict = p->moveRef.Judge(failed);
+	if(failed){
 		p->violations++;
 		Log("violation #%d %s n=%d dt=%.3f (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f) flags=%02x",
 		    p->id, p->name.c_str(), p->violations, dt,
 		    p->state.xMm/1000.0f, p->state.yMm/1000.0f, p->state.zMm/1000.0f,
 		    st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f, (unsigned)flags);
-		// rubber-band: push the client back to the last server-accepted state
-		BitWriter w;
-		BeginMsg(w, MSG_CORRECTION);
-		PlayerState fix = p->state;
-		fix.health = p->health;
-		fix.armour = p->armour;
-		WritePlayerState(w, fix);
-		SendTo(p->peer, w, CHAN_RELIABLE, true);
+		if(verdict == REF_RESYNC){
+			Log("[resync] %s re-anchored at (%.1f,%.1f,%.1f) after %d refused moves",
+			    p->name.c_str(), st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f, MOVE_RESYNC_REJECTS);
+		}else if(st.vehicleId == VEHICLE_NONE){
+			// rubber-band: push the client back to the last server-accepted state.
+			// Not while seated: the game cannot move a seated ped (it is put back
+			// into its seat), so the correction would only feed the streak.
+			BitWriter w;
+			BeginMsg(w, MSG_CORRECTION);
+			PlayerState fix = p->state;
+			fix.health = p->health;
+			fix.armour = p->armour;
+			WritePlayerState(w, fix);
+			SendTo(p->peer, w, CHAN_RELIABLE, true);
+		}
 		if(p->violations > VIOLATION_KICK){
 			KickPlayer(p->id, "movement validation failed");
 			return;
@@ -677,12 +714,17 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	st.playerId = p->id;
 	st.health = p->health;
 	st.armour = p->armour;
+	// authoritative occupancy: the relayed state carries the seat the server
+	// assigned (HandleVehEnter/Exit), never the client's claim — every client
+	// reconciles remote seating from it, every tick
+	st.vehicleId = p->state.vehicleId;
+	st.seat = p->state.seat;
 
-	// never adopt a failed move: the correction we send points at the last good
+	// never adopt a refused move: the correction we send points at the last good
 	// state, so adopting the bad one would make client and server swap reference
 	// frames every tick (a 20 Hz rubber-band oscillation — seen as alternating
-	// positions in the violation log)
-	if(!(flags & (VAL_TOO_FAST | VAL_TELEPORT))){
+	// positions in the violation log). A re-anchor (REF_RESYNC) is adopted.
+	if(verdict != REF_REJECT){
 		p->state = st;
 		p->lastStateTime = t;
 	}
@@ -701,10 +743,17 @@ void Server::HandleVehicleState(ServerPlayer* p, BitReader& r)
 	if(dt < 0.001f) dt = TICK_DT;
 	if(dt > 0.5f) dt = 0.5f;
 
-	if(v->lastStateTime > 0.0 && (ValidateVehicleMove(v->state, st, dt) & VAL_TELEPORT)){
-		// don't relay teleports; client will get corrected visually by its own physics
+	// don't relay a teleport — unless the driver keeps reporting the car there:
+	// then the car really is there (a warp, or a teleport state lost in
+	// transit) and refusing forever would freeze it for everyone
+	bool teleport = v->lastStateTime > 0.0 && (ValidateVehicleMove(v->state, st, dt) & VAL_TELEPORT);
+	RefVerdict verdict = v->moveRef.Judge(teleport);
+	if(verdict == REF_REJECT)
 		return;
-	}
+	if(verdict == REF_RESYNC)
+		Log("[resync] vehicle %d re-anchored at (%.1f,%.1f,%.1f) after %d refused moves",
+		    (int)v->id, st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f, MOVE_RESYNC_REJECTS);
+	st.modelId = v->modelId;   // the server's model, whatever the driver claims
 	v->state = st;
 	v->lastStateTime = t;
 
@@ -968,8 +1017,11 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 		// the car locally (it drove into one it spawned) and adopts it from the
 		// MSG_VEH_ENTER echo below, so exclude it from the spawn broadcast — else
 		// it would materialize a duplicate puppet of a car it already owns.
-		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
-		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false, p->id);
+		// v6: place it where the client says its car is (bounded by the player's
+		// accepted position), not where the player last stood on foot
+		float vx, vy, vz, vh;
+		PlaceNewVehicle(p->state, m, vx, vy, vz, vh);
+		v = SpawnVehicle(m.modelId, vx, vy, vz, vh, false, p->id);
 		if(!v) return;
 		vid = v->id;
 		Log("[VEH] player %d spawned vehicle id=%d model=%d", p->id, vid, (int)m.modelId);
@@ -992,7 +1044,10 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	}
 
 	v->occupants[seat] = p->id;
-	if(seat == 0) v->driverId = p->id;
+	if(seat == 0){
+		v->driverId = p->id;
+		v->moveRef = MoveReference();   // new driver, new refusal streak
+	}
 	p->state.vehicleId = vid;
 	p->state.seat = seat;
 
@@ -1003,6 +1058,10 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	out.vehicleId = vid;
 	out.seat = seat;   // the ASSIGNED seat (may differ from the request)
 	out.modelId = v->modelId;
+	out.x = DequantPos(v->state.xMm);
+	out.y = DequantPos(v->state.yMm);
+	out.z = DequantPos(v->state.zMm);
+	out.heading = DequantAngle(v->state.heading);
 	WriteVehEnter(w, out);
 	Broadcast(w, CHAN_RELIABLE, true);
 }
@@ -1030,6 +1089,50 @@ void Server::ClearPlayerVehicles(ServerPlayer* p, bool broadcast)
 	}
 	p->state.vehicleId = VEHICLE_NONE;
 	p->state.seat = 0xFF;
+}
+
+// Vehicle streaming (per viewer, per vehicle): the state goes out reliably the
+// moment a vehicle enters a player's streaming range, and unreliably once per
+// VEHICLE_KEYFRAME_SEC while it stays in range — parked cars included. A client
+// that was out of range while a car moved, joined late, or lost a relay, has
+// the car where it really is within a second. Cars a driver is streaming right
+// now skip the keyframe (HandleVehicleState relays them at 20 Hz), and nobody
+// is sent the car they drive (their own simulation is authoritative).
+void Server::StreamVehicles(double t)
+{
+	for(int j = 0; j < MAX_PLAYERS; j++){
+		ServerPlayer& q = m_players[j];
+		if(!q.active || !q.spawned || !q.peer) continue;
+		bool keyframe = t >= q.nextVehKeyframe;
+		if(keyframe) q.nextVehKeyframe = t + VEHICLE_KEYFRAME_SEC;
+		for(int i = 0; i < MAX_VEHICLES; i++){
+			ServerVehicle& v = m_vehicles[i];
+			if(!v.active){
+				q.vehInRange[i] = false;
+				continue;
+			}
+			float dist = DistMm(v.state.xMm, v.state.yMm, v.state.zMm, q.state.xMm, q.state.yMm, q.state.zMm);
+			bool in = dist <= m_cfg.streamDistance;
+			StreamSend send = VehicleStreamDecision(q.vehInRange[i], in, keyframe);
+			q.vehInRange[i] = in;
+			if(send == STREAM_NONE || v.driverId == q.id) continue;
+			if(send == STREAM_KEYFRAME && v.lastStateTime > 0.0 && t - v.lastStateTime < 0.5) continue;
+			BitWriter w;
+			BeginMsg(w, MSG_VEHICLE_STATE);
+			WriteVehicleState(w, v.state);
+			if(send == STREAM_ENTER)
+				SendTo(q.peer, w, CHAN_RELIABLE, true);
+			else
+				SendTo(q.peer, w, CHAN_STATE, false);
+		}
+	}
+}
+
+void Server::ForgetVehicleSlot(int slot)
+{
+	if(slot < 0 || slot >= MAX_VEHICLES) return;
+	for(int j = 0; j < MAX_PLAYERS; j++)
+		m_players[j].vehInRange[slot] = false;
 }
 
 void Server::HandleVehExit(ServerPlayer* p, BitReader& r)
@@ -1137,8 +1240,10 @@ void Server::Tick()
 		}
 	}
 
-	// (vehicle states are relayed directly in HandleVehicleState — driver-paced
-	//  at 20 Hz, no stale re-broadcasts of parked vehicles)
+	// vehicle states: driver-paced relays happen in HandleVehicleState (20 Hz);
+	// this streams a vehicle to a player the moment it enters their range and
+	// keyframes every vehicle in range (parked ones too) once a second
+	StreamVehicles(t);
 
 	// world clock: +1 game minute every 2 real seconds
 	if(t - m_lastWorldUpdate > 2.0){
@@ -1255,6 +1360,7 @@ void Server::SpawnPlayer(uint8_t playerId, float x, float y, float z, float head
 	p->respawnAt = 0.0;
 
 	PlayerState& st = p->state;
+	p->moveRef = MoveReference();
 	st.playerId = playerId;
 	st.xMm = QuantPos(x); st.yMm = QuantPos(y); st.zMm = QuantPos(z);
 	st.velX = st.velY = st.velZ = 0;
@@ -1356,6 +1462,7 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 	p->state.xMm = QuantPos(x); p->state.yMm = QuantPos(y); p->state.zMm = QuantPos(z);
 	p->state.heading = QuantAngle(heading);
 	p->lastStateTime = Now();
+	p->moveRef = MoveReference();
 
 	BitWriter w;
 	BeginMsg(w, MSG_CORRECTION);
@@ -1401,6 +1508,8 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	v->state.zMm = QuantPos(z);
 	v->state.heading = QuantAngle(heading);
 	v->lastStateTime = 0.0;   // nobody has driven it yet
+	v->moveRef = MoveReference();
+	ForgetVehicleSlot(slot);   // a reused slot is news to everyone
 
 	BitWriter w;
 	BeginMsg(w, MSG_VEH_SPAWN);
@@ -1447,6 +1556,7 @@ void Server::RemoveVehicle(uint16_t vehicleId)
 	Broadcast(w, CHAN_RELIABLE, true);
 
 	Log("[VEH] despawn id=%d (model=%d)", (int)vehicleId, (int)v->modelId);
+	ForgetVehicleSlot(vehicleId - 1);
 	v->active = false;
 	v->permanent = false;
 	v->state = VehicleState();

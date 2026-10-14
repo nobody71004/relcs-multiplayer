@@ -10,7 +10,8 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 5;  // v5: server map + static vehicles + master favorites
+constexpr uint16_t PROTOCOL_VERSION   = 6;  // v6: MSG_VEH_ENTER carries the vehicle position
+                                              // (v5: server map + static vehicles + master favorites)
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
 constexpr uint16_t DEFAULT_MASTER_PORT= 7800;  // ENet master server
@@ -49,6 +50,20 @@ constexpr float MAX_SPEED_VEHICLE  = 95.0f;  // m/s
 constexpr float STREAM_DISTANCE    = 200.0f; // m, AOI radius
 constexpr float TELEPORT_WINDOW_SEC  = 5.0f;  // flood-guard window for client-flagged teleports
 constexpr int   MAX_TELEPORTS_PER_WINDOW = 200; // >20 Hz sustained is impossible from a real client
+// A refused move keeps the server's movement reference where it was. When the
+// client genuinely is elsewhere (a flagged teleport lost in transit, a seated
+// player who cannot act on a correction) every later state is refused too and
+// the player/car freezes for everyone. After this many consecutive refusals the
+// server re-anchors on the client's state instead (still counted as violations,
+// so a sustained speedhack is kicked exactly as before).
+constexpr int   MOVE_RESYNC_REJECTS   = 10;   // ~0.5 s at 20 Hz
+// Vehicle streaming: a vehicle's state is (re)sent reliably to a player the
+// moment it enters their streaming range, and re-sent at this period while it
+// stays in range (parked cars included) so a missed relay never sticks.
+constexpr float VEHICLE_KEYFRAME_SEC  = 1.0f;
+// A car a client created locally (VEH_ENTER 0xFFFF) is placed where the client
+// says it is, if that is within this distance of the player's accepted state.
+constexpr float NEW_VEHICLE_MAX_OFFSET = 30.0f;
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -277,6 +292,9 @@ struct MsgVehEnter {
 	uint16_t vehicleId = 0xFFFF; // 0xFFFF = server assigns new id
 	uint8_t  seat = 0;
 	uint16_t modelId = 0;
+	// v6: client -> server: where the car is (places a new 0xFFFF vehicle);
+	//     server -> client: the vehicle's current server position
+	float    x = 0, y = 0, z = 0, heading = 0;
 };
 
 struct MsgVehExit {

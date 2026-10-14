@@ -124,7 +124,8 @@ void NetClient::SendRconCmd(const char* command)
 	enet_host_flush((ENetHost*)m_host);
 }
 
-void NetClient::SendVehEnter(uint16_t vehicleId, uint8_t seat, uint16_t modelId)
+void NetClient::SendVehEnter(uint16_t vehicleId, uint8_t seat, uint16_t modelId,
+                             float x, float y, float z, float heading)
 {
 	if(!m_host || !m_peer || !m_connected) return;
 	BitWriter w;
@@ -134,6 +135,7 @@ void NetClient::SendVehEnter(uint16_t vehicleId, uint8_t seat, uint16_t modelId)
 	m.vehicleId = vehicleId;
 	m.seat = seat;
 	m.modelId = modelId;
+	m.x = x; m.y = y; m.z = z; m.heading = heading;
 	WriteVehEnter(w, m);
 	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
 	enet_peer_send((ENetPeer*)m_peer, CHAN_RELIABLE, pkt);
@@ -297,6 +299,9 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 				rp.state.yMm = QuantPos(sp.y);
 				rp.state.zMm = QuantPos(sp.z);
 				rp.state.heading = QuantAngle(sp.heading);
+				// a (re)spawn is on foot; a seat follows as MSG_VEH_ENTER
+				rp.state.vehicleId = VEHICLE_NONE;
+				rp.state.seat = 0xFF;
 				Event e;
 				e.type = EV_REMOTE_SPAWN;
 				e.id = sp.playerId;
@@ -312,6 +317,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			NetRemotePlayer& rp = remotes[st.playerId];
 			rp.state = st;
 			rp.spawned = true;
+			rp.relayed = true;
 			rp.lastUpdate = 0.0; // refreshed by Pump caller via wall clock if needed
 		}
 		break;
@@ -471,6 +477,10 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			e.arg = m.vehicleId;
 			e.kind = m.seat;
 			e.model = m.modelId;
+			e.state.xMm = QuantPos(m.x);
+			e.state.yMm = QuantPos(m.y);
+			e.state.zMm = QuantPos(m.z);
+			e.state.heading = QuantAngle(m.heading);
 			m_events.push_back(e);
 		}
 		break;

@@ -149,4 +149,77 @@ inline int32_t ValidateMoney(int32_t reported, int32_t& seen, int32_t& granted, 
 	return reported;
 }
 
+// ---------------------------------------------------------------------------
+// movement reference — whether a refused move keeps being refused.
+// The server adopts a player/vehicle state as its reference only when it
+// validates. A one-off discontinuity the server never learnt about (a flagged
+// teleport lost in transit, a correction a seated client cannot apply) would
+// otherwise make every later state fail against the stale reference, freezing
+// the entity for everyone forever. Judge() re-anchors after a streak of
+// MOVE_RESYNC_REJECTS refusals; the caller still counts each refusal as a
+// violation, so sustained cheating is kicked exactly as before.
+// ---------------------------------------------------------------------------
+enum RefVerdict : uint8_t {
+	REF_ADOPT  = 0,   // valid: becomes the new reference
+	REF_REJECT = 1,   // refused: reference unchanged (rubber-band / drop)
+	REF_RESYNC = 2,   // refused too often in a row: adopt it as the new reference
+};
+
+struct MoveReference {
+	int rejects = 0;  // consecutive refusals
+
+	RefVerdict Judge(bool failed)
+	{
+		if(!failed){
+			rejects = 0;
+			return REF_ADOPT;
+		}
+		if(++rejects >= MOVE_RESYNC_REJECTS){
+			rejects = 0;
+			return REF_RESYNC;
+		}
+		return REF_REJECT;
+	}
+};
+
+// ---------------------------------------------------------------------------
+// where a client-created car (VEH_ENTER 0xFFFF) goes: the position the client
+// reports when it is sane and close to the player's accepted state, else the
+// player's accepted state (pre-v6 behaviour)
+// ---------------------------------------------------------------------------
+inline bool PlaceNewVehicle(const PlayerState& ref, const MsgVehEnter& m,
+                            float& x, float& y, float& z, float& heading)
+{
+	float rx = DequantPos(ref.xMm), ry = DequantPos(ref.yMm), rz = DequantPos(ref.zMm);
+	x = rx; y = ry; z = rz;
+	heading = DequantAngle(ref.heading);
+	if(!std::isfinite(m.x) || !std::isfinite(m.y) || !std::isfinite(m.z))
+		return false;
+	if(std::fabs(m.x) > WORLD_LIMIT_XY || std::fabs(m.y) > WORLD_LIMIT_XY || std::fabs(m.z) > WORLD_LIMIT_Z)
+		return false;
+	float dx = m.x - rx, dy = m.y - ry, dz = m.z - rz;
+	if(dx * dx + dy * dy + dz * dz > NEW_VEHICLE_MAX_OFFSET * NEW_VEHICLE_MAX_OFFSET)
+		return false;
+	x = m.x; y = m.y; z = m.z;
+	if(std::isfinite(m.heading))
+		heading = m.heading;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// per-viewer vehicle streaming decision (one vehicle, one viewer, one tick)
+// ---------------------------------------------------------------------------
+enum StreamSend : uint8_t {
+	STREAM_NONE     = 0,
+	STREAM_ENTER    = 1,  // just came into range: send now, reliably
+	STREAM_KEYFRAME = 2,  // still in range, keyframe due: send unreliably
+};
+
+inline StreamSend VehicleStreamDecision(bool wasInRange, bool inRange, bool keyframeDue)
+{
+	if(!inRange) return STREAM_NONE;
+	if(!wasInRange) return STREAM_ENTER;
+	return keyframeDue ? STREAM_KEYFRAME : STREAM_NONE;
+}
+
 } // namespace rnet

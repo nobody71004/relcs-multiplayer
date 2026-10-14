@@ -57,6 +57,11 @@ struct ServerPlayer {
 	int violations = 0;
 	int teleportBurst = 0;            // client-flagged teleports in the current window
 	double teleportWindowStart = 0.0;
+	rnet::MoveReference moveRef;      // refused-move streak (re-anchor, rnet_validator.h)
+	// vehicle streaming: which vehicles were in this player's range last tick
+	// (entering range sends the state at once) and when the next keyframe is due
+	bool vehInRange[rnet::MAX_VEHICLES] = {};
+	double nextVehKeyframe = 0.0;
 	// tough validator state (rnet_validator.h)
 	rnet::RateLimiter msgRate;        // every packet — flood defence
 	rnet::RateLimiter chatRate;       // chat lines — spam defence
@@ -89,6 +94,7 @@ struct ServerVehicle {
 	uint8_t driverId = 0xFF;
 	uint8_t occupants[8];            // seat -> playerId (0xFF = free)
 	float lastStateTime = 0.0;
+	rnet::MoveReference moveRef;     // refused-teleport streak (re-anchor)
 };
 
 class GameMode;
@@ -162,6 +168,8 @@ private:
 	void HandleVehEnter(ServerPlayer* p, rnet::BitReader& r);
 	void HandleVehExit(ServerPlayer* p, rnet::BitReader& r);
 	void ClearPlayerVehicles(ServerPlayer* p, bool broadcast); // drop all seats held by p
+	void StreamVehicles(double t);    // stream-in + keyframes of vehicle states (Tick)
+	void ForgetVehicleSlot(int slot); // nobody has seen this vehicle slot yet
 	void HandleRcon(ServerPlayer* p, rnet::BitReader& r, bool auth);
 	void LoadVehicleSpawns(const std::string& path); // vehicles.cfg -> permanent vehicles
 
