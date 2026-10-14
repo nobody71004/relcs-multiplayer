@@ -179,6 +179,17 @@ static void AnchorSeatedPuppet(CPed* ped)
 	SyncPuppetToRw(ped);
 }
 
+// the engine's own in-car pose for this seat and vehicle (low cars, bikes and
+// boats each have their own sit anim). Also re-applied whenever a seated
+// puppet's clump is rebuilt: a fresh clump has no anims and stands upright.
+static void PoseSeatedPuppet(CPed* ped)
+{
+	CVehicle* veh = ped->m_pMyVehicle;
+	if(!veh || !ped->m_rwObject) return;
+	RpAnimBlendClumpSetBlendDeltas((RpClump*)ped->m_rwObject, ASSOC_PARTIAL, -1000.0f);
+	ped->AddInCarAnims(veh, veh->pDriver == ped);
+}
+
 // returns false when the seat is already held by someone else (logged by the caller)
 static bool SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
 {
@@ -206,14 +217,9 @@ static bool SeatNetPed(CPed* ped, CVehicle* veh, uint8 seat)
 	ped->bInVehicle = true;
 	ped->SetPedState(PED_DRIVING);
 	AnchorSeatedPuppet(ped);
-	// the engine's own in-car pose for this seat and vehicle (low cars, bikes
-	// and boats each have their own sit anim; a plain CAR_SIT blended over the
-	// on-foot anims left the model standing up through the seat). The frame
-	// pass keeps the ped in its seat from here.
-	if(ped->m_rwObject){
-		RpAnimBlendClumpSetBlendDeltas((RpClump*)ped->m_rwObject, ASSOC_PARTIAL, -1000.0f);
-		ped->AddInCarAnims(veh, seat == 0);
-	}
+	// a plain CAR_SIT blended over the on-foot anims left the model standing
+	// up through the seat. The frame pass keeps the ped in its seat from here.
+	PoseSeatedPuppet(ped);
 	return true;
 }
 
@@ -655,6 +661,7 @@ static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
 		ped->SetModelIndex(MI_MALE01);
 		SyncPuppetToRw(ped);
 		rp.lastAnim = -1;
+		PoseSeatedPuppet(ped);   // no-op on foot
 		fprintf(stderr, "[NET] remote ped id=%d clump rebuilt\n", (int)id);
 		fflush(stderr);
 	}
