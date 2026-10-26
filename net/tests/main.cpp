@@ -729,6 +729,22 @@ static void TestProfileStore()
 	CHECK(f.score == 7 && f.kills == 7 && f.deaths == 3);
 	CHECK(f.hasPos && f.x == 1133.5f && f.y == -660.25f && f.z == 23.0f && f.heading == 1.5f);
 
+	// character look: the chosen ped model AND the component slots survive a
+	// save/reopen, so the creator only has to ask a first-time player once
+	PlayerProfile look;
+	look.skin = 78;
+	for(int i = 0; i < 8; i++) look.skinComponents[i] = (uint8_t)(i * 9 + 1);
+	CHECK(db.Save("looks", look));
+	db.Close();
+	CHECK(db.Open(path));
+	PlayerProfile look2;
+	CHECK(db.Load("looks", look2));
+	CHECK(look2.skin == 78);
+	bool compsOk = true;
+	for(int i = 0; i < 8; i++)
+		if(look2.skinComponents[i] != (uint8_t)(i * 9 + 1)) compsOk = false;
+	CHECK(compsOk);
+
 	// a profile saved without a position reads back as no position
 	PlayerProfile g;
 	g.money = 1;

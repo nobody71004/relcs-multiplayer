@@ -5,6 +5,9 @@ workspace "reLCS-net"
 	configurations { "Debug", "Release" }
 	architecture "x86_64"
 	location "build"
+	-- the machine's installed Visual Studio toolset (VS 2022 BuildTools, v143);
+	-- premake's vs2019 action otherwise pins v142, which is not installed here
+	toolset "v143"
 	targetdir "bin/%{cfg.buildcfg}"
 	defines { "NOMINMAX", "WIN32_LEAN_AND_MEAN", "ENET_STATIC", "_CRT_SECURE_NO_WARNINGS" }
 	rtti "Off"
@@ -112,3 +115,11 @@ project "net-launcher"
 	files { "launcher/*.cpp", "launcher/*.h" }
 	netCommon()
 	links { "advapi32", "comctl32", "shell32", "ole32", "iphlpapi" }
+	-- Epic Online Services: the launcher owns the EOS bootstrap and shows the
+	-- Connect login state; the SDK ships next to the launcher at runtime.
+	includedirs { "../vendor/eos-sdk/include" }
+	libdirs { "../vendor/eos-sdk/lib/Win64" }
+	links { "EOSSDK-Win64-Shipping" }
+	postbuildcommands {
+		'{COPYFILE} "%{wks.location}/../../vendor/eos-sdk/bin/Win64/EOSSDK-Win64-Shipping.dll" "%{cfg.targetdir}/EOSSDK-Win64-Shipping.dll"'
+	}

@@ -73,6 +73,9 @@ workspace "reLCS"
 	configurations { "Debug", "Release" }
 	startproject "reLCS"
 	location "build"
+	-- the machine's installed Visual Studio toolset (VS 2022 BuildTools, v143);
+	-- premake's vs2019 action otherwise pins v142, which is not installed here
+	toolset "v143"
 	symbols "Full"
 	staticruntime "off"
 
@@ -169,7 +172,7 @@ workspace "reLCS"
 	filter { "platforms:*librw_d3d9*" }
 		defines { "RW_D3D9" }
 		if(not _OPTIONS["with-librw"]) then
-			libdirs { path.join(Librw, "lib/win-%{getarch(cfg.architecture)}-d3d9/%{cfg.buildcfg}") }
+			libdirs { path.join(Librw, "lib/%{cfg.platform}/%{cfg.buildcfg}") }
 		end
 
 	filter "platforms:*librw_gl3_glfw*"

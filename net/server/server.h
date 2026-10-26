@@ -143,6 +143,7 @@ private:
 	void SendRefusal(ENetPeer* peer, uint8_t code, const char* reason); // MSG_DISCONNECT + JoinRefused code
 	void OnConnect(ENetPeer* peer);
 	void HandleInventory(ServerPlayer* p, rnet::BitReader& r);
+	void HandleAppearance(ServerPlayer* p, rnet::BitReader& r);
 	void SendInventory(ServerPlayer* p);    // restore the persisted profile
 	void OnDisconnect(ENetPeer* peer);
 	void OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel);

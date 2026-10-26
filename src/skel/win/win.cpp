@@ -971,10 +971,13 @@ MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		case WM_SETCURSOR:
 		{
-			// a UI panel (F6 admin / console / chat) owns the mouse: show the
-			// standard arrow cursor while it is open
+			// a UI panel (F6 admin / console / chat / creator) owns the mouse: show
+			// the standard arrow cursor while it is open. The display counter is
+			// normalised because the engine already ran ShowCursor(FALSE) here and
+			// a single ShowCursor(TRUE) may not be enough to get the arrow back.
 			if( NetGame_WantMouse() )
 			{
+				while( ShowCursor(TRUE) < 0 ) {}
 				SetCursor(LoadCursor(NULL, IDC_ARROW));
 				break;
 			}
@@ -1064,21 +1067,28 @@ MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 
 		case WM_LBUTTONDOWN:
 		{
-			SetCapture(window);
+			// never capture the mouse while a UI panel is open: the click belongs
+			// to the CEF overlay, and a captured cursor makes the panel unusable
+			// (clicks stop reaching it until the window loses focus and is
+			// re-activated)
+			if( !NetGame_WantMouse() )
+				SetCapture(window);
 
 			return 0L;
 		}
 
 		case WM_RBUTTONDOWN:
 		{
-			SetCapture(window);
+			if( !NetGame_WantMouse() )
+				SetCapture(window);
 
 			return 0L;
 		}
 		
 		case WM_MBUTTONDOWN:
 		{
-			SetCapture(window);
+			if( !NetGame_WantMouse() )
+				SetCapture(window);
 
 			return 0L;
 		}
@@ -1100,21 +1110,24 @@ MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 
 		case WM_LBUTTONUP:
 		{
-			ReleaseCapture();
+			if( GetCapture() == window )
+				ReleaseCapture();
 
 			return 0L;
 		}
 
 		case WM_RBUTTONUP:
 		{
-			ReleaseCapture();
+			if( GetCapture() == window )
+				ReleaseCapture();
 
 			return 0L;
 		}
 		
 		case WM_MBUTTONUP:
 		{
-			ReleaseCapture();
+			if( GetCapture() == window )
+				ReleaseCapture();
 
 			return 0L;
 		}
