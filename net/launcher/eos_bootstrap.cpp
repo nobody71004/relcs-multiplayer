@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include <windows.h>
+
 namespace eosboot {
 namespace {
 
@@ -139,7 +141,7 @@ bool InitSdk()
 	}
 	Log("[eos] SDK %s initialized", "1.19.2");
 	EOS_Logging_SetCallback(OnEosLog);
-	EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, EOS_ELogLevel::EOS_LOG_Error);
+	EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, EOS_ELogLevel::EOS_LOG_Warning);
 	AddStep("sdk");
 	return true;
 }
@@ -163,7 +165,22 @@ bool CreatePlatform(const std::string& productId, const std::string& sandboxId,
 	opts.bIsServer = EOS_FALSE;
 	opts.ClientCredentials.ClientId = clientId.c_str();
 	opts.ClientCredentials.ClientSecret = clientSecret.c_str();
-	opts.CacheDirectory = "eos-cache";
+	// EOS 1.19 requires an absolute cache path; a relative one makes
+	// EOS_Platform_Create fail with "Cache directory path is relative".
+	static std::string cacheDir = []{
+		char exe[MAX_PATH] = {};
+		DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+		std::string dir;
+		if(n > 0 && n < MAX_PATH){
+			dir.assign(exe, n);
+			size_t slash = dir.find_last_of("\\/");
+			if(slash != std::string::npos) dir.resize(slash + 1);
+		}
+		dir += "eos-cache";
+		CreateDirectoryA(dir.c_str(), nullptr);
+		return dir;
+	}();
+	opts.CacheDirectory = cacheDir.c_str();
 	opts.TickBudgetInMilliseconds = 0;
 	opts.Flags = EOS_PF_DISABLE_OVERLAY;   // the launcher has no social overlay
 
@@ -195,7 +212,9 @@ void CreateDeviceId()
 	opts.ApiVersion = EOS_CONNECT_CREATEDEVICEID_API_LATEST;
 	opts.DeviceModel = "PC Windows";
 	SetPending("device-id");
+	g.deviceResult = -2;
 	EOS_Connect_CreateDeviceId(g.connect, &opts, nullptr, OnCreateDeviceId);
+	Log("[eos] CreateDeviceId request sent (model=%s)", opts.DeviceModel);
 }
 
 void Login(const std::string& displayName)
@@ -276,15 +295,25 @@ void Start(const std::string& productId, const std::string& sandboxId,
 				int dr = g.deviceResult.load();
 				// DuplicateNotAllowed means this machine already has a device id:
 				// that is the normal path on every start after the first.
-				if(dr != -2 || elapsed > 5.0){
-					if(dr >= 0 && dr != (int)EOS_EResult::EOS_Success &&
-					   dr != (int)EOS_EResult::EOS_DuplicateNotAllowed){
-						Log("[eos] CreateDeviceId unusable (%s), trying login anyway", ResultName(dr));
-					}
+				if(dr >= 0 && dr != (int)EOS_EResult::EOS_Success &&
+				   dr != (int)EOS_EResult::EOS_DuplicateNotAllowed){
+					Log("[eos] CreateDeviceId failed: %s", ResultName(dr));
+					SetError((std::string("CreateDeviceId failed: ") + ResultName(dr) +
+					          " (enable Connect for the client policy in the dev portal)").c_str());
+					AddStep("device-id-failed");
+					break;
+				}
+				if(dr == (int)EOS_EResult::EOS_Success ||
+				   dr == (int)EOS_EResult::EOS_DuplicateNotAllowed){
 					AddStep("device-id");
 					Login("reLCS Player");
 					loginSent = true;
 					loginAt = elapsed;
+				}else if(elapsed > 60.0){
+					Log("[eos] CreateDeviceId timed out");
+					SetError("CreateDeviceId timed out (Connect permission, network or sandbox/deployment mismatch)");
+					AddStep("device-id-timeout");
+					break;
 				}
 			}else{
 				int lr = g.loginResult.load();
