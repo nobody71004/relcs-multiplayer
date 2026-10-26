@@ -51,6 +51,7 @@ public:
 		EV_WORLD,          // server world clock/weather: kind=hour arg=minute amount=weather
 		EV_RES_LIST,       // mod/resource inventory updated (see resList)
 		EV_VOICE,          // voice frame: id = speaker, text = one Opus packet
+		EV_AC_STATUS,      // anti-cheat registration answer: kind = AcRegisterResult, text = detail
 	};
 
 	struct Event {
@@ -81,6 +82,14 @@ public:
 	void SendVehState(const rnet::VehicleState& s); // unreliable, 20 Hz, driver only
 	void SendInventory(const rnet::MsgInventory& m); // reliable snapshot (profile sync)
 	void SendAppearance(const rnet::MsgAppearance& m); // reliable: "this is my look"
+
+	// --- EOS anti-cheat ---
+	// MSG_AC_HELLO (PUID + Connect ID token + platform) then the relay. The
+	// session itself lives in acclient; this only moves bytes over the peer.
+	void SendAcHello();
+	void SendAcPayload(const void* data, uint32_t len);
+	bool AcRegistered() const { return m_acStatus == rnet::AC_REG_OK; }
+	uint8_t AcStatus() const { return m_acStatus; }
 
 	bool Connected() const { return m_connected; }
 	bool Spawned() const { return m_spawned; }
@@ -114,4 +123,8 @@ private:
 	std::string m_hostname, m_gameMode, m_mapName;
 	uint8_t m_players = 0, m_maxPlayers = 0;
 	std::deque<Event> m_events;
+	bool m_acHelloSent = false;
+	uint8_t m_acStatus = 0xFF;      // 0xFF = no answer yet, else AcRegisterResult
+	double m_acRetryAt = 0.0;
+	int m_acAttempts = 0;
 };

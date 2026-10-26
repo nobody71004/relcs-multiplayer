@@ -15,6 +15,8 @@ struct Status {
 	bool runtimeInstalled = false;   // EasyAntiCheat/ + start_protected_game.exe present
 	bool configWritten = false;      // Settings.json + <game>.exe.eac written
 	bool integrityBuilt = false;     // Certificates/base.bin from the signing tool
+	bool eosSdk = false;             // EOSSDK-Win64-Shipping.dll in the game folder
+	bool eosConfig = false;          // eos.ini (client credentials) in the game folder
 	std::string version;             // runtime version from EasyAntiCheat/.version
 	std::string lastError;
 	std::string log;                 // last action summary for the UI

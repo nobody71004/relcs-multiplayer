@@ -21,6 +21,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <shlobj.h>    // SHBrowseForFolderW: folder picker fallback
+#include <shobjidl.h>  // IFileOpenDialog: the folder picker
 
 #include <cstdio>
 #include <cstring>
@@ -49,7 +51,14 @@ struct ServerRow {
 	bool online = false;              // reachable right now
 };
 
-static std::string g_gameExe = "reLCS.exe";
+// The install the user picked in Settings ("" = let detection find it). Kept as
+// a directory: launcher.ini values that point at the executable are migrated to
+// their folder on load, and every path the UI sends is accepted in either form.
+static std::string g_gameDir;
+// defined with the detection code below; LoadConfig needs them first
+static std::string NormalizePath(const std::string& raw);
+static std::string ResolveInstall(const std::string& raw, std::string& dir, std::string& why,
+                                  bool& dataOk, bool& cefOk);
 static std::string g_nick = "Player";
 // server rcon password for in-game admin tools; defaults to the fleet's password so a
 // fresh install can open the admin panel without editing launcher.ini
@@ -679,7 +688,15 @@ static void LoadConfig()
 		std::string key = line.substr(0, eq), val = line.substr(eq + 1);
 		trim(key);
 		trim(val);
-		if(key == "game") g_gameExe = val;
+		if(key == "game"){
+			// older configs store the executable: keep the folder either way, and
+			// keep a path that no longer resolves so Settings can explain it
+			// instead of silently falling back to auto-detection
+			std::string dir, why;
+			bool dataOk = false, cefOk = false;
+			if(!ResolveInstall(val, dir, why, dataOk, cefOk).empty()) g_gameDir = dir;
+			else g_gameDir = NormalizePath(val);
+		}
 		else if(key == "nick") g_nick = val;
 		else if(key == "rcon") g_rconPw = val.empty() ? std::string(DEFAULT_RCON_PASSWORD) : val;
 		else if(key == "pass") g_pass = val;
@@ -694,7 +711,7 @@ static void LoadConfig()
 static void SaveConfig()
 {
 	std::ofstream f("launcher.ini");
-	f << "game = " << g_gameExe << "\n";
+	f << "game = " << g_gameDir << "\n";
 	f << "nick = " << g_nick << "\n";
 	f << "master = " << g_masterHost << ":" << g_masterPort << "\n";
 	f << "rcon = " << g_rconPw << "\n";
@@ -782,45 +799,286 @@ static void RegUninstallDirs(std::vector<std::string>& out)
 			RegCloseKey(key);
 		}
 	}
+}// What a user actually pastes: a quoted "Copy as path" value, %VARS%, a
+// trailing separator, or a bare drive letter. Normalising here means every other
+// function only ever sees an absolute path without quotes.
+static std::string NormalizePath(const std::string& raw)
+{
+	size_t a = raw.find_first_not_of(" \t\r\n");
+	size_t b = raw.find_last_not_of(" \t\r\n");
+	std::string s = (a == std::string::npos) ? std::string() : raw.substr(a, b - a + 1);
+	if(s.size() >= 2 && s.front() == '"' && s.back() == '"') s = s.substr(1, s.size() - 2);
+	if(s.find('%') != std::string::npos){
+		char exp[MAX_PATH * 2] = {};
+		DWORD n = ExpandEnvironmentStringsA(s.c_str(), exp, sizeof exp);
+		if(n > 0 && n <= sizeof exp) s = exp;
+	}
+	while(s.size() > 3 && (s.back() == '\\' || s.back() == '/')) s.pop_back();
+	char full[MAX_PATH * 4] = {};
+	if(!s.empty() && GetFullPathNameA(s.c_str(), sizeof full, full, nullptr) > 0) s = full;
+	if(s.size() == 2 && s[1] == ':') s += "\\";   // "D:" -> "D:\"
+	return s;
 }
 
-// bounded directory walk (depth 2, capped) for "somewhere in Downloads"
-static void ScanForGame(const std::string& root, int depth, std::vector<std::string>& out, int& budget)
+// Resolves a user path — folder or executable — to the install. Returns the exe
+// path ("" when it is not usable) and fills `dir` plus the missing-file warning.
+static std::string ResolveInstall(const std::string& raw, std::string& dir, std::string& why,
+                                  bool& dataOk, bool& cefOk)
 {
-	if(depth < 0 || budget <= 0) return;
+	dir.clear();
+	why.clear();
+	dataOk = false;
+	cefOk = false;
+	std::string p = NormalizePath(raw);
+	if(p.empty()){
+		why = "empty path";
+		return "";
+	}
+	bool isDir = DirExists(p);
+	if(!isDir && !FileExists(p)){
+		why = "path does not exist";
+		return "";
+	}
+	std::string d = p;
+	if(!isDir){
+		size_t s = d.find_last_of('\\');
+		if(s == std::string::npos){
+			why = "not an absolute path";
+			return "";
+		}
+		d.resize(s);
+	}
+	if(!GameDirOk(d, dataOk, cefOk)){
+		why = "no reLCS.exe in that folder";
+		return "";
+	}
+	if(!dataOk) why = "game data missing (models/gta3.img)";
+	else if(!cefOk) why = "cefui.dll is missing (the in-game UI will not show)";
+	dir = d;
+	return d + "\\reLCS.exe";
+}
+
+// Native folder picker. IFileOpenDialog is the modern dialog; SHBrowseForFolder
+// stays as the safety net for machines where the COM dialog cannot start.
+static bool PickGameFolder(std::string& out, std::string& why)
+{
+	out.clear();
+	why.clear();
+	HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	bool uninit = SUCCEEDED(hrCo);
+	IFileOpenDialog* dlg = nullptr;
+	HRESULT hr = (FAILED(hrCo) && hrCo != RPC_E_CHANGED_MODE)
+	    ? hrCo
+	    : CoCreateInstance(__uuidof(FileOpenDialog), nullptr, CLSCTX_INPROC_SERVER,
+	                       __uuidof(IFileOpenDialog), (void**)&dlg);
+	if(SUCCEEDED(hr) && dlg){
+		DWORD opts = 0;
+		if(FAILED(dlg->GetOptions(&opts))) opts = 0;
+		dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+		dlg->SetTitle(L"Select the reLCS game folder");
+		hr = dlg->Show(GetActiveWindow());
+		if(hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)){
+			why = "cancelled";
+		}else if(SUCCEEDED(hr)){
+			IShellItem* item = nullptr;
+			if(SUCCEEDED(dlg->GetResult(&item)) && item){
+				PWSTR path = nullptr;
+				if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path){
+					char narrow[MAX_PATH * 2] = {};
+					WideCharToMultiByte(CP_ACP, 0, path, -1, narrow, sizeof narrow, nullptr, nullptr);
+					out = narrow;
+					CoTaskMemFree(path);
+				}
+				item->Release();
+			}
+		}else{
+			why = "the folder dialog failed";
+		}
+		dlg->Release();
+	}else{
+		BROWSEINFOW bi = {};
+		bi.lpszTitle = L"Select the reLCS game folder";
+		bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+		LPITEMIDLIST idl = SHBrowseForFolderW(&bi);
+		if(idl){
+			wchar_t path[MAX_PATH] = {};
+			if(SHGetPathFromIDListW(idl, path)){
+				char narrow[MAX_PATH * 2] = {};
+				WideCharToMultiByte(CP_ACP, 0, path, -1, narrow, sizeof narrow, nullptr, nullptr);
+				out = narrow;
+			}
+			CoTaskMemFree(idl);
+		}else{
+			why = "cancelled";
+		}
+	}
+	if(uninit) CoUninitialize();
+	if(out.empty()){
+		if(why.empty()) why = "no folder selected";
+		return false;
+	}
+	out = NormalizePath(out);
+	return true;
+}
+
+// Folders that never hold a game install and cost the most to walk.
+static bool SkipScanDir(const char* name)
+{
+	static const char* skip[] = {
+		"$recycle.bin", "system volume information", "windows", "programdata",
+		"appdata", "node_modules", ".git", "__pycache__", "recovery", "perflogs",
+		"temp", "winsxs", "driverstore", "installer", "onedrivetemp",
+	};
+	for(const char* s : skip)
+		if(_stricmp(name, s) == 0) return true;
+	return false;
+}
+
+// A full-disk walk needs a stop condition that a huge profile tree cannot
+// defeat: the directory cap alone ran out inside C:\Users on a real machine
+// before the walk ever reached the rest of the drive. Scans are therefore also
+// wall-clock bounded, and the caller picks how patient to be.
+static ULONGLONG g_scanDeadline = 0;   // GetTickCount64 value; 0 = unbounded
+
+static bool ScanExpired()
+{
+	return g_scanDeadline != 0 && GetTickCount64() > g_scanDeadline;
+}
+
+// Bounded walk: `budget` is shared by every drive so a full disk cannot hang the
+// menu. Returns true (and sets `hit`) on the first install found.
+static bool ScanTree(const std::string& root, int depth, std::string& hit, int& scanned, int& budget)
+{
+	if(depth < 0 || budget <= 0 || ScanExpired()) return false;
 	std::string pattern = root + "\\*";
 	WIN32_FIND_DATAA fd;
 	HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-	if(h == INVALID_HANDLE_VALUE){
-		// the root itself may be the install
-		bool dataOk = false, cefOk = false;
-		if(GameDirOk(root, dataOk, cefOk)) out.push_back(root);
-		return;
-	}
+	if(h == INVALID_HANDLE_VALUE) return false;
+	bool found = false;
 	do{
-		if(budget-- <= 0) break;
 		if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-		if(fd.cFileName[0] == '.') continue;
+		if(fd.cFileName[0] == '.' || SkipScanDir(fd.cFileName)) continue;
+		if(budget-- <= 0 || ScanExpired()) break;
+		scanned++;
 		std::string sub = root + "\\" + fd.cFileName;
 		bool dataOk = false, cefOk = false;
-		if(GameDirOk(sub, dataOk, cefOk)){ out.push_back(sub); continue; }
-		if(depth > 0) ScanForGame(sub, depth - 1, out, budget);
+		if(GameDirOk(sub, dataOk, cefOk)){
+			hit = sub;
+			found = true;
+			break;
+		}
+		if(depth > 0 && ScanTree(sub, depth - 1, hit, scanned, budget)){
+			found = true;
+			break;
+		}
 	}while(FindNextFileA(h, &fd));
 	FindClose(h);
+	return found;
 }
 
-// detection order: configured path, registry, common install dirs, next to the
-// launcher, a bounded scan of the usual download/game folders, then PATH.
-// Returns the exe path ("") when nothing looks like an install.
-static std::string DetectGameExe(std::string& how, bool& dataOk, std::string& err)
+// Every fixed/removable drive: the root, the folders games actually get
+// installed to, then a shallow walk. Registry and common paths miss an install
+// extracted to another drive or an external SSD — this is what catches those.
+static bool ScanAllDrives(std::string& hit, int& scanned, int budget, unsigned maxMs)
+{
+	hit.clear();
+	scanned = 0;
+	g_scanDeadline = GetTickCount64() + maxMs;
+
+	// one candidate folder: the folder itself, then two levels inside it
+	auto tryDir = [&](const std::string& p) -> bool {
+		if(!DirExists(p)) return false;
+		bool dataOk = false, cefOk = false;
+		if(GameDirOk(p, dataOk, cefOk)){
+			hit = p;
+			return true;
+		}
+		scanned++;
+		return ScanTree(p, 2, hit, scanned, budget);
+	};
+
+	char drives[512] = {};
+	if(GetLogicalDriveStringsA(sizeof drives - 1, drives) == 0) return false;
+	for(const char* d = drives; *d; d += strlen(d) + 1){
+		if(ScanExpired()) break;
+		UINT type = GetDriveTypeA(d);
+		if(type != DRIVE_FIXED && type != DRIVE_REMOVABLE) continue;
+		if(d[0] == 'A' || d[0] == 'a' || d[0] == 'B' || d[0] == 'b') continue;   // floppies
+		std::string root = d;
+		while(root.size() > 2 && root.back() == '\\') root.pop_back();   // "D:\\" -> "D:"
+		if(!DirExists(root)) continue;
+		Log("[DETECT] scanning %s", root.c_str());
+
+		if(tryDir(root)) return true;
+
+		// user profiles next: an extracted build usually lands in Downloads,
+		// Desktop or Documents of whoever downloaded it, and those sit three
+		// levels down from the drive root.
+		std::string users = root + "\\Users";
+		WIN32_FIND_DATAA pfd;
+		HANDLE ph = FindFirstFileA((users + "\\*").c_str(), &pfd);
+		if(ph != INVALID_HANDLE_VALUE){
+			do{
+				if(!(pfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+				if(pfd.cFileName[0] == '.' || SkipScanDir(pfd.cFileName)) continue;
+				for(const char* sub : { "Downloads", "Desktop", "Documents", "Games" })
+					if(tryDir(users + "\\" + pfd.cFileName + "\\" + sub)) return true;
+			}while(FindNextFileA(ph, &pfd));
+			FindClose(ph);
+		}
+
+		for(const char* sub : { "reLCS", "Games", "Games2", "SteamLibrary\\steamapps\\common",
+		                        "steamapps\\common", "Epic Games", "GOG Games", "XboxGames",
+		                        "Downloads", "Desktop", "Documents" })
+			if(tryDir(root + "\\" + sub)) return true;
+
+		// anything else: a bounded walk. Depth 3 covers <drive>\a\b\reLCS, the
+		// shape of a manually extracted archive; `budget` stops a full disk from
+		// turning "Re-scan" into a multi-minute freeze.
+		if(ScanTree(root, 3, hit, scanned, budget)) return true;
+		if(budget <= 0) break;
+	}
+	g_scanDeadline = 0;
+	return false;
+}
+
+// detection order: the configured path, registry, common install dirs, next to
+// the launcher, PATH, then every drive. Returns the exe path ("") when nothing
+// looks like an install.
+// `deep` is set by the actions a player waits for on purpose (Re-scan, Join):
+// the every-drive walk then gets seconds instead of a quick pass, because a
+// build extracted anywhere on a second disk is exactly what it is looking for.
+static std::string DetectGameExe(std::string& how, bool& dataOk, std::string& err, bool deep = false)
 {
 	how.clear();
 	err.clear();
 	dataOk = false;
-	std::vector<std::pair<std::string, const char*>> cands;   // path or dir + source
 
-	if(!g_gameExe.empty())
-		cands.push_back({ g_gameExe, "settings" });
+	// The setting is the user's decision: honour it before any probing, and give
+	// it the whole scan only when it stopped being usable (moved/uninstalled).
+	std::string savedNote;
+	if(!g_gameDir.empty()){
+		std::string dir, why;
+		bool sData = false, sCef = false;
+		std::string exe = ResolveInstall(g_gameDir, dir, why, sData, sCef);
+		(void)sCef;   // cef is already folded into `why`
+		if(!exe.empty()){
+			how = "settings";
+			dataOk = sData;
+			err = why;   // set only when data/cef is missing
+			return exe;
+		}
+		savedNote = "saved path is not a game install (" + why + ")";
+		Log("[DETECT] %s: %s", savedNote.c_str(), g_gameDir.c_str());
+	}
+	// every later hit has to say why the saved path was passed over
+	auto useSavedNote = [&savedNote](std::string& e){
+		if(savedNote.empty()) return;
+		e = savedNote + (e.empty() ? std::string(" — using the detected one")
+		                          : " — using the detected one (" + e + ")");
+	};
+
+	std::vector<std::pair<std::string, const char*>> cands;   // path or dir + source
 
 	// registry: launcher-written hints, App Paths, uninstall entries
 	const char* regKeys[] = { "SOFTWARE\\reLCS", "SOFTWARE\\WOW6432Node\\reLCS" };
@@ -885,6 +1143,7 @@ static std::string DetectGameExe(std::string& how, bool& dataOk, std::string& er
 				how = c.second;
 				dataOk = data;
 				if(!data) err = "game data missing (models/gta3.img)";
+				useSavedNote(err);
 				return dir;
 			}
 			continue;
@@ -900,36 +1159,33 @@ static std::string DetectGameExe(std::string& how, bool& dataOk, std::string& er
 		if(!dirOk) err = "found the exe but its data files are not next to it";
 		else if(!data) err = "game data missing (models/gta3.img)";
 		else if(!cef) err = "cefui.dll is missing (the in-game UI will not show)";
+		useSavedNote(err);
 		return exe;
 	}
 
-	// bounded scan of the folders games actually get extracted to
-	std::vector<std::string> roots;
-	if(!up.empty()){
-		roots.push_back(up + "\\Downloads");
-		roots.push_back(up + "\\Desktop");
-		roots.push_back(up + "\\Documents");
-		roots.push_back(up);
-	}
-	roots.push_back("C:\\Games");
-	std::vector<std::string> found;
-	for(const auto& r : roots){
-		if(!DirExists(r)) continue;
-		int budget = 300;
-		ScanForGame(r, 1, found, budget);
-		if(!found.empty()) break;
-	}
-	if(!found.empty()){
-		bool data = false, cef = false;
-		GameDirOk(found[0], data, cef);
-		how = "folder scan";
-		dataOk = data;
-		if(!data) err = "game data missing (models/gta3.img)";
-		else if(!cef) err = "cefui.dll is missing (the in-game UI will not show)";
-		return found[0] + "\\reLCS.exe";
+	// last resort: every drive. An install extracted to D:\ or an external SSD
+	// is exactly what registry hints and fixed common paths miss.
+	{
+		std::string hit;
+		int scanned = 0;
+		ULONGLONG t0 = GetTickCount64();
+		if(ScanAllDrives(hit, scanned, deep ? 60000 : 8000, deep ? 3500u : 400u)){
+			bool data = false, cef = false;
+			GameDirOk(hit, data, cef);
+			how = "all-drives scan";
+			dataOk = data;
+			if(!data) err = "game data missing (models/gta3.img)";
+			else if(!cef) err = "cefui.dll is missing (the in-game UI will not show)";
+			useSavedNote(err);
+			Log("[DETECT] all-drives scan found %s (%d dirs, %llu ms)", hit.c_str(), scanned,
+			    (unsigned long long)(GetTickCount64() - t0));
+			return hit + "\\reLCS.exe";
+		}
+		Log("[DETECT] all-drives scan done (%d dirs, %llu ms)", scanned,
+		    (unsigned long long)(GetTickCount64() - t0));
 	}
 
-	if(err.empty()) err = "no game install found";
+	if(err.empty()) err = savedNote.empty() ? "no game install found" : savedNote + " — no install found";
 	return "";
 }
 
@@ -955,7 +1211,7 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 
 	std::string how, detErr;
 	bool dataOk = false;
-	std::string exe = DetectGameExe(how, dataOk, detErr);
+	std::string exe = DetectGameExe(how, dataOk, detErr, true);   // player is waiting
 	if(exe.empty()){
 		g_lastJoinError = "game install not found (" + detErr + ") — set the path in Settings";
 		Log("[JOIN] %s", g_lastJoinError.c_str());
@@ -1121,12 +1377,22 @@ static void HandleQuery(const char* request, void*)
 		if(s2 != std::string::npos){ name = dir.substr(s2 + 1); dir.resize(s2); }
 		eac::Status ac;
 		if(!dir.empty()) eac::Prepare(dir, name, ac);
-		std::string js = "{\"reply\":\"eacstatus\",\"ok\":" + std::string(ac.runtimeInstalled && ac.configWritten ? "true" : "false") +
+		// The client needs both halves to be protected: the Easy Anti-Cheat
+		// runtime (kernel driver, started by the bootstrapper) *and* the EOS SDK
+		// in the game folder (the in-game AC client). Report them separately so
+		// "why am I refused by that server" has an answer in the UI.
+		std::string acErr = ac.lastError.empty() ? gErr2 : ac.lastError;
+		if(acErr.empty() && !ac.eosSdk)
+			acErr = "EOSSDK-Win64-Shipping.dll is missing from the game folder — "
+			         "servers that require anti-cheat will refuse this client";
+		std::string js = "{\"reply\":\"eacstatus\",\"ok\":" + std::string(ac.runtimeInstalled && ac.configWritten && ac.eosSdk ? "true" : "false") +
 		                 ",\"runtime\":" + std::string(ac.runtimeInstalled ? "true" : "false") +
 		                 ",\"config\":" + std::string(ac.configWritten ? "true" : "false") +
 		                 ",\"integrity\":" + std::string(ac.integrityBuilt ? "true" : "false") +
+		                 ",\"eosSdk\":" + std::string(ac.eosSdk ? "true" : "false") +
+		                 ",\"eosIni\":" + std::string(ac.eosConfig ? "true" : "false") +
 		                 ",\"version\":\"" + Jesc(ac.version) + "\"" +
-		                 ",\"error\":\"" + Jesc(ac.lastError.empty() ? gErr2 : ac.lastError) + "\"" +
+		                 ",\"error\":\"" + Jesc(acErr) + "\"" +
 		                 ",\"log\":\"" + Jesc(ac.log) + "\"}";
 		Reply(js);
 	}else if(cmd == "eacinstall"){
@@ -1258,7 +1524,29 @@ static void HandleQuery(const char* request, void*)
 		std::string game = arg("game"), master = arg("master"), nick = arg("nick");
 		std::string rcon = arg("rcon");
 		std::string pass = arg("pass");
-		if(!game.empty()) g_gameExe = game;
+		// The install path is validated before anything is written: a typo must
+		// not replace a working setting with something that cannot launch.
+		bool haveGame = (args.find("game=") != std::string::npos);
+		std::string resolvedExe, gameWarning;
+		bool gameDataOk = false, gameCefOk = false;
+		if(haveGame){
+			if(game.empty()){
+				g_gameDir.clear();   // cleared on purpose: back to auto-detection
+				haveGame = false;
+			}else{
+				std::string dir, why;
+				std::string exe = ResolveInstall(game, dir, why, gameDataOk, gameCefOk);
+				if(exe.empty()){
+					Log("[CONFIG] game path rejected: %s (%s)", why.c_str(), game.c_str());
+					Reply("{\"reply\":\"config\",\"ok\":false,\"error\":\"" + Jesc(why) + "\"}");
+					return;
+				}
+				g_gameDir = dir;
+				resolvedExe = exe;
+				gameWarning = why;   // empty unless data/cef is missing
+				Log("[CONFIG] game path %s -> %s", game.c_str(), exe.c_str());
+			}
+		}
 		if(!nick.empty() && ValidUsername(nick)) g_nick = nick;
 		if(args.find("rcon=") != std::string::npos) g_rconPw = rcon; // allow clearing
 		if(args.find("pass=") != std::string::npos) g_pass = pass; // allow clearing
@@ -1268,7 +1556,16 @@ static void HandleQuery(const char* request, void*)
 			if(c != std::string::npos) g_masterPort = (uint16_t)atoi(master.c_str() + c + 1);
 		}
 		SaveConfig();
-		Reply("{\"reply\":\"config\",\"ok\":true}");
+		std::string js = "{\"reply\":\"config\",\"ok\":true";
+		if(haveGame){
+			js += ",\"how\":\"settings\",\"dir\":\"" + Jesc(g_gameDir);
+			js += "\",\"path\":\"" + Jesc(resolvedExe);
+			js += "\",\"data\":" + std::string(gameDataOk ? "true" : "false");
+			js += ",\"cef\":" + std::string(gameCefOk ? "true" : "false");
+			js += ",\"error\":\"" + Jesc(gameWarning);
+			js += "\"";
+		}
+		Reply(js + "}");
 	}else if(cmd == "favadd" || cmd == "favdel"){
 		std::string address = arg("address"), name = arg("name");
 		bool add = (cmd == "favadd");
@@ -1310,11 +1607,25 @@ static void HandleQuery(const char* request, void*)
 			      "\",\"error\":\"" + Jesc(note) +
 			      "\",\"rows\":" + RowsToJson(rows) + "}");
 		}).detach();
+	}else if(cmd == "browsegame"){
+		// Native folder picker. Modal on the CEF UI thread, which is what a file
+		// dialog is expected to do: nothing else can change the path while it is
+		// open. The reply carries the chosen folder; the page then validates it
+		// through the normal config path so data/cef problems show up there too.
+		std::string picked, why;
+		if(PickGameFolder(picked, why)){
+			Log("[BROWSE] picked %s", picked.c_str());
+			Reply("{\"reply\":\"browsegame\",\"ok\":true,\"dir\":\"" + Jesc(picked) + "\"}");
+		}else{
+			Log("[BROWSE] no folder (%s)", why.c_str());
+			Reply("{\"reply\":\"browsegame\",\"ok\":false,\"error\":\"" + Jesc(why) + "\"}");
+		}
 	}else if(cmd == "detectgame"){
 		std::thread([](){
 			std::string how, err;
 			bool dataOk = false, cefOk = false;
-			std::string exe = DetectGameExe(how, dataOk, err);
+			std::string exe = DetectGameExe(how, dataOk, err, true);   // Re-scan
+			std::string dir;
 			if(!exe.empty()){
 				std::string d = exe;
 				size_t s = d.find_last_of('\\');
@@ -1322,13 +1633,14 @@ static void HandleQuery(const char* request, void*)
 					d.resize(s);
 					bool data2 = false;
 					GameDirOk(d, data2, cefOk);
+					dir = d;
 				}
 			}
 			Log("[DETECT] game=%s how=%s data=%d cef=%d (%s)",
 			    exe.empty() ? "-" : exe.c_str(), how.empty() ? "-" : how.c_str(),
 			    (int)dataOk, (int)cefOk, err.c_str());
 			Reply("{\"reply\":\"game\",\"ok\":" + std::string(exe.empty() ? "false" : "true") +
-			      ",\"path\":\"" + Jesc(exe) + "\",\"how\":\"" + Jesc(how) +
+			      ",\"path\":\"" + Jesc(exe) + "\",\"dir\":\"" + Jesc(dir) + "\",\"how\":\"" + Jesc(how) +
 			      "\",\"data\":" + (dataOk ? "true" : "false") +
 			      "\",\"cef\":" + (cefOk ? "true" : "false") +
 			      ",\"error\":\"" + Jesc(err) + "\"}");
@@ -1633,7 +1945,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 			if(c != std::string::npos) g_masterPort = (uint16_t)atoi(v.c_str() + c + 1);
 		}
 	}
-	if(!gameOverride.empty()) g_gameExe = gameOverride;
+	if(!gameOverride.empty()){
+		// -game takes the same folder-or-exe form as the UI, and only replaces the
+		// setting when it actually resolves
+		std::string dir, why;
+		bool dataOk = false, cefOk = false;
+		std::string exe = ResolveInstall(gameOverride, dir, why, dataOk, cefOk);
+		if(!exe.empty()) g_gameDir = dir;
+		Log("[DETECT] -game %s -> %s", gameOverride.c_str(), exe.empty() ? why.c_str() : exe.c_str());
+	}
 
 	// headless EOS bootstrap check (CI/runbook)
 	for(int i = 1; i < __argc; i++){

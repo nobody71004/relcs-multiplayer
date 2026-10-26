@@ -430,6 +430,63 @@ inline bool ReadStringMsg(BitReader& r, char* dst, size_t dstSize, uint16_t maxL
 }
 
 // ---------------------------------------------------------------------------
+// EOS Anti-Cheat relay codecs
+//
+// Payloads are treated as opaque bytes: the length is checked against the
+// frame on the wire, never trusted from the peer for bounds.
+// ---------------------------------------------------------------------------
+inline void WriteAcHello(BitWriter& w, const MsgAcHello& m)
+{
+	w.WriteU8(m.platform);
+	w.WriteString(m.productUserId, AC_PUID_LEN - 1);
+	w.WriteString(m.idToken, AC_TOKEN_LEN - 1);
+}
+inline bool ReadAcHello(BitReader& r, MsgAcHello& m)
+{
+	m = MsgAcHello();
+	m.platform = r.ReadU8();
+	std::string puid = r.ReadString(AC_PUID_LEN - 1);
+	std::string token = r.ReadString(AC_TOKEN_LEN - 1);
+	CopyStr(m.productUserId, sizeof m.productUserId, puid.c_str());
+	CopyStr(m.idToken, sizeof m.idToken, token.c_str());
+	return r.Ok();
+}
+inline void WriteAcStatus(BitWriter& w, const MsgAcStatus& m)
+{
+	w.WriteU8(m.status);
+	w.WriteU8(m.registered);
+	w.WriteString(m.detail, MAX_REASON_LEN - 1);
+}
+inline bool ReadAcStatus(BitReader& r, MsgAcStatus& m)
+{
+	m = MsgAcStatus();
+	m.status = r.ReadU8();
+	m.registered = r.ReadU8();
+	std::string d = r.ReadString(MAX_REASON_LEN - 1);
+	CopyStr(m.detail, sizeof m.detail, d.c_str());
+	return r.Ok();
+}
+inline bool WriteAcPayload(BitWriter& w, const MsgAcPayload& m)
+{
+	if(m.len > MAX_AC_PAYLOAD) return false;
+	w.WriteU16(m.len);
+	for(uint16_t i = 0; i < m.len; i++) w.WriteU8(m.data[i]);
+	return true;
+}
+inline bool ReadAcPayload(BitReader& r, MsgAcPayload& m)
+{
+	m = MsgAcPayload();
+	uint16_t len = r.ReadU16();
+	// the frame must actually carry what the header claims: a truncated or
+	// oversized message is dropped instead of read past its end
+	if(len > MAX_AC_PAYLOAD) return false;
+	if(r.BitsLeft() < (int)len * 8) return false;
+	m.len = len;
+	for(uint16_t i = 0; i < len; i++) m.data[i] = r.ReadU8();
+	return r.Ok();
+}
+
+// ---------------------------------------------------------------------------
 // Master codecs
 // ---------------------------------------------------------------------------
 inline void WriteMasterAnnounce(BitWriter& w, const MsgMasterAnnounce& m)

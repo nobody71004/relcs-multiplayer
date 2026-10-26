@@ -3137,6 +3137,22 @@ void NetGame_Frame(void)
 			}
 			break;
 		}
+		case NetClient::EV_AC_STATUS:
+			// EOS registration answer. A refusal is not fatal on its own: the
+			// server keeps us for its grace window, so the player gets told why
+			// before the kick instead of dropping for "no reason".
+			ConsolePrint("anti-cheat: %s", ev.text.c_str());
+			fprintf(stderr, "[NET] ac status=%d registered=%d %s\n", (int)ev.kind,
+			        ev.kind == rnet::AC_REG_OK ? 1 : 0, ev.text.c_str());
+			fflush(stderr);
+			if(ev.kind == rnet::AC_REG_OK){
+				s_bannerText = "EOS ANTI-CHEAT: PROTECTED";
+				s_bannerUntil = NowSec() + 3.0;
+			}else{
+				s_bannerText = "EOS ANTI-CHEAT: NOT PROTECTED";
+				s_bannerUntil = NowSec() + 8.0;
+			}
+			break;
 		case NetClient::EV_DISCONNECTED:
 			fprintf(stderr, "[NET] disconnected: %s\n", ev.text.c_str());
 			fflush(stderr);
@@ -3144,6 +3160,10 @@ void NetGame_Frame(void)
 				ConsolePrint("join refused: this name is claimed — set the right password in the launcher (or use -password)");
 			else if(ev.kind == rnet::REFUSE_PASSWORD)
 				ConsolePrint("join refused: %s", ev.text.c_str());
+			else if(ev.kind == rnet::REFUSE_ANTICHEAT)
+				ConsolePrint("join refused: %s — this server keeps protected clients only "
+				             "(install Easy Anti-Cheat, launcher: -eacinstall; EOSSDK-Win64-Shipping.dll "
+				             "beside reLCS.exe)", ev.text.c_str());
 			while(!s_remotes.empty())
 				RemoveRemote(s_remotes.begin()->first);
 			ClearAllVehicles();

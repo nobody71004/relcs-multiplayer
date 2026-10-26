@@ -498,12 +498,13 @@
               <div class="notice" id="gameState">Detecting the game install…</div>
             </div>
             <div class="field">
-              <label for="game">Game executable</label>
+              <label for="game">Game folder or executable</label>
               <div class="inline">
                 <input id="game" class="mono" autocomplete="off" placeholder="auto-detected">
+                <button class="btn" id="btnBrowse">Browse…</button>
                 <button class="btn" id="btnDetect">Re-scan</button>
               </div>
-              <div class="help" id="gameHint">Leave this empty to let the launcher find the install automatically (registry, common folders, next to the launcher).</div>
+              <div class="help" id="gameHint">Leave this empty to let the launcher find the install itself — it scans every drive. Browse picks any folder (a moved install, another drive, an external SSD); the folder holding reLCS.exe is the one to choose.</div>
             </div>
           </div>
         </div>
@@ -893,10 +894,20 @@ window.onCefReply = function (json) {
       pollSecurity();
       break;
     case "game":
-      if (msg.ok) $("game").value = msg.path;
+      if (msg.ok) $("game").value = msg.dir || msg.path || "";
       showGameState(msg);
       setStatus(msg.ok ? "game detected (" + (msg.how || "auto") + ")" : "game not found: " + (msg.error || ""),
                 msg.ok ? "ok" : "err");
+      break;
+    case "browsegame":
+      if (msg.ok) {
+        $("game").value = msg.dir || "";
+        $("gameState").className = "notice";
+        $("gameState").textContent = "Checking the selected folder…";
+        saveCfg();   // validate + persist through the same path as Save settings
+      } else {
+        setStatus("no folder selected: " + (msg.error || "cancelled"), "warn");
+      }
       break;
     case "servers": {
       servers = msg.rows || [];
@@ -979,7 +990,20 @@ window.onCefReply = function (json) {
                 msg.ok ? "ok" : "err");
       break;
     case "config":
-      setStatus("settings saved", "ok");
+      if (msg.ok) {
+        setStatus("settings saved", "ok");
+        if (msg.path) {
+          $("game").value = msg.dir || msg.path;
+          showGameState({ ok: true, path: msg.path, how: "settings",
+                          data: msg.data, cef: msg.cef, error: msg.error || "" });
+        }
+      } else {
+        // the host refused the path: say why here, not only in the status bar
+        const why = msg.error || "unknown error";
+        $("gameState").className = "notice err";
+        $("gameState").innerHTML = "Game path not saved" + '<span class="sub">' + esc(why) + "</span>";
+        setStatus("settings not saved: " + why, "err");
+      }
       break;
     case "addfav":
       setStatus(msg.ok ? "favorite saved (local cache)" : "select a server first", msg.ok ? "ok" : "err");
@@ -1109,9 +1133,13 @@ $("btnAddFav").addEventListener("click", () => {
 });
 $("btnDetect").addEventListener("click", () => {
   $("gameState").className = "notice";
-  $("gameState").textContent = "Scanning the registry, common folders and your home directory…";
+  $("gameState").textContent = "Scanning the registry, common folders and every drive…";
   setStatus("detecting the game install…");
   send("detectgame");
+});
+$("btnBrowse").addEventListener("click", () => {
+  setStatus("waiting for the folder dialog…");
+  send("browsegame");
 });
 $("btnPingAll").addEventListener("click", () => {
   setStatus("probing every listed server (map, mode, ping)…");
@@ -1119,8 +1147,10 @@ $("btnPingAll").addEventListener("click", () => {
 });
 $("btnSaveUser").addEventListener("click", () =>
   send(`saveuser?nick=${jenc($("nick").value)}`));
-$("btnSaveCfg").addEventListener("click", () =>
-  send(`config?game=${jenc($("game").value)}&master=${jenc($("master").value)}&nick=${jenc($("nick").value)}&pass=${jenc($("pass").value)}&rcon=${jenc($("rcon").value)}`));
+function saveCfg() {
+  send(`config?game=${jenc($("game").value)}&master=${jenc($("master").value)}&nick=${jenc($("nick").value)}&pass=${jenc($("pass").value)}&rcon=${jenc($("rcon").value)}`);
+}
+$("btnSaveCfg").addEventListener("click", saveCfg);
 $("btnQuit").addEventListener("click", () => send("quit"));
 $("btnDiag").addEventListener("click", runDiag);
 $("btnEacInstall").addEventListener("click", () => {

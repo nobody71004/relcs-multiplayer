@@ -4,9 +4,11 @@
 #include "rnet_voice.h"
 #include "profiles.h"
 #include "passhash.h"
+#include "anticheat_config.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -1329,9 +1331,157 @@ static void TestVoiceCodec()
 	CHECK(!ReadVoice(rShort, fromId, back, backLen));
 }
 
+// ---------------------------------------------------------------------------
+// EOS Anti-Cheat relay + config
+// ---------------------------------------------------------------------------
+static void TestAcProtocol()
+{
+	MsgAcHello h;
+	h.platform = AC_PLATFORM_WINDOWS;
+	CopyStr(h.productUserId, sizeof h.productUserId, "00112233445566778899aabbccddeeff");
+	CopyStr(h.idToken, sizeof h.idToken, "eyJhbGciOiJIUzI1NiJ9.payload.signature");
+
+	BitWriter w;
+	BeginMsg(w, MSG_AC_HELLO);
+	WriteAcHello(w, h);
+	CHECK(PeekType(w.Data(), w.ByteSize()) == MSG_AC_HELLO);
+
+	BitReader r(w.Data(), w.ByteSize());
+	CHECK(r.ReadU8() == MSG_AC_HELLO);
+	MsgAcHello h2;
+	CHECK(ReadAcHello(r, h2));
+	CHECK(h2.platform == AC_PLATFORM_WINDOWS);
+	CHECK(std::string(h2.productUserId) == "00112233445566778899aabbccddeeff");
+	CHECK(std::string(h2.idToken) == "eyJhbGciOiJIUzI1NiJ9.payload.signature");
+
+	MsgAcStatus st;
+	st.status = AC_REG_BAD_TOKEN;
+	st.registered = 0;
+	CopyStr(st.detail, sizeof st.detail, "Connect ID token rejected");
+	BitWriter w2;
+	BeginMsg(w2, MSG_AC_STATUS);
+	WriteAcStatus(w2, st);
+	BitReader r2(w2.Data(), w2.ByteSize());
+	CHECK(r2.ReadU8() == MSG_AC_STATUS);
+	MsgAcStatus st2;
+	CHECK(ReadAcStatus(r2, st2));
+	CHECK(st2.status == AC_REG_BAD_TOKEN);
+	CHECK(st2.registered == 0);
+	CHECK(std::string(st2.detail) == "Connect ID token rejected");
+
+	// a full-size AC message survives the relay unchanged
+	MsgAcPayload p;
+	p.len = (uint16_t)MAX_AC_PAYLOAD;
+	for(int i = 0; i < MAX_AC_PAYLOAD; i++) p.data[i] = (uint8_t)(i * 7);
+	BitWriter w3;
+	CHECK(WriteAcPayload(w3, p));
+	BitReader r3(w3.Data(), w3.ByteSize());
+	MsgAcPayload p2;
+	CHECK(ReadAcPayload(r3, p2));
+	CHECK(p2.len == MAX_AC_PAYLOAD);
+	CHECK(memcmp(p.data, p2.data, MAX_AC_PAYLOAD) == 0);
+
+	// a header that claims more bytes than the frame carries is refused
+	BitWriter w4;
+	w4.WriteU16(200);
+	w4.WriteU8(1);
+	BitReader r4(w4.Data(), w4.ByteSize());
+	MsgAcPayload p3;
+	CHECK(!ReadAcPayload(r4, p3));
+
+	// an oversized length is refused before anything is read
+	BitWriter w5;
+	w5.WriteU16((uint16_t)(MAX_AC_PAYLOAD + 1));
+	for(int i = 0; i < 8; i++) w5.WriteU8(0);
+	BitReader r5(w5.Data(), w5.ByteSize());
+	CHECK(!ReadAcPayload(r5, p3));
+
+	// an encoder never puts an oversized payload on the wire
+	MsgAcPayload big;
+	big.len = (uint16_t)(MAX_AC_PAYLOAD + 1);
+	BitWriter w6;
+	CHECK(!WriteAcPayload(w6, big));
+}
+
+static void TestAcConfig()
+{
+	CHECK(ac::IsProductUserId("00112233445566778899aabbccddeeff"));
+	CHECK(ac::IsProductUserId("00112233445566778899AABBCCDDEEFF"));
+	CHECK(!ac::IsProductUserId("00112233445566778899aabbccddeef"));    // 31 chars
+	CHECK(!ac::IsProductUserId("00112233445566778899aabbccddeeff0"));  // 33 chars
+	CHECK(!ac::IsProductUserId("zz112233445566778899aabbccddeeff"));
+	CHECK(!ac::IsProductUserId(""));
+
+	CHECK(std::string(ac::PlatformName(1)) == "windows");
+	CHECK(std::string(ac::PlatformName(2)) == "mac");
+	CHECK(std::string(ac::PlatformName(3)) == "linux");
+	CHECK(std::string(ac::PlatformName(0)) == "unknown");
+
+	std::string ini = "ac-test.ini";
+	{
+		std::ofstream f(ini);
+		f << "# client credentials\n";
+		f << "; second comment style\n";
+		f << "[eos]\n";
+		f << "client_id =  lcs-client-id  # trailing comment\n";
+		f << "client_secret=shhh\n";
+		f << "this line has no equals sign\n";
+	}
+	std::string v;
+	CHECK(ac::ReadIniValue(ini, "client_id", v) && v == "lcs-client-id");
+	CHECK(ac::ReadIniValue(ini, "client_secret", v) && v == "shhh");
+	CHECK(!ac::ReadIniValue(ini, "missing", v));
+	std::remove(ini.c_str());
+
+	std::string js = "ac-test.json";
+	{
+		std::ofstream f(js);
+		f << "{\n\t\"title\"\t: \"reLCS\",\n"
+		     "\t\"productid\"\t: \"fb155afe4a754a4b91929491873c844e\",\n"
+		     "\t\"sandboxid\" : \"515e78d9d395488faf0a3f63041dbba0\"\n}\n";
+	}
+	CHECK(ac::ReadJsonString(js, "productid", v) && v == "fb155afe4a754a4b91929491873c844e");
+	CHECK(ac::ReadJsonString(js, "title", v) && v == "reLCS");
+	CHECK(!ac::ReadJsonString(js, "deploymentid", v));
+	std::remove(js.c_str());
+
+	// Resolve() fills the shipped product data when nothing is configured
+	ac::Config cfg;
+	ac::Resolve(cfg);
+	CHECK(cfg.productId == ac::DEFAULT_PRODUCT_ID);
+	CHECK(cfg.sandboxId == ac::DEFAULT_SANDBOX_ID);
+	CHECK(cfg.deploymentId == ac::DEFAULT_DEPLOYMENT_ID);
+	CHECK(cfg.registerTimeout == 60);
+	CHECK(cfg.requireToken);
+	CHECK(cfg.kickOnViolation);
+
+	// "only protected clients are allowed" defaults on, with a workable grace
+	CHECK(cfg.requireProtected);
+	CHECK(cfg.failOpen);
+	CHECK(cfg.graceSeconds >= 5 && cfg.graceSeconds <= 600);
+
+	// a server.cfg typo must not become "kick on join" or "never kick"
+	ac::Config tight;
+	tight.graceSeconds = 0;
+	tight.registerTimeout = 0;
+	ac::Sanitize(tight);
+	CHECK(tight.graceSeconds == 5);
+	CHECK(tight.registerTimeout == 10);
+	tight.graceSeconds = 99999;
+	ac::Sanitize(tight);
+	CHECK(tight.graceSeconds == 600);
+	tight.graceSeconds = 45;
+	tight.registerTimeout = 30;
+	ac::Sanitize(tight);
+	CHECK(tight.graceSeconds == 45);
+	CHECK(tight.registerTimeout == 30);
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
+	TestAcProtocol();
+	TestAcConfig();
 	TestVoiceCodec();
 	TestWelcomeLiveInfo();
 	TestVehDespawnCodec();

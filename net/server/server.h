@@ -1,6 +1,7 @@
 // net/server/server.h — reLCS dedicated multiplayer server.
 #pragma once
 
+#include "anticheat.h"
 #include "compat.h"
 #include "profiles.h"
 #include "resource.h"
@@ -35,6 +36,7 @@ struct ServerConfig {
 	std::string resourcesDir = "resources";  // mod/resource packs ("" disables)
 	std::string vehiclesFile = "vehicles.cfg"; // static vehicle spawn list ("" disables)
 	std::string mapName = "Liberty City";    // shown in the launcher's server tooltip
+	ac::Config ac;                           // EOS Anti-Cheat session (server.cfg eac_*)
 };
 
 struct ServerPlayer {
@@ -55,6 +57,14 @@ struct ServerPlayer {
 	int score = 0;
 	uint16_t kills = 0, deaths = 0;
 	bool rconAuthed = false;
+	// EOS Anti-Cheat: 0 = no AC session requested, 1 = ID token being verified,
+	// 2 = registered with EOS_AntiCheatServer
+	uint8_t acState = 0;
+	// set from an EOS callback and acted on in Tick (never re-enter the SDK)
+	bool acKick = false;
+	std::string acKickReason;
+	// Now()-based deadline for "protected clients only"; 0 = not enforced
+	double acDeadline = 0.0;
 	int violations = 0;
 	int teleportBurst = 0;            // client-flagged teleports in the current window
 	double teleportWindowStart = 0.0;
@@ -162,7 +172,22 @@ private:
 	void HandleVehExit(ServerPlayer* p, rnet::BitReader& r);
 	void ClearPlayerVehicles(ServerPlayer* p, bool broadcast); // drop all seats held by p
 	void HandleRcon(ServerPlayer* p, rnet::BitReader& r, bool auth);
+	void HandleAcHello(ServerPlayer* p, rnet::BitReader& r);
+	void HandleAcPayload(ServerPlayer* p, rnet::BitReader& r);
 	void LoadVehicleSpawns(const std::string& path); // vehicles.cfg -> permanent vehicles
+
+	// --- EOS Anti-Cheat bridge ---------------------------------------------
+	// (EOS calls these from inside EOS_Platform_Tick, i.e. on the server thread)
+	void InitAntiCheat();
+	void PumpAntiCheat();
+	// true when the protected-clients-only policy is actually in force
+	bool AcEnforced() const;
+	void DropAcDeadlines();
+	void OnAcMessageToClient(void* handle, const void* data, uint32_t len);
+	void OnAcActionRequired(void* handle, int action, const char* reason);
+	void OnAcRegisterResult(void* handle, int status, const std::string& detail);
+	ServerPlayer* PlayerForHandle(void* handle);
+	void SendAcStatus(ServerPlayer* p, uint8_t status, const std::string& detail);
 
 	// helpers
 	void SendTo(ENetPeer* peer, const rnet::BitWriter& w, uint8_t channel, bool reliable);
@@ -185,6 +210,10 @@ private:
 	std::vector<uint32_t> m_bannedIps;
 
 	GameMode* m_gamemode = nullptr;
+	ac::Server m_ac;
+	int m_acRegistered = 0;      // clients that completed registration
+	int m_acRejected = 0;        // EOS_AntiCheatServer_RegisterClient refusals
+	bool m_acSuspend = false;    // enforcement off: EOS refuses this server's registrations
 	ProfileStore m_profiles;
 	ResourceManager m_resources;
 	double m_lastProfileFlush = -100.0;

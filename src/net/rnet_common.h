@@ -98,6 +98,14 @@ enum MsgType : uint8_t {
 	MSG_RES_LIST        = 45, // mod/resource inventory for the admin panel
 	MSG_VOICE           = 46, // proximity voice frame (client->server: [u8 unused][u8 len][len x Opus]; server->client: [u8 fromId][u8 len][len x Opus])
 	MSG_PLAYER_PING     = 47, // server->client ~1 Hz: top players with ping/score (scoreboard + player list)
+	// EOS Anti-Cheat relay (see MsgAcHello/MsgAcPayload). Additive and
+	// negotiated: a client that never sends MSG_AC_HELLO is simply not
+	// registered and the server relays nothing to it, so old builds keep
+	// joining the same server without a protocol bump.
+	MSG_AC_HELLO        = 60, // client -> server: register this peer with EOS AC (PUID + id token + platform)
+	MSG_AC_TO_CLIENT    = 61, // server -> client: opaque EOS_AntiCheatServer payload
+	MSG_AC_FROM_CLIENT  = 62, // client -> server: opaque EOS_AntiCheatClient payload
+	MSG_AC_STATUS       = 63, // server -> client: registration result
 	// admin
 	MSG_RCON_AUTH       = 50,
 	MSG_RCON_OK         = 51,
@@ -281,6 +289,7 @@ enum JoinRefused : uint8_t {
 	REFUSE_NAME     = 4, // name rejected
 	REFUSE_AUTH     = 5, // name is claimed and the password was wrong/missing
 	REFUSE_PASSWORD = 6, // password rejected (e.g. too short to claim)
+	REFUSE_ANTICHEAT = 7, // this server requires a protected (EOS AC) client
 };
 
 struct MsgKick {
@@ -397,6 +406,60 @@ struct MsgGamemodeEvent {
 	uint8_t  arg2 = 0;   // victim …
 	uint16_t len = 0;
 	char     text[MAX_CHAT_LEN] = {};
+};
+
+// ---------------------------------------------------------------------------
+// EOS Anti-Cheat relay (MSG_AC_*)
+//
+// The game server owns a live EOS_AntiCheatServer session. Clients that have a
+// local EOS_AntiCheatClient session register here with their ProductUserId and
+// a Connect ID token; the server verifies the token, calls
+// EOS_AntiCheatServer_RegisterClient with the peer as the opaque client handle
+// and then relays kernel-driver traffic verbatim in both directions:
+//
+//   EOS_AntiCheatClient_OnMessageToServer   -> MSG_AC_FROM_CLIENT -> ReceiveMessageFromClient
+//   EOS_AntiCheatServer OnMessageToClient    -> MSG_AC_TO_CLIENT   -> ReceiveMessageFromServer
+//
+// Payloads are opaque to reLCS: never parsed, only bounded.
+constexpr int AC_PUID_LEN    = 40;   // EOS ProductUserId string (32 hex chars) + slack
+constexpr int AC_TOKEN_LEN   = 512;  // Connect ID token JWT
+constexpr int MAX_AC_PAYLOAD = 1200; // one EOS AC message; larger ones are dropped
+
+// EOS_EAntiCheatCommonClientPlatform, narrowed to what a reLCS client can be.
+enum AcPlatform : uint8_t {
+	AC_PLATFORM_UNKNOWN = 0,
+	AC_PLATFORM_WINDOWS = 1,
+	AC_PLATFORM_MAC     = 2,
+	AC_PLATFORM_LINUX   = 3,
+};
+
+// MSG_AC_STATUS result codes.
+enum AcRegisterResult : uint8_t {
+	AC_REG_OK           = 0, // registered: AC traffic may flow
+	AC_REG_DISABLED     = 1, // this server runs no AC session (eac=0 / SDK missing)
+	AC_REG_BAD_PLATFORM = 2, // platform byte not understood
+	AC_REG_BAD_PUID     = 3, // ProductUserId string could not be parsed
+	AC_REG_BAD_TOKEN    = 4, // Connect ID token missing or failed verification
+	AC_REG_REJECTED     = 5, // EOS_AntiCheatServer_RegisterClient refused
+	AC_REG_ALREADY      = 6, // already registered on this peer
+};
+
+struct MsgAcHello {
+	uint8_t  platform = AC_PLATFORM_UNKNOWN;
+	char     productUserId[AC_PUID_LEN] = {};
+	char     idToken[AC_TOKEN_LEN] = {};
+};
+
+struct MsgAcStatus {
+	uint8_t  status = AC_REG_DISABLED;
+	uint8_t  registered = 0;             // 1 = the server's AC session holds this peer
+	char     detail[MAX_REASON_LEN] = {};
+};
+
+// One opaque EOS AC message in either direction.
+struct MsgAcPayload {
+	uint16_t len = 0;
+	uint8_t  data[MAX_AC_PAYLOAD] = {};
 };
 
 // ---------------------------------------------------------------------------

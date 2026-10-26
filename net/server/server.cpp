@@ -93,6 +93,9 @@ bool Server::Init(const ServerConfig& cfg)
 	// a parked showcase car) instead of only existing while somebody drives it
 	LoadVehicleSpawns(m_cfg.vehiclesFile);
 
+	// EOS Anti-Cheat: a failure here never stops the server — state() says why
+	InitAntiCheat();
+
 	Log("reLCS server '%s' listening on UDP %u | mode=%s | maxplayers=%d",
 	    m_cfg.hostname.c_str(), (unsigned)m_cfg.port, m_gamemode->Name(), m_cfg.maxPlayers);
 	return true;
@@ -148,6 +151,7 @@ void Server::Run()
 		Sleep(1);
 
 	}
+	m_ac.Stop();
 	FlushProfiles();
 	Log("server shutting down");
 }
@@ -279,6 +283,9 @@ void Server::OnDisconnect(ENetPeer* peer)
 	ServerPlayer* p = (ServerPlayer*)peer->data;
 	if(!p) return;
 
+	// drop the EOS anti-cheat slot before the peer pointer becomes stale
+	m_ac.UnregisterClient(peer);
+
 	// leave any vehicle (broadcasts MSG_VEH_EXIT so clients unseat the puppet)
 	ClearPlayerVehicles(p, true);
 
@@ -336,6 +343,8 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 	case MSG_APPEARANCE:  if(p) HandleAppearance(p, r); break;
 	case MSG_RCON_AUTH:   if(p) HandleRcon(p, r, true); break;
 	case MSG_RCON_CMD:    if(p) HandleRcon(p, r, false); break;
+	case MSG_AC_HELLO:    if(p) HandleAcHello(p, r); break;
+	case MSG_AC_FROM_CLIENT: if(p) HandleAcPayload(p, r); break;
 	case MSG_PING: {
 		if(!p) break;
 		uint32_t stamp = r.ReadU32();
@@ -372,6 +381,17 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			SendRefusal(peer, REFUSE_BANNED, "banned");
 			return;
 		}
+	}
+
+	// Protected clients only: in strict mode a server whose own AC session is
+	// not running has nothing that could verify a client, so every join would
+	// become an unprotected one. Refuse it up front instead of letting players
+	// in and kicking them a grace period later.
+	if(m_cfg.ac.requireProtected && !m_cfg.ac.failOpen && !m_ac.Ready()){
+		Log("[EAC] refused %s: anti-cheat required but the session is %s",
+		    hello.name, m_ac.StatusLine().c_str());
+		SendRefusal(peer, REFUSE_ANTICHEAT, "this server requires EOS anti-cheat");
+		return;
 	}
 
 	// latency probe: answer and allocate nothing
@@ -514,6 +534,14 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 
 	// let the admin panel see the mod/resource inventory
 	SendResList(peer);
+
+	// start the registration clock: the client opens its AC session and sends
+	// MSG_AC_HELLO on its own; a peer that never does is removed in Tick
+	if(AcEnforced()){
+		np.acDeadline = Now() + (double)m_cfg.ac.graceSeconds;
+		Log("[EAC] %s has %us to prove it is protected", np.name.c_str(),
+		    (unsigned)m_cfg.ac.graceSeconds);
+	}
 
 	// restore the persisted profile NOW (hello-time): it is queued on the
 	// reliable channel before the client can possibly report its inventory,
@@ -1211,10 +1239,199 @@ void Server::HandleRcon(ServerPlayer* p, BitReader& r, bool auth)
 }
 
 // ---------------------------------------------------------------------------
+// EOS Anti-Cheat bridge
+// ---------------------------------------------------------------------------
+static const char* AcResultText(int rc)
+{
+	switch(rc){
+	case AC_REG_OK:           return "registered";
+	case AC_REG_DISABLED:     return "no anti-cheat session on this server";
+	case AC_REG_BAD_PLATFORM: return "unknown client platform";
+	case AC_REG_BAD_PUID:     return "bad ProductUserId";
+	case AC_REG_BAD_TOKEN:    return "missing or invalid Connect ID token";
+	case AC_REG_REJECTED:     return "EOS refused the registration";
+	case AC_REG_ALREADY:      return "already registered";
+	}
+	return "unknown";
+}
+
+bool Server::AcEnforced() const
+{
+	return m_cfg.ac.requireProtected && m_ac.Ready() && !m_acSuspend;
+}
+
+void Server::DropAcDeadlines()
+{
+	for(int i = 0; i < MAX_PLAYERS; i++) m_players[i].acDeadline = 0.0;
+}
+
+void Server::InitAntiCheat()
+{
+	m_acRegistered = m_acRejected = 0;
+	m_acSuspend = false;
+	m_ac.SetLog([this](const std::string& line){ Log("%s", line.c_str()); });
+	m_ac.SetCallbacks(
+	    [this](void* handle, const void* data, uint32_t len){ OnAcMessageToClient(handle, data, len); },
+	    [this](void* handle, int action, const char* reason){ OnAcActionRequired(handle, action, reason); },
+	    [this](void* handle){ return PlayerForHandle(handle) != nullptr; },
+	    [this](void* handle, int status, const std::string& detail){ OnAcRegisterResult(handle, status, detail); });
+
+	bool up = m_ac.Start(m_cfg.ac);
+	Log("[EAC] %s — %s", up ? "session live" : "inactive", m_ac.StatusLine().c_str());
+}
+
+ServerPlayer* Server::PlayerForHandle(void* handle)
+{
+	if(!handle) return nullptr;
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(p.active && p.peer == handle) return &p;
+	}
+	return nullptr;
+}
+
+void Server::SendAcStatus(ServerPlayer* p, uint8_t status, const std::string& detail)
+{
+	if(!p || !p->peer) return;
+	if(status == AC_REG_OK) p->acDeadline = 0.0;   // protected: stop the clock
+	MsgAcStatus st;
+	st.status = status;
+	st.registered = (status == AC_REG_OK) ? 1 : 0;
+	CopyStr(st.detail, sizeof st.detail, detail.c_str());
+	BitWriter w;
+	BeginMsg(w, MSG_AC_STATUS);
+	WriteAcStatus(w, st);
+	SendTo(p->peer, w, CHAN_RELIABLE, true);
+	p->acState = st.registered ? 2 : 0;
+}
+
+void Server::OnAcMessageToClient(void* handle, const void* data, uint32_t len)
+{
+	ServerPlayer* p = PlayerForHandle(handle);
+	if(!p || !p->peer){
+		// the peer left between RegisterClient and the first message
+		m_ac.UnregisterClient(handle);
+		return;
+	}
+	if(!data || len == 0 || len > (uint32_t)MAX_AC_PAYLOAD) return;
+
+	MsgAcPayload m;
+	m.len = (uint16_t)len;
+	memcpy(m.data, data, len);
+	BitWriter w;
+	BeginMsg(w, MSG_AC_TO_CLIENT);
+	if(!WriteAcPayload(w, m)) return;
+	SendTo(p->peer, w, CHAN_RELIABLE, true);
+}
+
+void Server::OnAcActionRequired(void* handle, int action, const char* reason)
+{
+	ServerPlayer* p = PlayerForHandle(handle);
+	if(!p) return;
+	const char* why = (reason && *reason) ? reason : "EOS anti-cheat removed this client";
+
+	if(!m_cfg.ac.kickOnViolation){
+		Log("[EAC] %s flagged (action=%d): %s [kicks disabled]", p->name.c_str(), action, why);
+		SendChatTo(p->id, "[EAC] anti-cheat flagged this client");
+		return;
+	}
+	// deferred: Tick applies it after EOS_Platform_Tick has returned
+	p->acKick = true;
+	p->acKickReason = std::string("EOS anti-cheat: ") + why;
+}
+
+void Server::OnAcRegisterResult(void* handle, int status, const std::string& detail)
+{
+	ServerPlayer* p = PlayerForHandle(handle);
+	if(!p) return;
+	SendAcStatus(p, (uint8_t)status, detail.empty() ? AcResultText(status) : detail);
+	if(status == AC_REG_OK){
+		m_acRegistered++;
+		Log("[EAC] %s registered (%d client(s) in the session)", p->name.c_str(), m_ac.ClientCount());
+		return;
+	}
+	Log("[EAC] %s not registered: %s", p->name.c_str(), AcResultText(status));
+
+	// EOS refusing RegisterClient is a *server* integration problem (usually the
+	// dev-portal client is missing the anti-cheat permissions), not a cheat: if
+	// nobody at all can register, enforcement would empty the server. Suspend the
+	// policy loudly instead, and let `ac restart` re-arm it after the fix.
+	if(status == AC_REG_REJECTED && ++m_acRejected >= 2 && m_acRegistered == 0 && !m_acSuspend){
+		m_acSuspend = true;
+		DropAcDeadlines();
+		Log("[EAC] EOS refused every registration — server-side anti-cheat config is incomplete");
+		Log("[EAC] protected-clients-only enforcement SUSPENDED (fix the client permissions, then `ac restart`)");
+	}
+}
+
+void Server::HandleAcHello(ServerPlayer* p, BitReader& r)
+{
+	MsgAcHello hello;
+	if(!ReadAcHello(r, hello)) return;
+
+	if(!m_ac.Ready()){
+		SendAcStatus(p, AC_REG_DISABLED, m_ac.detail().empty() ? "no anti-cheat session" : m_ac.detail());
+		return;
+	}
+
+	char ipstr[32] = {};
+	ENetAddress a; a.host = p->ip; a.port = p->port;
+	enet_address_get_host_ip(&a, ipstr, sizeof ipstr);
+
+	int rc = m_ac.RegisterClient(p->peer, hello.productUserId, hello.idToken, hello.platform, ipstr);
+	if(rc == AC_REG_OK){
+		// verification is async: MSG_AC_STATUS follows from OnAcRegisterResult
+		p->acState = 1;
+		Log("[EAC] %s (%s, %s) requested registration — verifying Connect ID token",
+		    p->name.c_str(), ac::PlatformName(hello.platform), ipstr);
+		return;
+	}
+	SendAcStatus(p, (uint8_t)rc, AcResultText(rc));
+}
+
+void Server::HandleAcPayload(ServerPlayer* p, BitReader& r)
+{
+	MsgAcPayload m;
+	if(!ReadAcPayload(r, m)){
+		Log("[EAC] %s sent a malformed AC payload (dropped)", p->name.c_str());
+		return;
+	}
+	if(!m_ac.IsRegistered(p->peer)) return;   // unregistered peers cannot feed the session
+	m_ac.ReceiveFromClient(p->peer, m.data, m.len);
+}
+
+// ---------------------------------------------------------------------------
 void Server::Tick()
 {
 	float dt = (float)(1.0 / std::max(1, m_cfg.tickRate));
 	double t = Now();
+
+	// EOS work (ID-token callbacks, session heartbeat) runs before anything
+	// that can kick, so a removal decided inside a callback is applied below.
+	if(m_ac.TickDue(t)) m_ac.Tick(t);
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active || !p.acKick) continue;
+		p.acKick = false;
+		std::string why = p.acKickReason.empty() ? std::string("anti-cheat") : p.acKickReason;
+		p.acKickReason.clear();
+		Log("[EAC] removing %s: %s", p.name.c_str(), why.c_str());
+		KickPlayer(p.id, why.c_str());
+	}
+
+	// protected clients only: a peer that never opened an AC session is removed
+	if(AcEnforced()){
+		for(int i = 0; i < MAX_PLAYERS; i++){
+			ServerPlayer& p = m_players[i];
+			if(!p.active || p.acDeadline <= 0.0) continue;
+			if(p.acState == 2){ p.acDeadline = 0.0; continue; }
+			if(t < p.acDeadline) continue;
+			p.acDeadline = 0.0;
+			Log("[EAC] removing %s: no anti-cheat session after %us", p.name.c_str(),
+			    (unsigned)m_cfg.ac.graceSeconds);
+			KickPlayer(p.id, "EOS anti-cheat required — this client is not protected");
+		}
+	}
 
 	// respawns
 	for(int i = 0; i < MAX_PLAYERS; i++){
@@ -1701,6 +1918,11 @@ void Server::BroadcastPlayerPing()
 
 void Server::KickPlayer(uint8_t playerId, const char* reason)
 {
+	// keep the EOS session in step with the reLCS roster
+	if(ServerPlayer* kp = FindPlayer(playerId)){
+		m_ac.UnregisterClient(kp->peer);
+		kp->acState = 0;
+	}
 	ServerPlayer* p = FindPlayer(playerId);
 	if(!p) return;
 
@@ -1744,6 +1966,7 @@ void Server::SetServerVar(const std::string& key, const std::string& value)
 	else if(key == "weather") m_cfg.weather = (uint8_t)atoi(value.c_str());
 	else if(key == "hour") m_cfg.hour = (uint8_t)atoi(value.c_str());
 	else if(key == "minute") m_cfg.minute = (uint8_t)atoi(value.c_str());
+	else if(key == "ac_kick") m_cfg.ac.kickOnViolation = (atoi(value.c_str()) != 0);
 	else if(key == "lcs_scorelimit" && m_gamemode){
 		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->scoreLimit = atoi(value.c_str());
@@ -1788,14 +2011,62 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 	};
 
 	if(cmd == "help"){
-		respond("commands: help status players say kick ban banip unban setr getr settime setweather res gmx loadmode respawn teleport spawncar delcar cars exec uptime version netstats quit");
+		respond("commands: help status players say kick ban banip unban setr getr settime setweather res ac gmx loadmode respawn teleport spawncar delcar cars exec uptime version netstats quit");
 		respond("res: list info enable disable reload run install uninstall log");
+		respond("ac: status list kick <id> restart");
 		return true;
 	}
 	if(cmd == "status"){
 		respond("hostname=%s players=%d/%d mode=%s map=%s uptime=%.0fs tick=%d",
 		        m_cfg.hostname.c_str(), ActivePlayerCount(), m_cfg.maxPlayers,
 		        m_gamemode ? m_gamemode->Name() : "?", m_cfg.mapName.c_str(), Now(), m_cfg.tickRate);
+		respond("%s", m_ac.StatusLine().c_str());
+		return true;
+	}
+	if(cmd == "ac"){
+		// EOS Anti-Cheat administration
+		char sub[24] = {};
+		int id = 0;
+		int n = sscanf(rest.c_str(), "%23s %d", sub, &id);
+		std::string s = (n >= 1) ? std::string(sub) : std::string("status");
+
+		if(s == "status"){
+			respond("%s", m_ac.StatusLine().c_str());
+			respond("ac: require=%d enforced=%d grace=%us failOpen=%d registered=%d rejected=%d%s",
+			        m_cfg.ac.requireProtected ? 1 : 0, AcEnforced() ? 1 : 0,
+			        (unsigned)m_cfg.ac.graceSeconds, m_cfg.ac.failOpen ? 1 : 0,
+			        m_acRegistered, m_acRejected,
+			        m_acSuspend ? " SUSPENDED(server-side config)" : "");
+			respond("ac: serverName=\"%s\" product=%s registerTimeout=%us requireToken=%d kick=%d",
+			        m_ac.config().serverName.c_str(), m_ac.config().productId.c_str(),
+			        (unsigned)m_ac.config().registerTimeout, m_ac.config().requireToken ? 1 : 0,
+			        m_ac.config().kickOnViolation ? 1 : 0);
+			return true;
+		}
+		if(s == "list"){
+			auto clients = m_ac.Clients();
+			respond("ac: %d registered, %d tracked", m_ac.ClientCount(), (int)clients.size());
+			for(const auto& c : clients){
+				ServerPlayer* pl = PlayerForHandle(c.handle);
+				respond("  %s %s %s %s%s", c.productUserId.c_str(), ac::PlatformName(c.platform),
+				        c.ip.c_str(), pl ? pl->name.c_str() : "<gone>",
+				        c.registered ? "" : " (pending)");
+			}
+			return true;
+		}
+		if(s == "kick"){
+			ServerPlayer* pl = FindPlayer((uint8_t)id);
+			if(!pl){ respond("ac: no such player"); return true; }
+			KickPlayer(pl->id, "anti-cheat: removed by admin");
+			respond("ac: kicked #%d", id);
+			return true;
+		}
+		if(s == "restart"){
+			InitAntiCheat();
+			respond("ac: %s", m_ac.StatusLine().c_str());
+			return true;
+		}
+		respond("usage: ac status|list|kick <id>|restart");
 		return true;
 	}
 	if(cmd == "players"){

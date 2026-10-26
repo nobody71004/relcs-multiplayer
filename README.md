@@ -47,7 +47,7 @@
 | **Max slots** | 32 per instance by default, 5 instances on the public host = 160 |
 | **Persistence** | SQLite: `profiles.db` (wallet, weapons, stats, appearance, position) + `master.db` (favorites) |
 | **Identity** | Nickname + optional password claim, PBKDF2-HMAC-SHA256, per-account salt |
-| **Anti-cheat** | Client: Easy Anti-Cheat protected launch · Server: independent movement/state validator |
+| **Anti-cheat** | Client: Easy Anti-Cheat protected launch · Server: movement/state validator + live `EOS_AntiCheatServer` session with AC relay |
 | **Client platform** | Windows x64 (D3D9 + OpenAL, CEF UI) |
 | **Server platform** | Windows x64 and Linux x64 (no game assets required) |
 | **Launcher** | Native CEF/Chromium GUI (`reLCS-launcher.exe`, ~2.9 MB release zip) |
@@ -185,7 +185,7 @@ sequenceDiagram
 | Extensibility | Resource packs, `@on` hooks, command whitelist | ✅ shipping |
 | Anti-cheat | EAC protected launch + per-folder integrity catalogue | ✅ shipping |
 | Anti-cheat | Server-side movement/state validator | ✅ shipping |
-| Anti-cheat | EOS server anti-cheat session + message relay | 🚧 planned (§16) |
+| Anti-cheat | EOS **server** session + message relay (`EOS_AntiCheatServer_*`) | ✅ shipping (§11) |
 | Tooling | Scenario bots, net-shaper, HTTP agent bridge | ✅ shipping |
 | Platform | IPv6 | 🚧 not supported |
 
@@ -207,6 +207,12 @@ sequenceDiagram
 - Rejection of insane state, packet floods, chat spam, money edits and malformed payloads.
 - RCON-authenticated admins are exempt, because noclip legitimately exceeds the budgets.
 - Structured logging: `[anticheat] <name> …` lines land in the server log for review.
+- **EOS Anti-Cheat server session** (`EOS_AntiCheatServer_BeginSession`): peers register with
+  a verified EOS Connect ID token, then the kernel-driver traffic is relayed verbatim in both
+  directions (`MSG_AC_FROM_CLIENT`/`MSG_AC_TO_CLIENT`) so EOS can act on a live client.
+- Runtime-loaded SDK: a host without `libEOSSDK`/`EOSSDK-Win64-Shipping.dll` still serves
+  players; `status` reports `state=sdk-missing` instead of the process failing to start.
+- Admin surface: `ac status`, `ac list`, `ac kick <id>`, `ac restart` (console + RCON).
 </details>
 
 <details open>
@@ -474,6 +480,17 @@ far, including the non-exclusive DirectInput mouse level the multiplayer UI reli
 | `profiles` | `profiles.db` | SQLite path; empty disables |
 | `resources` | `resources` | resource-pack directory; empty disables |
 | `vehicles` | `vehicles.cfg` | static spawn list; empty disables |
+| `eac` | `1` | EOS Anti-Cheat session (see §11); `0` disables it |
+| `eac_server_name` | EAC `title` (`reLCS`) | name shown in the EOS AC dashboard |
+| `eac_product_id`, `eac_sandbox_id`, `eac_deployment_id` | from `EasyAntiCheat/Settings.json`, else the shipped ids | override the product data |
+| `eac_client_id`, `eac_client_secret` | from `eos.ini` | only needed when no `eos.ini` is next to the server |
+| `eac_ini`, `eac_settings` | searched | explicit `eos.ini` / EAC `Settings.json` paths |
+| `eac_sdk_dir` | *(empty)* | extra directory to search for the SDK library (`RELCS_EOSSDK` also works) |
+| `eac_cache_dir` | `eos-cache` | EOS cache directory (made absolute) |
+| `eac_register_timeout` | `60` | seconds a peer gets to finish AC authentication |
+| `eac_require_token` | `1` | require a verified Connect ID token before registering a peer |
+| `eac_kick` | `1` | `0` = log/flag EOS removals but do not kick |
+| `eac_gameplay_data` | `0` | `LogPlayerTick` & friends (unused, costs memory) |
 
 Map name defaults to `Liberty City` and is shown in the launcher's server tooltip.
 
@@ -509,6 +526,7 @@ The server console and in-band RCON share one dispatcher; `help` prints the full
 | Communication | `say <text>` | broadcast a `[SERVER]` chat line |
 | | `broadcast <text>` | on-screen banner for every client |
 | Resources | `res` (alias `resources`) | `res list\|info\|enable\|disable\|reload\|run\|install\|uninstall\|log` |
+| Anti-cheat | `ac` | `ac status` (session state + config), `ac list` (registered clients), `ac kick <id>`, `ac restart` |
 | Process | `exec <file>` | run a command file |
 | | `quit`, `exit` | shut the server down |
 
@@ -576,6 +594,7 @@ Scripts run ordinary server commands; `%id%`, `%name%` and `%args%` are expanded
 | **Profile** | `INVENTORY` 34, `APPEARANCE` 35 (ped model + 8 component slots, both directions) |
 | **World** | `WORLD` 40, `SCORE_UPDATE` 41, `GAMEMODE_EVENT` 42, `PICKUP_SPAWN` 43, `PICKUP_COLLECT` 44, `RES_LIST` 45, `VOICE` 46, `PLAYER_PING` 47 |
 | **Admin** | `RCON_AUTH` 50, `RCON_OK` 51, `RCON_CMD` 52, `RCON_RESP` 53 |
+| **Anti-cheat** | `AC_HELLO` 60 (PUID + Connect ID token + platform), `AC_TO_CLIENT` 61, `AC_FROM_CLIENT` 62 (opaque EOS payload, ≤ 1200 B), `AC_STATUS` 63 |
 | **Master** | `MASTER_ANNOUNCE` 80, `MASTER_LIST_REQ` 81, `MASTER_LIST_RESP` 82, `MASTER_FAV_LIST` 83, `MASTER_FAV_ADD` 84, `MASTER_FAV_DEL` 85, `MASTER_FAV_RESP` 86 |
 
 ### 9.3 Join refusals
@@ -646,18 +665,34 @@ connect), ping/probe, favorites, settings, EOS status, and the join flow that ha
 | `-join <ip:port>` | join a server immediately |
 | `-nick <name>` | nickname for this session |
 | `-master <host[:port]>` | master to query and save |
-| `-game <path>` | game executable (skip auto-detection) |
+| `-game <path>` | game folder **or** executable (skip auto-detection) |
 | `-query "<op>"` | run one raw UI operation and print the reply |
 | `-selftest` | headless self-checks (master + LAN queries) |
 | `-eostest` | run the EOS bootstrap and report each step |
 | `-eacinstall` | install/repair the Easy Anti-Cheat service (needs admin) |
 | `-eacintegrity` | sign the integrity catalogue for the game folder |
 
+**Finding the install.** Settings accepts a folder or an executable, typed or picked with
+**Browse…** (native folder dialog), and validates it before saving: a path that does not
+exist, holds no `reLCS.exe`, or is missing game data is rejected with that exact reason and
+the previous setting is left alone. A configured folder always wins over auto-detection.
+
+With nothing configured the order is: registry hints and uninstall entries → common install
+folders (`Program Files`, `%LOCALAPPDATA%`, the profile's Downloads/Desktop/Documents,
+`C:\Games`) → next to the launcher and the dev tree → **every fixed and removable drive**.
+The drive pass checks each root, the `Users\<name>\{Downloads,Desktop,Documents,Games}`
+folders, the usual game libraries (`Games`, `SteamLibrary\steamapps\common`, `Epic Games`,
+`GOG Games`, `XboxGames`) and then a bounded walk up to four levels deep, skipping
+`Windows`, `ProgramData`, `AppData`, `$Recycle.Bin`, `node_modules` and similar. Re-scan and
+Join use a thorough pass (60k directories / 3.5 s), the background checks a quick one
+(8k / 0.4 s). Measured here: 15 817 directories in 859 ms, and it found a probe install at
+`C:\zz-scan\a\b\reLCS` that no fixed path lists.
+
 ### 10.2 Files next to the launcher
 
 | File | Purpose |
 |---|---|
-| `launcher.ini` | game path, nickname, master, RCON password (kept across upgrades; an empty `rcon` falls back to the fleet default) |
+| `launcher.ini` | game **folder**, nickname, master, RCON password (kept across upgrades; an empty `rcon` falls back to the fleet default; an old executable path is migrated to its folder on load) |
 | `eos.ini` | EOS product client id/secret (`eos.ini.example`) |
 | `eac/` | EAC payload: `runtime/`, `reLCS.exe.eac`, `integrity.cfg`, public certificate |
 | `favorites.ini` | local cache only — the master owns the real list |
@@ -687,11 +722,85 @@ flowchart TD
 - **The signing key is never shipped.** Release zips carry the runtime, the `.eac` CDN
   config, `integrity.cfg` and the *public* certificate only.
 - **EOS login is a separate concern.** The launcher bootstraps the SDK and signs in via
-  Connect; every step is shown in the UI and appended to `eos-bootstrap.log`. EOS 1.19
-  refuses platform creation without a client credential pair.
-- **Server-side EOS anti-cheat** (`EOS_AntiCheatServer_BeginSession` + message relay) is not
-  wired into `net/server` yet — see §16. The servers currently rely on the reLCS validator,
-  which is independent of EAC.
+  Connect; every step is shown in the UI and appended to `eos-bootstrap.log`. A dedicated
+  server creates its platform with `bIsServer` and the same product/sandbox/deployment ids.
+
+**Two different integrations, often confused**
+
+| Model | What runs where | What it proves | Status here |
+|---|---|---|---|
+| **EAC bootstrapper** | `start_protected_game.exe` + the `EasyAntiCheat_EOS` service verify the game folder against the signed catalogue, then start `reLCS.exe` | the *local files* are the ones you signed; nothing is injected before start | ✅ shipping (client) |
+| **EOS Anti-Cheat session** (`EOS_AntiCheatClient` ↔ `EOS_AntiCheatServer`) | the game opens a local AC client session; the server opens a matching session and relays the driver traffic as opaque blobs | a *live* client is still intact mid-session, and the server receives verdicts it can act on | ✅ server + client |
+
+**Server side — implemented** ([`net/server/anticheat.cpp`](net/server/anticheat.cpp))
+
+| Stage | What happens |
+|---|---|
+| Boot | `EOS_Initialize` → `EOS_Platform_Create(bIsServer)` → `GetAntiCheatServerInterface` → `AddNotify{MessageToClient,ClientActionRequired,ClientAuthStatusChanged}` → `BeginSession` |
+| Register | client sends `MSG_AC_HELLO` (ProductUserId + Connect ID token + platform) → `EOS_Connect_VerifyIdToken` → `EOS_AntiCheatServer_RegisterClient` with the reLCS peer as the opaque handle; a PUID that does not match the verified token is refused |
+| Relay | `MSG_AC_FROM_CLIENT` → `ReceiveMessageFromClient`; `OnMessageToClient` → `MSG_AC_TO_CLIENT` (1200-byte cap, unregistered peers ignored) |
+| Verdict | `OnClientActionRequired` marks the peer; the kick is applied from `Tick` after `EOS_Platform_Tick` returns, never re-entering the SDK; `ac_kick=0` downgrades it to a flag + chat line |
+| Teardown | unregister on kick/disconnect, `EndSession` + `Platform_Release` on shutdown |
+
+- The SDK is bound with `LoadLibrary`/`dlopen`, not linked: a host without
+  `EOSSDK-Win64-Shipping.dll` / `libEOSSDK-Linux-Shipping.so` still boots and reports
+  `state=sdk-missing`; missing credentials report `state=not-configured`.
+- Nothing is negotiated at HELLO: message ids 60–63 are additive, so a stock client keeps
+  joining and simply never registers (and `PROTOCOL_VERSION` stays at 7).
+- **One dev-portal action is still required.** `BeginSession` only creates the *local*
+  session; the backend then authenticates it, and the current EOS client credential is
+  refused with `403 policy_missing_action` — it is missing
+  `anticheat:authenticateForAnyUser` and `anticheat:authenticateForLocalUser`. `ac status`
+  shows this as `lastError="…ServiceName=[AntiCheat]…policy_missing_action…"`. Grant the
+  anti-cheat permissions to the client in the EOS portal and the session authenticates.
+
+| Verified | Result |
+|---|---|
+| Windows build + `net-tests` (AC codecs, PUID, ini/JSON readers) | builds, 3432 checks green |
+| Windows server, real product ids | `[EAC] anti-cheat session started`, `state=running` |
+| Linux build (g++ 15) + `libEOSSDK-Linux-Shipping.so` | `state=running` with real ids |
+| Host without the SDK | `state=sdk-missing`, server keeps serving |
+| Bot joins a server with the session live | `[JOIN]`, spawn, RCON `ac list` all work |
+| Backend auth | ⚠️ 403 `policy_missing_action` until the client is granted the anticheat permissions |
+
+**Client side — implemented** ([`src/net/acclient.cpp`](src/net/acclient.cpp))
+
+| Piece | What happens |
+|---|---|
+| SDK | `EOSSDK-Win64-Shipping.dll` is bound at runtime (`LoadLibrary` + `GetProcAddress`), never linked: a game folder without it still starts, it just plays unprotected and is refused by a server that requires protection |
+| Login | the game does its own Connect device-id login (cache in `eos-ac-cache/`) to get a ProductUserId; `eos.ini` supplies the client credentials, and the launcher copies that file next to the game with the SDK |
+| Session | `GetAntiCheatClientInterface` → `AddNotifyMessageToServer` + `AddNotifyClientIntegrityViolated` → `BeginSession(ClientServer, LocalUserId)` |
+| Register | after the server's `WELCOME`, `MSG_AC_HELLO` carries the PUID, a **fresh** ID token and the platform; a refusal is retried up to five times inside the server's grace window |
+| Relay | `OnMessageToServer` → `MSG_AC_FROM_CLIENT`; `MSG_AC_TO_CLIENT` → `ReceiveMessageFromServer` (opaque both ways, 1200-byte cap) |
+| Diagnostics | `eos-ac.log` next to the game logs every step; a local integrity violation is shown to the player and reported by EOS to the server |
+
+- The whole session is driven from `NetClient::Pump`, so there is no extra wiring in the
+game loop, and it keeps ticking between servers.
+- Failure is graceful and explained: `state=sdk-missing` (no SDK), `init-failed` (SDK too
+old), `failed` (`BeginSession` refused — usually the EasyAntiCheat service is not running).
+
+**Only protected clients are allowed** (`ac_require`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ac_require` | `1` | remove a peer that has not registered an AC session inside the grace window |
+| `ac_grace` | `30` | seconds a joining player gets to register (clamped to 5–600) |
+| `ac_failopen` | `1` | if this server's own session cannot run, stay playable instead of refusing every join |
+
+- `ac_failopen=0` is the strict deployment: with no live session the server refuses joins
+  up front (`REFUSE_ANTICHEAT`) instead of letting people in and kicking them later.
+- Enforcement is suspended with a loud log and `ac status` says
+  `SUSPENDED(server-side config)` when EOS refuses *every* registration (the 403 below):
+  that is a server misconfiguration, not a cheat, and emptying the server would hide it.
+  `ac restart` re-arms it after the portal fix.
+
+| Verified end to end | Result |
+|---|---|
+| `reLCS.exe` builds with the module (MSVC x64 Release) | builds, links, no EOS import in the PE |
+| Server with a live session, `ac_require=1`, `ac_grace=5`, bot joins | `[EAC] has 5s to prove it is protected` → `removing BotA: no anti-cheat session after 5s`, bot reads `EOS anti-cheat required — this client is not protected` |
+| Same, `ac_failopen=0`, session not running | join refused up front with `this server requires EOS anti-cheat` |
+| Same, `ac_failopen=1`, session not running | player joins, loud `state=not-configured` warning in the log |
+| `ac_require=0` | unchanged behaviour, no deadline |
 
 ---
 
@@ -862,9 +971,28 @@ appearance sync and the character-creator freeze fix.
 
 ## 16. Roadmap & known gaps
 
-- **Server-side EOS anti-cheat** — `EOS_AntiCheatServer_BeginSession`, per-client
-  registration and `OnMessageToServer` relay over the reLCS protocol
-  ([`net/docs/EAC_INTEGRATION_PLAN.md`](net/docs/EAC_INTEGRATION_PLAN.md)).
+- **EOS anti-cheat** — both halves ship (§11):
+
+  | Piece | State |
+  |---|---|
+  | EOS product / sandbox / deployment ids | ✅ `net/eac/runtime/EasyAntiCheat/Settings.json` |
+  | Client credentials | ✅ `eos.ini` (launcher, server and now the game all load it) |
+  | EAC module config + CDN url | ✅ `net/eac/reLCS.exe.eac` |
+  | Windows + Linux SDK | ✅ Windows lib vendored; Linux `.so` ships with the fleet bundle |
+  | `EOS_AntiCheatServer` session + relay + `ac` commands | ✅ `net/server/anticheat.cpp` |
+  | Protocol slots for relayed messages | ✅ `MSG_AC_HELLO`/`TO_CLIENT`/`FROM_CLIENT`/`STATUS` (no version bump) |
+  | `EOS_AntiCheatClient` session inside the game | ✅ `src/net/acclient.cpp` |
+  | SDK + credentials in the game folder | ✅ launcher writes both on join |
+  | Protected-clients-only policy | ✅ `ac_require` / `ac_grace` / `ac_failopen` |
+  | EOS client granted `anticheat:authenticate*` | ❌ dev portal returns `403 policy_missing_action` (visible as `ac status` `lastError`) |
+
+  Remaining work: grant the anti-cheat permissions to the client in the EOS portal — that is
+  the only step EOS still refuses, and until it is done a protected client cannot finish
+  registration. After that, prove with a rig that a *tampered* client is kicked mid-session;
+  that test cannot run before registration succeeds, because the server never gets to verify
+  the client at all.
+- **Linux SDK vendoring** — `build-linux.sh` only needs the headers; the `.so` is deployed,
+  not committed (see [`net/eac/README.md`](net/eac/README.md)).
 - **IPv6** — the stack addresses nodes with 32-bit IPv4 only.
 - **Launcher auto-update** — currently a manual zip replacement.
 - **Resource sandbox** — external packs are command-whitelisted; finer-grained capability
