@@ -998,21 +998,35 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 // ---------------------------------------------------------------------------
 // JS <-> host plumbing (lcs:// scheme)
 // ---------------------------------------------------------------------------
+// JSON string escaping (the value goes between double quotes in a JSON text).
+// A single quote is legal JSON and must NOT be backslash-escaped here: `\'` is
+// not a JSON escape and made JSON.parse reject any value containing one.
 static std::string Jesc(const std::string& s)
 {
 	std::string o;
 	for(char c : s){
-		if(c == '\'' || c == '\\' || c == '"'){ o += '\\'; o += c; }
+		if(c == '\\' || c == '"'){ o += '\\'; o += c; }
 		else if((unsigned char)c < 0x20) continue;
 		else o += c;
 	}
 	return o;
 }
 
+// The JSON text travels inside a single-quoted JavaScript string literal, so it
+// needs a second escaping layer of its own. With one layer the JS literal ate
+// the JSON escapes: a game path reached JSON.parse with bare backslashes (an
+// invalid escape), so the init reply never parsed and the page stayed on
+// "Game: detecting" / "Player —" whenever a game install was found.
 static void Reply(const std::string& json)
 {
-	if(g_exec)
-		g_exec(("window.onCefReply && onCefReply('" + json + "')").c_str());
+	if(!g_exec) return;
+	std::string lit;
+	lit.reserve(json.size() + 16);
+	for(char c : json){
+		if(c == '\\' || c == '\''){ lit += '\\'; lit += c; }
+		else lit += c;
+	}
+	g_exec(("window.onCefReply && onCefReply('" + lit + "')").c_str());
 }
 
 static std::string RowToJson(const ServerRow& r)
@@ -1406,6 +1420,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 	case WM_SIZE:
 		if(g_resize) g_resize(LOWORD(lParam), HIWORD(lParam));
 		break;
+	case WM_DPICHANGED:{
+		// moved to a monitor with another scale: take the size Windows suggests
+		const RECT* r = (const RECT*)lParam;
+		SetWindowPos(hWnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+		             SWP_NOZORDER | SWP_NOACTIVATE);
+		return 0;
+	}
 	case WM_DESTROY:
 		if(g_close) g_close();
 		PostQuitMessage(0);
@@ -1434,6 +1455,8 @@ static HWND MakeHostWindow(HINSTANCE hInst, int nCmdShow, int w, int h)
 	                       CW_USEDEFAULT, CW_USEDEFAULT,
 	                       rc.right - rc.left, rc.bottom - rc.top,
 	                       nullptr, nullptr, hInst, nullptr);
+	// the A call above cannot carry the em dash (it showed as "â€”")
+	SetWindowTextW(g_hWnd, L"Liberty City Stories Online \x2014 Launcher");
 	// open filling the screen (the selftest keeps it hidden); the CEF view
 	// follows the size through WM_SIZE -> cefui_resize
 	ShowWindow(g_hWnd, nCmdShow == SW_HIDE ? SW_HIDE : SW_SHOWMAXIMIZED);
@@ -1569,6 +1592,16 @@ static int SelfTest(bool cefLoaded)
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 {
+	// Per-monitor DPI awareness, before any window exists. CEF renders DPI
+	// aware; a DPI-unaware host got a scaled-down client size while the page
+	// laid out at the real scale, so on a 125-150% display the right side and
+	// the bottom of the page (most of the server list) was cut off.
+	{
+		typedef BOOL (WINAPI* SetDpiCtxFn)(HANDLE);
+		SetDpiCtxFn setCtx = (SetDpiCtxFn)GetProcAddress(GetModuleHandleA("user32.dll"),
+		                                                "SetProcessDpiAwarenessContext");
+		if(setCtx) setCtx((HANDLE)-4);   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+	}
 	g_log = fopen("launcher.log", "w");
 
 	// Epic Online Services bootstrap: start before any CLI path so -eostest can
