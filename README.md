@@ -2,7 +2,7 @@
 
 **A SA-MP-class multiplayer platform built into the GTA: Liberty City Stories reverse-engineering port.**
 
-[![Release](https://img.shields.io/badge/release-v0.3.1-00e5ff?style=flat-square)](https://github.com/nobody71004/relcs-multiplayer/releases/tag/v0.3.1)
+[![Release](https://img.shields.io/badge/release-v0.3.2-00e5ff?style=flat-square)](https://github.com/nobody71004/relcs-multiplayer/releases/tag/v0.3.2)
 [![Protocol](https://img.shields.io/badge/protocol-v7-8b5cf6?style=flat-square)](#9-the-protocol-v7)
 [![Tick rate](https://img.shields.io/badge/tick_rate-20_Hz-22d3ee?style=flat-square)](#91-transport--channels)
 [![Platform](https://img.shields.io/badge/platform-Windows_%7C_Linux-34d399?style=flat-square)](#7-building-from-source)
@@ -14,7 +14,7 @@
 > turn a single-player port into a persistent online world.
 
 ```
- v0.3.1   ·   protocol 7   ·   20 Hz authoritative   ·   UDP 7777 / 7778 / 7800   ·   ENet
+ v0.3.2   ·   protocol 7   ·   20 Hz authoritative   ·   UDP 7777 / 7778 / 7800   ·   ENet
 ```
 
 ---
@@ -269,11 +269,14 @@ CLI: `-http <port> -server <host:port> -rcon <pw> [-bot_exe <path>] [-web <path>
 
 ## 4. Quick start — players
 
-1. **Get the launcher** from [Releases](https://github.com/nobody71004/relcs-multiplayer/releases/tag/v0.3.1):
-   `reLCS-launcher-v0.3.1-win64.zip`.
-2. **Unzip over** an existing launcher folder — your `launcher.ini` is preserved.
+1. **Get the launcher** from [Releases](https://github.com/nobody71004/relcs-multiplayer/releases/tag/v0.3.2):
+   `reLCS-launcher-v0.3.2-win64.zip` (~174 MB).
+2. **Unzip anywhere** — the package is self-contained: it ships Chromium, the EOS SDK,
+   the MSVC runtime and the EAC payload, so it opens on a machine with no game folder and
+   no redistributables. Unzipping over an old launcher folder keeps `launcher.ini`.
 3. **Point it at your game folder** in Settings (or `-game "C:\path\reLCS\reLCS.exe"`).
-   The launcher needs `cefui.dll` from the game folder for the in-game UI.
+   The game install supplies `reLCS.exe` and its data; the launcher's own UI needs nothing
+   from it.
 4. **Optional EOS login** — copy `eos.ini.example` to `eos.ini` and fill in your product's
    client id/secret. Without it the launcher still lists and joins servers; only the EOS
    identity steps report `client-credentials-missing`.
@@ -807,19 +810,32 @@ headers the server and client use.
    powershell -ExecutionPolicy Bypass -File net\launcher\package-release.ps1 -Version X.Y.Z
    # -> out/reLCS-launcher-vX.Y.Z-win64.zip
    ```
-   It ships `reLCS-launcher.exe`, `launcher.html`, `cefui.dll`, **`EOSSDK-Win64-Shipping.dll`**,
-   the app-local MSVC runtime (`msvcp140`, `vcruntime140`, `vcruntime140_1`), `eos.ini.example`
-   and `eac/` (runtime, `.eac`, `integrity.cfg`, public cert, licences — **never**
-   `keys/base_private.key`). `PACKAGE-README.txt` lists the files the game install must
-   still supply (`libcef.dll` + Chromium assets, `reLCS.exe`).
+   The zip is **self-contained** (35 files, ~378 MB staged, ~174 MB compressed) and ships
+   everything the process loads at startup:
+
+   | Group | Files |
+   |---|---|
+   | Launcher | `reLCS-launcher.exe`, `launcher.html` |
+   | CEF host | `cefui.dll`, `cefsub.exe` (browser subprocess) |
+   | Chromium | `libcef.dll`, `chrome_elf.dll`, `chrome_100_percent.pak`, `chrome_200_percent.pak`, `resources.pak`, `icudtl.dat`, `v8_context_snapshot.bin`, `locales/en-US.pak`, `locales/en-GB.pak` |
+   | GPU helpers | `d3dcompiler_47.dll`, `dxcompiler.dll`, `dxil.dll`, `vk_swiftshader.dll`, `vk_swiftshader_icd.json`, `vulkan-1.dll` |
+   | Epic | `EOSSDK-Win64-Shipping.dll` |
+   | MSVC runtime | `msvcp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` |
+   | EAC | `eac/` payload: runtime, `reLCS.exe.eac`, `integrity.cfg`, public cert, licences — **never** `keys/base_private.key` |
+
+   The script fails instead of producing a partial zip; `PACKAGE-README.txt` inside the
+   zip states the same inventory. Extra locales can be added with `-Locale en-US,de-DE,…`.
 4. **Tag and publish:** `git tag -a vX.Y.Z -m "…"`, push the tag, `gh release create`.
 5. **Deploy the servers** from the same commit (§12.4) — the protocol version in the
    release notes tells players whether they must update.
 
-**Current release — v0.3.1:** the launcher package now bundles the EOS SDK and the MSVC
-runtime, so a fresh machine no longer fails with `EOSSDK-Win64-Shipping.dll was not found`,
-and the launcher defaults to the fleet RCON password so the in-game admin panel works
-without editing `launcher.ini`. Carries v0.3.0: EAC protected launch, EOS login, character
+**Current release — v0.3.2:** the launcher zip is self-contained. v0.3.0 shipped the exe
+alone (fatal: `EOSSDK-Win64-Shipping.dll` missing), v0.3.1 added the EOS SDK but not the
+Chromium runtime (`libcef.dll` and friends), so this release bundles the whole CEF runtime,
+`cefsub.exe`, the GPU helpers and the MSVC runtime as well, and defaults to the fleet RCON
+password so the admin panel works without editing `launcher.ini`. Verified by unzipping
+into an empty folder and running `-selftest`: `[SELFTEST] RESULT: PASS`, CEF page loaded,
+five public servers listed. Carries v0.3.0: EAC protected launch, EOS login, character
 appearance sync and the character-creator freeze fix.
 
 ---
@@ -834,7 +850,9 @@ appearance sync and the character-creator freeze fix.
 | `version 'GLIBCXX_3.4.xx' not found` | binary linked against a newer libstdc++ | rebuild with `build-linux.sh` or ship `libstdc++.so.6` |
 | EAC refuses the launch after replacing files | integrity catalogue is stale | `reLCS-launcher.exe -game <exe> -eacintegrity` |
 | Overlay panels freeze the game | old build: DirectInput teardown + CEF callbacks off-thread | fixed in v0.3.0 — update the client |
-| Launcher quits with `EOSSDK-Win64-Shipping.dll was not found` | v0.3.0 zip did not bundle the EOS SDK | use v0.3.1+, or drop `EOSSDK-Win64-Shipping.dll` next to `reLCS-launcher.exe` |
+| Launcher quits with `EOSSDK-Win64-Shipping.dll was not found` | v0.3.0 zip did not bundle the EOS SDK | use v0.3.2+, or drop `EOSSDK-Win64-Shipping.dll` next to `reLCS-launcher.exe` |
+| Launcher exits silently or with `libcef.dll was not found` / a blank window | v0.3.1 bundled `cefui.dll` but not Chromium | use v0.3.2+ (ships `libcef.dll`, paks, `cefsub.exe`, locales) |
+| CEF starts but its network service crash-loops | `resources.pak` / `v8_context_snapshot.bin` missing next to the launcher | use v0.3.2+, or copy both from the game folder |
 | Admin panel says "not configured" | launcher passed no `-rcon` (empty `rcon` in `launcher.ini`) | v0.3.1+ defaults to the fleet password; otherwise set `rcon = <server rcon_password>` |
 | `client-credentials-missing` in the launcher | no EOS client id/secret | fill `eos.ini` |
 | Crash in the D3D9 renderer with modded models | missing librw read guard | apply `patches/librw-geoplg-readmesh-guard.patch` |
