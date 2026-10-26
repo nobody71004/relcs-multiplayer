@@ -17,6 +17,12 @@ constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
 constexpr uint16_t DEFAULT_MASTER_PORT= 7800;  // ENet master server
 constexpr uint32_t GAME_VERSION_TAG   = 0x4C435331; // "LCS1"
 
+// Admin RCON password used when neither the launcher config nor -rcon supplies one.
+// The public fleet is started with this value so a fresh launcher install can open the
+// admin panel without extra setup; change it on the servers (server.cfg rcon_password)
+// and pass -rcon <new value> to the game to rotate it. Rides the game UDP port in-band.
+constexpr const char* DEFAULT_RCON_PASSWORD = "relcs-admin-2026";
+
 // ---------------------------------------------------------------------------
 // Limits / rates
 // ---------------------------------------------------------------------------
