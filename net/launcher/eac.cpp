@@ -188,18 +188,23 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	std::string acDir = gameDir + "\\EasyAntiCheat";
 	if(!DirExists(acDir)) CreateDirectoryA(acDir.c_str(), nullptr);
 	bool runtimeOk = true;
-	for(const char* file : { "EasyAntiCheat_EOS_Setup.exe", "SplashScreen.png", "Settings.json" })
-		if(FileExists(runtimeSrc + "\\EasyAntiCheat\\" + file)){
-			bool copied = false;
-			runtimeOk = CopyIfNewer(runtimeSrc + "\\EasyAntiCheat\\" + file,
-			                        acDir + "\\" + file, copied) && runtimeOk;
-			anyCopied = anyCopied || copied;
-		}
-	for(const char* sub : { "Licenses", "Localization" }){
-		std::string src = runtimeSrc + "\\EasyAntiCheat\\" + sub;
-		if(DirExists(src)){
-			if(!DirExists(acDir + "\\" + sub)) CreateDirectoryA((acDir + "\\" + sub).c_str(), nullptr);
-			CopyTree(src, acDir + "\\" + sub);
+	// the UI polls the status; do not recopy the localisation tree on every poll
+	bool haveRuntime = FileExists(acDir + "\\EasyAntiCheat_EOS_Setup.exe") &&
+	                   FileExists(acDir + "\\SplashScreen.png");
+	if(!haveRuntime){
+		for(const char* file : { "EasyAntiCheat_EOS_Setup.exe", "SplashScreen.png" })
+			if(FileExists(runtimeSrc + "\\EasyAntiCheat\\" + file)){
+				bool copied = false;
+				runtimeOk = CopyIfNewer(runtimeSrc + "\\EasyAntiCheat\\" + file,
+				                        acDir + "\\" + file, copied) && runtimeOk;
+				anyCopied = anyCopied || copied;
+			}
+		for(const char* sub : { "Licenses", "Localization" }){
+			std::string src = runtimeSrc + "\\EasyAntiCheat\\" + sub;
+			if(DirExists(src)){
+				if(!DirExists(acDir + "\\" + sub)) CreateDirectoryA((acDir + "\\" + sub).c_str(), nullptr);
+				CopyTree(src, acDir + "\\" + sub);
+			}
 		}
 	}
 
@@ -232,7 +237,10 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	         "}\r\n",
 	         rnet::EOS_GAME_TITLE, gameExeName.c_str(), rnet::EOS_PRODUCT_ID,
 	         rnet::EOS_SANDBOX_ID, rnet::EOS_DEPLOYMENT_ID);
-	bool settingsOk = WriteText(acDir + "\\Settings.json", settings);
+	std::string settingsPath = acDir + "\\Settings.json";
+	bool settingsOk = true;
+	std::string currentSettings = ReadFile(settingsPath);
+	if(currentSettings != settings) settingsOk = WriteText(settingsPath, settings);
 
 	// the CDN config that tells EAC where to fetch its module build
 	std::string eacCfg = ReadFile(payload + "\\reLCS.exe.eac");
@@ -240,7 +248,8 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 		eacCfg = "cdn=https://modules-cdn.eac-prod.on.epicgames.com/builds/14006/"
 		         "a4e0e875-fbff-4e7e-a823-8f0a18b1321f/{{system}}";
 	std::string cfgName = gameDir + "\\" + gameExeName + ".eac";
-	bool cfgOk = WriteText(cfgName, eacCfg);
+	bool cfgOk = true;
+	if(ReadFile(cfgName) != eacCfg) cfgOk = WriteText(cfgName, eacCfg);
 
 	out.configWritten = settingsOk && cfgOk;
 	out.integrityBuilt = FileExists(acDir + "\\Certificates\\base.bin");
