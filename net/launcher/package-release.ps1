@@ -170,9 +170,15 @@ Bundled runtime (all required)
                                 integrity.cfg, public certificate, licences
 
 Provided by the game install (not in this zip)
-  libcef.dll + chrome_*.pak + locales\ + icudtl.dat
-                                Chromium runtime used by cefui.dll; keep these in the
-                                launcher folder or the game folder
+  libcef.dll                    Chromium that cefui.dll loads (too large to bundle)
+  chrome_elf.dll, chrome_100_percent.pak, chrome_200_percent.pak, resources.pak,
+  icudtl.dat, v8_context_snapshot.bin, locales\
+                                Chromium assets; without resources.pak and
+                                v8_context_snapshot.bin CEF starts but its network
+                                service crash-loops
+  d3dcompiler_47.dll, dxcompiler.dll, dxil.dll, vk_swiftshader.dll, vulkan-1.dll
+                                Chromium GPU helpers (fall back to software without them)
+  cefsub.exe                    CEF subprocess helper
   reLCS.exe                     the game client (protected launch verifies it)
 
 Admin / RCON
