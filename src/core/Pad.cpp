@@ -894,9 +894,15 @@ void CPad::UpdateMouse()
 	bool uiMouse = NetGame_WantMouse();
 	if ( uiMouse != s_uiMouseActive )
 	{
+		// Do NOT tear the DirectInput device down here. FIX_BUGS makes the
+		// mouse cooperative level non-exclusive in both modes, so nothing about
+		// the device actually changes — but Unacquire()+Release() from the
+		// frame loop deadlocks inside DINPUT8 (main thread: CPad::UpdatePads
+		// -> _InputShutdownMouse -> DINPUT8!DirectInput8Create ->
+		// WaitForSingleObject) the moment a CEF panel opens or closes, which
+		// freezes the game on its last frame. Keep the device and just stop
+		// reading it while the overlay owns the cursor.
 		s_uiMouseActive = uiMouse;
-		if ( PSGLOBAL(mouse) )
-			_InputShutdownMouse(); // re-acquired below with the right coop level
 	}
 	if ( s_uiMouseActive )
 	{

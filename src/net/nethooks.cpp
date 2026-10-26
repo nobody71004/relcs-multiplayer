@@ -53,7 +53,8 @@
 
 #include <windows.h>
 #include <cstdarg>
-
+#include <deque>
+#include <mutex>
 // winsock1's in_addr macros (s_net/s_host/...) collide with our own globals
 #undef s_net
 #undef s_host
@@ -1482,10 +1483,16 @@ static std::string UrlDecode(const std::string& s)
 	return out;
 }
 
-static void CefQueryHandler(const char* request, void*)
+// CEF delivers lcs:// navigations on Chromium's IO/UI thread, never on the
+// game's main thread. Applying them there (re-skinning a ped, streaming a
+// model, running the console) touches RenderWare and the streaming manager
+// from a foreign thread: picking a character froze the whole game. Keep the
+// callback trivial and drain the queue from NetGame_Frame instead.
+static std::mutex s_cefQueueLock;
+static std::deque<std::string> s_cefQueue;
+
+static void ProcessCefRequest(const std::string& req)
 {
-	if(!request) return;
-	std::string req(request);
 	size_t q = req.find('?');
 	std::string cmd = req.substr(0, q);
 	std::string args = q == std::string::npos ? "" : req.substr(q + 1);
@@ -1525,9 +1532,28 @@ static void CefQueryHandler(const char* request, void*)
 		s_cefPanel.clear();
 		CefHud_Show("");
 	}else{
-		fprintf(stderr, "[CEF] %s\n", request);
+		fprintf(stderr, "[CEF] %s\n", req.c_str());
 		fflush(stderr);
 	}
+}
+
+static void CefQueryHandler(const char* request, void*)
+{
+	if(!request) return;
+	std::lock_guard<std::mutex> lock(s_cefQueueLock);
+	// a stalled frame must not let the overlay grow the queue without bound
+	if(s_cefQueue.size() >= 256) s_cefQueue.pop_front();
+	s_cefQueue.push_back(request);
+}
+
+static void DrainCefRequests(void)
+{
+	std::deque<std::string> queued;
+	{
+		std::lock_guard<std::mutex> lock(s_cefQueueLock);
+		queued.swap(s_cefQueue);
+	}
+	for(std::string& req : queued) ProcessCefRequest(req);
 }
 
 static double s_lastCefPush = 0.0;
@@ -2717,6 +2743,7 @@ void NetGame_Frame(void)
 	if(CefHud_Active()){
 		static bool s_cefHooked = false;
 		if(!s_cefHooked){ s_cefHooked = true; CefHud_SetQueryHandler(CefQueryHandler); }
+		DrainCefRequests();
 		CefHud_Tick();
 		CefPushState();
 	}
@@ -3629,6 +3656,10 @@ void NetGame_DrawHud(void)
 
 void NetGame_Shutdown(void)
 {
+	{
+		std::lock_guard<std::mutex> lock(s_cefQueueLock);
+		s_cefQueue.clear();
+	}
 	CefHud_Shutdown();
 	VoiceShutdown();
 	if(s_connected){
