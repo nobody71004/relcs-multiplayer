@@ -23,6 +23,7 @@ struct ServerConfig {
 	std::string gamemode = "survivor";     // survivor | freeroam
 	bool announce = false;                 // list on master server
 	std::string master = "127.0.0.1";      // master server host
+	std::string publicIp;                  // WAN address to list (port-forwarded LAN box); empty = LAN IP
 	uint16_t masterPort = rnet::DEFAULT_MASTER_PORT;
 	bool lanDiscover = true;
 	std::string rconPassword = "";
@@ -87,6 +88,7 @@ struct ServerVehicle {
 	uint16_t modelId = 0;
 	rnet::VehicleState state;
 	uint8_t driverId = 0xFF;
+	uint8_t ownerId = 0xFF;            // player whose enter allocated it (0xFF = static/admin)
 	uint8_t occupants[8];            // seat -> playerId (0xFF = free)
 	float lastStateTime = 0.0;
 };
@@ -120,7 +122,7 @@ public:
 	                 uint16_t skin, uint8_t health, uint8_t armour);
 	void KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId);
 	void TeleportPlayer(uint8_t playerId, float x, float y, float z, float heading);
-	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent);
+	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent, uint8_t ownerId = 0xFF);
 	void RemoveVehicle(uint16_t vehicleId);
 	void SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour);
 	void BroadcastScores();
@@ -140,6 +142,7 @@ private:
 	void SendRefusal(ENetPeer* peer, uint8_t code, const char* reason); // MSG_DISCONNECT + JoinRefused code
 	void OnConnect(ENetPeer* peer);
 	void HandleInventory(ServerPlayer* p, rnet::BitReader& r);
+	void HandleAppearance(ServerPlayer* p, rnet::BitReader& r);
 	void SendInventory(ServerPlayer* p);    // restore the persisted profile
 	void OnDisconnect(ENetPeer* peer);
 	void OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel);

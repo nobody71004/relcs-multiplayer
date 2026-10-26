@@ -37,10 +37,20 @@ SpawnPoint RandomSpawnPoint()
 // ---------------------------------------------------------------------------
 // Free roam
 // ---------------------------------------------------------------------------
+// The spawn message carries the player's own model. It used to be hard-coded 0,
+// which meant every spawn (join *and* respawn) told the client "no saved look":
+// the first-join character creator reopened after every death and remote puppets
+// were built with model 0 until the next appearance message.
+static uint16_t SpawnSkinFor(Server& server, uint8_t playerId)
+{
+	ServerPlayer* p = server.FindPlayer(playerId);
+	return p ? p->skin : 0;
+}
+
 void FreeRoamMode::OnPlayerSpawnRequest(Server& server, uint8_t playerId)
 {
 	SpawnPoint sp = RandomSpawnPoint();
-	server.SpawnPlayer(playerId, sp.x, sp.y, sp.z, sp.heading, 0, 100, 0);
+	server.SpawnPlayer(playerId, sp.x, sp.y, sp.z, sp.heading, SpawnSkinFor(server, playerId), 100, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -56,7 +66,7 @@ LibertyCitySurvivorMode::LibertyCitySurvivorMode()
 void LibertyCitySurvivorMode::OnPlayerSpawnRequest(Server& server, uint8_t playerId)
 {
 	SpawnPoint sp = RandomSpawnPoint();
-	server.SpawnPlayer(playerId, sp.x, sp.y, sp.z, sp.heading, 0, 100, 0);
+	server.SpawnPlayer(playerId, sp.x, sp.y, sp.z, sp.heading, SpawnSkinFor(server, playerId), 100, 0);
 
 	if(m_phase == Phase::Warmup && server.ActivePlayerCount() >= 1)
 		OnRoundStart(server);

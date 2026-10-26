@@ -31,6 +31,12 @@ struct PlayerProfile {
 	// match stats — survive reconnects
 	int32_t score = 0;
 	uint16_t kills = 0, deaths = 0;
+	// chosen character (ped model index); 0 = never picked one
+	uint16_t skin = 0;
+	// clothing/component variation slots that came with the chosen skin (0 =
+	// default). Stock LCS renders a ped by model only; a modded ped pack can
+	// honour these, and they travel with the profile either way.
+	uint8_t skinComponents[8] = {};
 	// last on-foot position (world metres) + heading (degrees); hasPos gates it
 	bool hasPos = false;
 	float x = 0.0f, y = 0.0f, z = 0.0f, heading = 0.0f;

@@ -5016,7 +5016,10 @@ CPed::Render(void)
 		if (!bRenderPedInCar)
 			return;
 
-		if (!m_pMyVehicle->IsBike() && !IsPlayer()) {
+		// net puppets (remote players, UNK_CHAR) are drawn like the local
+		// player: the 25 m in-car cull is for traffic NPCs and made another
+		// player vanish from their car as soon as it drove away from the camera
+		if (!m_pMyVehicle->IsBike() && !IsPlayer() && CharCreatedBy != UNK_CHAR) {
 			float camDistSq = (TheCamera.GetPosition() - GetPosition()).MagnitudeSqr();
 			if (camDistSq > SQR((m_pMyVehicle->IsBoat() ? 40.0f : 25.0f) * TheCamera.LODDistMultiplier))
 				return;

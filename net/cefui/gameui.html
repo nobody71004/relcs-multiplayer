@@ -176,6 +176,14 @@
     <h2>Server Admin Panel — Esc to close</h2>
     <div class="grid">
       <div class="full">
+        <label>RCON: <b id="admStatus">not authenticated</b></label>
+        <div class="inline" id="admLogin">
+          <input id="admPass" type="password" maxlength="64" placeholder="server rcon password" autocomplete="off">
+          <button class="abtn" id="admLoginBtn">Log in</button>
+        </div>
+        <div id="admResp" style="font:12px monospace;opacity:0.75;min-height:16px;margin-top:4px"></div>
+      </div>
+      <div class="full">
         <label>Broadcast to all players</label>
         <div class="inline">
           <input id="admBroadcast" maxlength="120" placeholder="Server announcement…">
@@ -291,6 +299,60 @@
 
   <div class="hint" id="hint"></div>
 
+<style>
+  #creator .cwrap { display:flex; gap:14px; }
+  #creator .clist { flex:1 1 58%; min-width:0; }
+  #creator .cside { flex:0 0 38%; display:flex; flex-direction:column; gap:8px; }
+  #creator .csearch { width:100%; box-sizing:border-box; padding:7px 9px; margin-bottom:8px; }
+  #creatorGrid { display:grid; grid-template-columns:repeat(3,1fr); gap:6px;
+                 max-height:52vh; overflow-y:auto; padding-right:4px; }
+  #creatorGrid .cped { display:flex; flex-direction:column; align-items:flex-start;
+                       gap:1px; padding:6px 7px; font-size:12px; text-align:left;
+                       border-radius:6px; border:1px solid rgba(255,255,255,0.12);
+                       background:rgba(255,255,255,0.05); color:inherit; cursor:pointer; }
+  #creatorGrid .cped small { opacity:0.55; font-size:10px; }
+  #creatorGrid .cped.sel { border-color:#59f; background:rgba(90,150,255,0.22); }
+  #creatorGrid .cped:hover { background:rgba(255,255,255,0.12); }
+  #creator .cpreview { border:1px solid rgba(255,255,255,0.12); border-radius:8px;
+                       padding:10px; background:rgba(255,255,255,0.04); }
+  #creator .cname { font-size:16px; font-weight:600; letter-spacing:0.04em; }
+  #creator .cid { font-size:11px; opacity:0.6; }
+  #creator .clabel { font-size:11px; opacity:0.65; margin-top:8px; }
+  #creator .ccomps { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:4px; }
+  #creator .ccomps input { width:100%; box-sizing:border-box; padding:4px; font-size:11px; }
+  #creator .cactions { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:auto; }
+  #creator .cactions .wide { grid-column:1/-1; }
+</style>
+
+<div id="creator" style="display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+     width:760px;max-width:94vw;background:rgba(8,10,14,0.96);border:1px solid rgba(255,255,255,0.14);
+     border-radius:10px;padding:18px 20px;color:#e8ecf2;font-family:inherit;z-index:50">
+  <h2 style="margin:0 0 4px;font-size:20px;letter-spacing:0.06em">CHARACTER CREATOR</h2>
+  <div id="creatorSub" style="opacity:0.7;font-size:12px;margin-bottom:12px">
+    This is the body other players see, live. Pick any ped in the game, then <b>Done</b>.
+  </div>
+  <div class="cwrap">
+    <div class="clist">
+      <input id="creatorSearch" class="csearch" placeholder="search ped models (name or #id)" autocomplete="off">
+      <div id="creatorGrid"></div>
+      <div style="font-size:11px;opacity:0.55;margin-top:6px"><span id="creatorCount">0</span> models</div>
+    </div>
+    <div class="cside">
+      <div class="cpreview">
+        <div class="cname" id="creatorName">—</div>
+        <div class="cid" id="creatorModel">model —</div>
+        <div class="clabel">Component slots (used by modded ped packs)</div>
+        <div class="ccomps" id="creatorComps"></div>
+      </div>
+      <div class="cactions">
+        <button class="abtn" id="creatorRandom">Random</button>
+        <button class="abtn" id="creatorApply">Re-apply</button>
+        <button class="abtn wide" id="creatorDone">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -302,7 +364,7 @@ document.body.appendChild(iframe);
 function send(req) { iframe.src = "lcs://" + req; }
 
 // ---- panels ------------------------------------------------------------
-const panels = { chat: $("chat"), console: $("console"), inventory: $("inventory"), admin: $("admin") };
+const panels = { chat: $("chat"), console: $("console"), inventory: $("inventory"), admin: $("admin"), creator: $("creator") };
 let openPanel = null;
 
 function show(name) {
@@ -316,9 +378,112 @@ function show(name) {
     if (openPanel === "console") renderCon();
     if (openPanel === "inventory") renderInv();
     if (openPanel === "admin") renderAdmin();
+    if (openPanel === "creator") renderCreator();
   }
 }
 window.GameUI = { show: show };
+
+// ---- character creator (opened by the host on a first join) -------------
+// The host decides when to open it (the server spawned this player without a
+// saved look). The ped catalog comes from the host (state.peds = every ped model
+// the game knows); a pick is a normal appearance message, so the host re-skins
+// our own body immediately — that is the live preview — and the server persists
+// it and rebroadcasts it to everyone else.
+let creatorSel = { model: 0, comps: [0, 0, 0, 0, 0, 0, 0, 0] };
+let creatorFilter = "";
+let creatorBuilt = false;
+
+function creatorPeds() {
+  return (state.peds && state.peds.length) ? state.peds : [{ id: 7, name: "male01" }];
+}
+
+function creatorSend() {
+  if (!(creatorSel.model > 0)) return;
+  let q = "appearance?model=" + creatorSel.model;
+  creatorSel.comps.forEach((v, i) => { q += "&c" + i + "=" + (v | 0); });
+  send(q);
+}
+
+function creatorSyncFromState() {
+  const c = state.creator;
+  if (!c) return;
+  if (c.model) creatorSel.model = c.model;
+  if (Array.isArray(c.comps)) {
+    creatorSel.comps = c.comps.slice(0, 8);
+    while (creatorSel.comps.length < 8) creatorSel.comps.push(0);
+  }
+}
+
+function creatorRenderInfo() {
+  const ped = creatorPeds().find(p => p.id === creatorSel.model);
+  $("creatorName").textContent = ped ? ped.name : "—";
+  $("creatorModel").textContent = "model #" + creatorSel.model;
+  $("creatorComps").querySelectorAll("input[data-slot]").forEach((inp) => {
+    if (document.activeElement !== inp)
+      inp.value = creatorSel.comps[+inp.dataset.slot] | 0;
+  });
+}
+
+function creatorRenderGrid() {
+  const g = $("creatorGrid");
+  const q = creatorFilter.trim().toLowerCase();
+  const all = creatorPeds();
+  const list = q ? all.filter(p => p.name.toLowerCase().includes(q) || String(p.id) === q.replace(/^#/, "")) : all;
+  g.innerHTML = list.length ? list.map(p =>
+    `<button class="cped${p.id === creatorSel.model ? " sel" : ""}" data-model="${p.id}">` +
+    `${escapeHtml(p.name)}<small>#${p.id}</small></button>`
+  ).join("") : `<div style="grid-column:1/-1;opacity:0.6;font-size:12px">no ped matches “${escapeHtml(q)}”</div>`;
+  g.querySelectorAll("button[data-model]").forEach(b => {
+    b.onclick = () => {
+      creatorSel.model = +b.dataset.model;
+      creatorSend();                 // live preview on our own body
+      g.querySelectorAll("button[data-model]").forEach(o => o.classList.toggle("sel", o === b));
+      creatorRenderInfo();
+    };
+  });
+  $("creatorCount").textContent = list.length + " / " + all.length;
+}
+
+function renderCreator() {
+  creatorSyncFromState();
+  if (!(creatorSel.model > 0)) {
+    const ped = creatorPeds()[0];
+    creatorSel.model = ped ? ped.id : 7;
+  }
+  if (!creatorBuilt) {
+    creatorBuilt = true;
+    const box = $("creatorComps");
+    box.innerHTML = Array.from({ length: 8 }, (_, i) =>
+      `<input type="number" min="0" max="255" data-slot="${i}" title="component slot ${i}" value="0">`).join("");
+    box.querySelectorAll("input[data-slot]").forEach((inp) => {
+      inp.onchange = () => {
+        const v = Math.max(0, Math.min(255, parseInt(inp.value, 10) || 0));
+        creatorSel.comps[+inp.dataset.slot] = v;
+        creatorSend();
+      };
+    });
+    $("creatorSearch").oninput = () => { creatorFilter = $("creatorSearch").value; creatorRenderGrid(); };
+    $("creatorRandom").onclick = () => {
+      const all = creatorPeds();
+      if (!all.length) return;
+      creatorSel.model = all[(Math.random() * all.length) | 0].id;
+      creatorSel.comps = creatorSel.comps.map(() => 0);
+      creatorSend();
+      creatorRenderGrid();
+      creatorRenderInfo();
+    };
+    $("creatorApply").onclick = () => creatorSend();
+    $("creatorDone").onclick = () => send("close");
+    $("creatorSub").innerHTML = "This is the body other players see — a pick applies instantly. " +
+      "Pick any ped in the game, then <b>Done</b>. Reopen any time with the <b>creator</b> command.";
+  }
+  creatorRenderGrid();
+  creatorRenderInfo();
+  const first = !!(state.creator && state.creator.first);
+  $("creatorSub").style.color = first ? "#8cf" : "";
+  if (first) $("creatorSub").innerHTML = "<b>First join:</b> choose the character you want to play as. " +
+    "A pick applies instantly; press <b>Done</b> when you are happy with it.";
+}
 
 // ---- state -------------------------------------------------------------
 let state = {
@@ -386,6 +551,34 @@ function renderAdmin() {
   $("admGod").classList.toggle("on", god);
   $("admNoclip").textContent = "NoClip: " + (nc ? "ON" : "OFF");
   $("admNoclip").classList.toggle("on", nc);
+
+  // rcon state: 0 = no password, 1 = password set but not accepted, 2 = authed.
+  // The server-only buttons (broadcast/give/bot/prop/time/weather) are refused
+  // without it, so say so instead of letting them look like dead buttons.
+  const rcon = state.rcon | 0;
+  const st = $("admStatus");
+  if (rcon === 2) {
+    st.textContent = "ADMIN — authenticated";
+    st.style.color = "#7f7";
+    $("admLogin").style.display = "none";
+  } else if (rcon === 1) {
+    st.textContent = "password set — not accepted yet";
+    st.style.color = "#e5b";
+    $("admLogin").style.display = "flex";
+  } else {
+    st.textContent = "not authenticated — enter the server's rcon password";
+    st.style.color = "#e5b";
+    $("admLogin").style.display = "flex";
+  }
+  $("admResp").textContent = state.rconmsg || "";
+  // dim the buttons that need the server (everything except god/noclip/fps,
+  // which run on this client) so a refused command is visible before clicking
+  const serverBtns = ["admSend", "admGiveMoney", "admGiveWeapon", "admProp",
+                      "admBot", "admSetTime", "admSetWeather", "resEnable",
+                      "resDisable", "resRun", "resReload", "resInstall", "resUninstall"];
+  const dim = rcon === 2 ? "1" : "0.55";
+  serverBtns.forEach((id) => { const b = $(id); if (b) b.style.opacity = dim; });
+  document.querySelectorAll("#admin [data-t]").forEach((b) => { b.style.opacity = dim; });
 }
 
 function renderWelcome() {
@@ -417,6 +610,15 @@ function renderBanner() {
 }
 
 function con(cmd) { send("console?cmd=" + encodeURIComponent(cmd)); }
+
+$("admLoginBtn").addEventListener("click", () => {
+  const pw = $("admPass").value;
+  if (pw) { con("rconauth " + pw); $("admPass").value = ""; }
+});
+$("admPass").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { $("admLoginBtn").click(); e.preventDefault(); }
+  e.stopPropagation();
+});
 
 $("admSend").addEventListener("click", () => {
   const v = $("admBroadcast").value.trim();
@@ -498,6 +700,7 @@ window.GameUI.push = function (json) {
   if (openPanel === "console") renderCon();
   if (openPanel === "inventory") renderInv();
   if (openPanel === "admin") renderAdmin();
+  if (openPanel === "creator") { creatorSyncFromState(); creatorRenderInfo(); }
 };
 
 // ---- inputs ------------------------------------------------------------

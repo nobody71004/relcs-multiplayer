@@ -317,7 +317,8 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 		if(++p->floodStrikes > 20){
 			KickPlayer(p->id, "packet flood");
 		}else
-			Log("[anticheat] %s packet flood strike %d", p->name.c_str(), p->floodStrikes);
+			Log("[anticheat] %s packet flood strike %d (dropped msg type=%d channel=%d len=%d)",
+			    p->name.c_str(), p->floodStrikes, (int)type, (int)channel, (int)packet->dataLength);
 		return;
 	}
 
@@ -332,6 +333,7 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 	case MSG_VEH_ENTER:   if(p) HandleVehEnter(p, r); break;
 	case MSG_VEH_EXIT:    if(p) HandleVehExit(p, r); break;
 	case MSG_INVENTORY:   if(p) HandleInventory(p, r); break;
+	case MSG_APPEARANCE:  if(p) HandleAppearance(p, r); break;
 	case MSG_RCON_AUTH:   if(p) HandleRcon(p, r, true); break;
 	case MSG_RCON_CMD:    if(p) HandleRcon(p, r, false); break;
 	case MSG_PING: {
@@ -463,6 +465,20 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			np.inv.count++;
 		}
 		np.invSet = true;
+		// a saved character is restored here, before the first spawn: the client
+		// adopts the echo as its baseline and does not open the creator
+		if(np.savedProfile.skin != 0){
+			np.skin = np.savedProfile.skin;
+			BitWriter wa;
+			BeginMsg(wa, MSG_APPEARANCE);
+			rnet::MsgAppearance ap;
+			ap.playerId = np.id;
+			ap.model = np.skin;
+			memcpy(ap.components, np.savedProfile.skinComponents, sizeof ap.components);
+			rnet::WriteAppearance(wa, ap);
+			SendTo(peer, wa, CHAN_RELIABLE, true);
+			Log("[appearance] %s restored model %d", np.name.c_str(), (int)np.skin);
+		}
 		// match stats carry over; the first spawn resumes the last on-foot spot
 		np.score = np.savedProfile.score;
 		np.kills = np.savedProfile.kills;
@@ -547,6 +563,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		vs.y = v.state.yMm / 1000.0f;
 		vs.z = v.state.zMm / 1000.0f;
 		vs.heading = DequantAngle(v.state.heading);
+		vs.ownerId = v.ownerId;
 		WriteVehSpawn(wv, vs);
 		SendTo(peer, wv, CHAN_RELIABLE, true);
 
@@ -571,10 +588,49 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		}
 	}
 
+	{
+		int live = 0, seated = 0;
+		for(int i = 0; i < MAX_VEHICLES; i++){
+			if(!m_vehicles[i].active) continue;
+			live++;
+			for(int s = 0; s < 8; s++)
+				if(m_vehicles[i].occupants[s] != 0xFF) seated++;
+		}
+		Log("[VEHSYNC] join snapshot to player %d: %d vehicles, %d occupied seats",
+		    (int)np.id, live, seated);
+	}
 	if(m_gamemode) m_gamemode->OnPlayerConnect(*this, np.id);
 }
 
 // ---------------------------------------------------------------------------
+// A player picked (or changed) the character he renders as. The server owns the
+// value so a look survives rejoins and every other client re-skins the puppet;
+// the echo also reaches the sender, whose client adopts it as its baseline.
+void Server::HandleAppearance(ServerPlayer* p, BitReader& r)
+{
+	rnet::MsgAppearance m;
+	if(!rnet::ReadAppearance(r, m)) return;
+	// 0 = "no preference"; anything else must be a plausible ped model id. The
+	// client already refuses non-ped types (it builds the choice list from the
+	// ped model table), so this is the cheap remote sanity gate. Model 1..6 are
+	// valid peds too (cop/swat/medic/...), so the floor is 1, not MI_MALE01.
+	if(m.model != 0 && (m.model < 1 || m.model > 20000)){
+		Log("[appearance] %s sent invalid model %d (ignored)", p->name.c_str(), (int)m.model);
+		return;
+	}
+	p->skin = m.model;
+	p->savedProfile.skin = m.model;
+	memcpy(p->savedProfile.skinComponents, m.components, sizeof m.components);
+	p->profileDirty = true;
+
+	BitWriter w;
+	BeginMsg(w, MSG_APPEARANCE);
+	m.playerId = p->id;
+	rnet::WriteAppearance(w, m);
+	Broadcast(w, CHAN_RELIABLE, true);
+	Log("[appearance] %s is model %d", p->name.c_str(), (int)m.model);
+}
+
 void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 {
 	PlayerState st;
@@ -859,6 +915,9 @@ void Server::SaveProfile(ServerPlayer* p)
 		prof.weapons = p->savedProfile.weapons;
 		prof.currentWeapon = p->savedProfile.currentWeapon;
 	}
+	prof.skin = p->skin;
+	// the chosen look's component slots travel with the model
+	memcpy(prof.skinComponents, p->savedProfile.skinComponents, sizeof prof.skinComponents);
 	prof.score = p->score;
 	prof.kills = p->kills;
 	prof.deaths = p->deaths;
@@ -953,9 +1012,14 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 {
 	MsgVehEnter m;
 	if(!ReadVehEnter(r, m)) return;
+	Log("[VEHSYNC] enter request player=%d veh=%d seat=%d model=%d",
+	    (int)p->id, (int)m.vehicleId, (int)m.seat, (int)m.modelId);
 
 	// claimed model sanity (real clients send the engine model index)
-	if(m.modelId == 0 || m.modelId > 20000) return;
+	if(m.modelId == 0 || m.modelId > 20000){
+		Log("[VEHSYNC] enter DENIED player=%d: bad model %d", (int)p->id, (int)m.modelId);
+		return;
+	}
 
 	// a player holds exactly one seat: drop any old occupancy (broadcasts exit)
 	ClearPlayerVehicles(p, true);
@@ -966,13 +1030,19 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	if(vid == 0xFFFF){
 		// allocate a new vehicle at the player's position
 		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
-		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false);
-		if(!v) return;
+		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false, p->id);
+		if(!v){
+			Log("[VEHSYNC] enter DENIED player=%d: could not spawn model %d", (int)p->id, (int)m.modelId);
+			return;
+		}
 		vid = v->id;
 		Log("[VEH] player %d spawned vehicle id=%d model=%d", p->id, vid, (int)m.modelId);
 	}else{
 		v = FindVehicle(vid);
-		if(!v) return;
+		if(!v){
+			Log("[VEHSYNC] enter DENIED player=%d: no vehicle id=%d", (int)p->id, (int)vid);
+			return;
+		}
 	}
 
 	// seat assignment: honour the request when free, otherwise the lowest free
@@ -984,7 +1054,7 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 		for(int s = 0; s < 8; s++)
 			if(v->occupants[s] == 0xFF){ seat = (uint8_t)s; break; }
 	if(seat == 0xFF){
-		Log("[VEH] player %d denied: vehicle id=%d full", p->id, vid);
+		Log("[VEHSYNC] enter DENIED player=%d: vehicle id=%d has no free seat", (int)p->id, (int)vid);
 		return;
 	}
 
@@ -992,6 +1062,9 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	if(seat == 0) v->driverId = p->id;
 	p->state.vehicleId = vid;
 	p->state.seat = seat;
+	Log("[VEHSYNC] enter OK player=%d veh=%d seat=%d (asked %d) model=%d owner=%d driver=%d",
+	    (int)p->id, (int)vid, (int)seat, (int)m.seat, (int)v->modelId,
+	    (int)v->ownerId, (int)v->driverId);
 
 	BitWriter w;
 	BeginMsg(w, MSG_VEH_ENTER);
@@ -1015,6 +1088,8 @@ void Server::ClearPlayerVehicles(ServerPlayer* p, bool broadcast)
 		for(int s = 0; s < 8; s++)
 			if(v.occupants[s] == p->id){ v.occupants[s] = 0xFF; held = true; }
 		if(v.driverId == p->id){ v.driverId = 0xFF; held = true; }
+		if(held)
+			Log("[VEHSYNC] clear player=%d veh=%d (broadcast=%d)", (int)p->id, (int)v.id, (int)broadcast);
 		if(held && broadcast){
 			BitWriter w;
 			BeginMsg(w, MSG_VEH_EXIT);
@@ -1033,6 +1108,7 @@ void Server::HandleVehExit(ServerPlayer* p, BitReader& r)
 {
 	MsgVehExit m;
 	if(!ReadVehExit(r, m)) return;
+	Log("[VEHSYNC] exit request player=%d veh=%d", (int)p->id, (int)m.vehicleId);
 
 	// occupancy is authoritative: clients may send 0 or a stale id (the bot
 	// sends 0), so resolve the vehicle actually holding the player
@@ -1048,7 +1124,11 @@ void Server::HandleVehExit(ServerPlayer* p, BitReader& r)
 		for(int i = 0; i < MAX_VEHICLES; i++)
 			if(m_vehicles[i].active && inVehicle(&m_vehicles[i])){ v = &m_vehicles[i]; break; }
 	}
-	if(!v) return;
+	if(!v){
+		Log("[VEHSYNC] exit ignored player=%d: not seated in any vehicle", (int)p->id);
+		return;
+	}
+	Log("[VEHSYNC] exit OK player=%d veh=%d", (int)p->id, (int)v->id);
 	for(int s = 0; s < 8; s++)
 		if(v->occupants[s] == p->id) v->occupants[s] = 0xFF;
 	if(v->driverId == p->id) v->driverId = 0xFF;
@@ -1075,7 +1155,12 @@ void Server::HandleRcon(ServerPlayer* p, BitReader& r, bool auth)
 		BitWriter w;
 		BeginMsg(w, ok ? MSG_RCON_OK : MSG_RCON_RESP);
 		if(!ok){
-			const char* bad = "RCON: wrong password";
+			// "wrong password" hides the real cause when the server was started
+			// without one: then no password can ever work and every admin-panel
+			// button stays dead. Say which of the two it is.
+			const char* bad = m_cfg.rconPassword.empty()
+			    ? "RCON: this server has no admin password (start it with -rcon_password <pw>)"
+			    : "RCON: wrong password";
 			WriteStringMsg(w, bad, 255);
 		}
 		SendTo(p->peer, w, CHAN_RELIABLE, true);
@@ -1246,6 +1331,11 @@ void Server::SpawnPlayer(uint8_t playerId, float x, float y, float z, float head
 
 	p->spawned = true;
 	p->alive = true;
+	// gamemodes spawn with skin 0 ("I have no opinion"); that must not erase a
+	// look the player already chose or the profile restored. Only a player who
+	// genuinely has no look yet keeps 0, which is what tells the client to open
+	// the character creator on a first join.
+	if(skin == 0) skin = p->skin;
 	p->skin = skin;
 	p->health = health;
 	p->armour = armour;
@@ -1368,7 +1458,7 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 // after its driver walks away, exactly like a car parked on the street.
 // ---------------------------------------------------------------------------
 ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
-                                    float heading, bool permanent)
+                                    float heading, bool permanent, uint8_t ownerId)
 {
 	if(modelId == 0){
 		Log("[VEH] refusing model 0");
@@ -1389,6 +1479,7 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	v->id = (uint16_t)(slot + 1);
 	v->modelId = modelId;
 	v->driverId = 0xFF;
+	v->ownerId = ownerId;
 	for(int s = 0; s < 8; s++) v->occupants[s] = 0xFF;
 	v->state = VehicleState();
 	v->state.vehicleId = v->id;
@@ -1405,6 +1496,7 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	vs.vehicleId = v->id;
 	vs.modelId = modelId;
 	vs.x = x; vs.y = y; vs.z = z; vs.heading = heading;
+	vs.ownerId = ownerId;
 	WriteVehSpawn(w, vs);
 	Broadcast(w, CHAN_RELIABLE, true);
 
@@ -2124,6 +2216,12 @@ void Server::UpdateMasterAnnounce()
 		a.maxPlayers = (uint8_t)m_cfg.maxPlayers;
 		a.protocolVersion = PROTOCOL_VERSION;
 		a.advertisedIp = LanIPv4();
+		if(!m_cfg.publicIp.empty()){
+			// port-forwarded box: list the WAN address, not the LAN one
+			ENetAddress pub;
+			if(enet_address_set_host(&pub, m_cfg.publicIp.c_str()) == 0)
+				a.advertisedIp = pub.host;
+		}
 		CopyStr(a.hostname, sizeof a.hostname, m_cfg.hostname.c_str());
 		CopyStr(a.gameMode, sizeof a.gameMode, m_gamemode ? m_gamemode->Name() : "");
 		CopyStr(a.mapName, sizeof a.mapName, m_cfg.mapName.c_str());

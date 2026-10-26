@@ -10,7 +10,8 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 5;  // v5: server map + static vehicles + master favorites
+constexpr uint16_t PROTOCOL_VERSION   = 7;  // v7: MsgVehSpawn carries the owner (entering player) id
+// v5: server map + static vehicles + master favorites
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
 constexpr uint16_t DEFAULT_MASTER_PORT= 7800;  // ENet master server
@@ -79,6 +80,9 @@ enum MsgType : uint8_t {
 	MSG_VEH_SPAWN       = 32,
 	MSG_VEH_DESPAWN     = 33, // server removed a vehicle (static spawn cleanup)
 	MSG_INVENTORY       = 34, // profile sync: full money+weapon snapshot (both ways)
+	MSG_APPEARANCE      = 35, // player appearance: ped model + clothing/component slots
+	                          // client->server: "this is my look" (server persists + rebroadcasts)
+	                          // server->client: a player's look (own restore on join, remotes on join/change)
 	// world / gamemode
 	MSG_WORLD           = 40,
 	MSG_SCORE_UPDATE    = 41,
@@ -152,6 +156,24 @@ struct MsgInventory {
 	InvEntry entries[MAX_INV_ENTRIES];
 };
 
+// Player appearance (MSG_APPEARANCE): the character model a player renders as,
+// plus a fixed set of clothing/component variation slots.
+//
+// GTA:LCS renders a ped by its *model index* (one model = one look); `model`
+// is the ped model id a player chose (MI_MALE01, MI_GANG01, ...). The component
+// slots are an additive, forward-compatible channel for per-slot clothing/skin
+// variation (hats/torso/legs/...) — a modded build or a future ped variation
+// system can honour them; a stock LCS client applies `model` and ignores the
+// rest. Kept fixed-size so the codec never trusts a wire-supplied length.
+constexpr int MAX_APPEARANCE_COMPONENTS = 8;
+constexpr uint16_t APPEARANCE_MODEL_DEFAULT = 7;  // MI_MALE01 — the stock avatar
+
+struct MsgAppearance {
+	uint16_t playerId = 0;
+	uint16_t model = APPEARANCE_MODEL_DEFAULT;  // ped model index (the character/outfit)
+	uint8_t  components[MAX_APPEARANCE_COMPONENTS] = {}; // per-slot variation (0 = default)
+};
+
 // animFlags bits
 constexpr uint8_t ANIM_CROUCH   = 1;
 constexpr uint8_t ANIM_AIM      = 2;
@@ -175,6 +197,9 @@ struct VehicleState {
 	uint8_t  gas = 0, brake = 0;
 	uint8_t  flags = 0;   // VEHFLAG_*
 	uint16_t health = 1000;
+	// door open ratio per eDoors index (bonnet, boot, front L/R, rear L/R):
+	// 0 = closed, 255 = fully open. Non-car vehicles send zeros.
+	uint8_t  doors[6] = {};
 };
 
 // vehicle flags
@@ -288,6 +313,7 @@ struct MsgVehSpawn {
 	uint16_t vehicleId = 0;
 	uint16_t modelId = 0;
 	float    x = 0, y = 0, z = 0, heading = 0;
+	uint8_t  ownerId = 0xFF; // player whose enter allocated it (0xFF = static/admin)
 };
 
 // MSG_VEH_DESPAWN — the server retired a vehicle (admin delcar, static spawn

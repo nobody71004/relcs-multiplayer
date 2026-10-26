@@ -175,6 +175,17 @@ void NetClient::SendInventory(const MsgInventory& m)
 	enet_host_flush((ENetHost*)m_host);
 }
 
+void NetClient::SendAppearance(const MsgAppearance& m)
+{
+	if(!m_host || !m_peer || !m_connected) return;
+	BitWriter w;
+	BeginMsg(w, MSG_APPEARANCE);
+	WriteAppearance(w, m);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+	enet_peer_send((ENetPeer*)m_peer, CHAN_RELIABLE, pkt);
+	enet_host_flush((ENetHost*)m_host);
+}
+
 void NetClient::SendSpawnRequest()
 {
 	if(!m_host || !m_peer || !m_connected) return;
@@ -287,6 +298,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 				Event e;
 				e.type = EV_SPAWNED;
 				e.id = m_myId;
+				e.kind = sp.skinModel ? 1 : 0;   // 0 = server has no saved look
 				e.state = myState;
 				m_events.push_back(e);
 			}else{
@@ -405,6 +417,24 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		}
 		break;
 	}
+	case MSG_APPEARANCE:{
+		MsgAppearance m;
+		if(ReadAppearance(r, m)){
+			// store it on the remote (own id still flows through so the game layer
+			// can confirm/apply its own restored look)
+			if(m.playerId != m_myId){
+				NetRemotePlayer& rp = remotes[(uint8_t)m.playerId];
+				rp.appearance = m;
+				rp.haveAppearance = true;
+			}
+			Event e;
+			e.type = EV_APPEARANCE;
+			e.id = (uint8_t)m.playerId;
+			e.appearance = m;
+			m_events.push_back(e);
+		}
+		break;
+	}
 	case MSG_PICKUP_SPAWN:{
 		MsgPickup pk;
 		if(ReadPickup(r, pk)){
@@ -419,6 +449,14 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			e.state.zMm = QuantPos(pk.z);
 			m_events.push_back(e);
 		}
+		break;
+	}
+	case MSG_RCON_OK:{
+		// the auth packet is answered on the reliable channel before any command
+		// we send afterwards, so this flips the admin panel to "logged in"
+		Event e;
+		e.type = EV_RCON_OK;
+		m_events.push_back(e);
 		break;
 	}
 	case MSG_RCON_RESP:{
@@ -449,6 +487,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			fflush(stderr);
 			Event e;
 			e.type = EV_VEH_SPAWN;
+			e.id = vs.ownerId;
 			e.arg = vs.vehicleId;
 			e.model = vs.modelId;
 			e.state.xMm = QuantPos(vs.x);

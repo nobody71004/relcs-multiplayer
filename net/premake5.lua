@@ -5,6 +5,9 @@ workspace "reLCS-net"
 	configurations { "Debug", "Release" }
 	architecture "x86_64"
 	location "build"
+	-- the machine's installed Visual Studio toolset (VS 2022 BuildTools, v143);
+	-- premake's vs2019 action otherwise pins v142, which is not installed here
+	toolset "v143"
 	targetdir "bin/%{cfg.buildcfg}"
 	defines { "NOMINMAX", "WIN32_LEAN_AND_MEAN", "ENET_STATIC", "_CRT_SECURE_NO_WARNINGS" }
 	rtti "Off"

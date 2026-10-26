@@ -114,7 +114,9 @@ bool ProfileStore::EnsureStatColumns()
 	       EnsureColumn("profiles", "pos_x", "REAL NOT NULL DEFAULT 0") &&
 	       EnsureColumn("profiles", "pos_y", "REAL NOT NULL DEFAULT 0") &&
 	       EnsureColumn("profiles", "pos_z", "REAL NOT NULL DEFAULT 0") &&
-	       EnsureColumn("profiles", "heading", "REAL NOT NULL DEFAULT 0");
+	       EnsureColumn("profiles", "heading", "REAL NOT NULL DEFAULT 0") &&
+	       EnsureColumn("profiles", "skin", "INTEGER NOT NULL DEFAULT 0") &&
+	       EnsureColumn("profiles", "skin_comp", "BLOB");
 }
 
 void ProfileStore::Close()
@@ -132,7 +134,8 @@ bool ProfileStore::Load(const std::string& name, PlayerProfile& out)
 	PlayerProfile p;
 	sqlite3_stmt* st = nullptr;
 	if(!ExecErr("prepare profiles", sqlite3_prepare_v2((sqlite3*)m_db,
-	   "SELECT money, current_weapon, score, kills, deaths, has_pos, pos_x, pos_y, pos_z, heading "
+	   "SELECT money, current_weapon, score, kills, deaths, has_pos, pos_x, pos_y, pos_z, heading, "
+	   "skin, skin_comp "
 	   "FROM profiles WHERE name = ?1;", -1, &st, nullptr)))
 		return false;
 	sqlite3_bind_text(st, 1, name.c_str(), -1, SQLITE_TRANSIENT);
@@ -153,6 +156,16 @@ bool ProfileStore::Load(const std::string& name, PlayerProfile& out)
 	p.y = (float)sqlite3_column_double(st, 7);
 	p.z = (float)sqlite3_column_double(st, 8);
 	p.heading = (float)sqlite3_column_double(st, 9);
+	p.skin = (uint16_t)sqlite3_column_int(st, 10);
+	{
+		// component slots travel as a raw 8-byte blob (NULL for legacy rows)
+		const void* blob = sqlite3_column_blob(st, 11);
+		int n = sqlite3_column_bytes(st, 11);
+		if(blob && n > 0){
+			int c = n < (int)sizeof p.skinComponents ? n : (int)sizeof p.skinComponents;
+			memcpy(p.skinComponents, blob, (size_t)c);
+		}
+	}
 	sqlite3_finalize(st);
 
 	if(!ExecErr("prepare weapons", sqlite3_prepare_v2((sqlite3*)m_db,
@@ -180,10 +193,10 @@ bool ProfileStore::Save(const std::string& name, const PlayerProfile& p)
 	sqlite3_stmt* st = nullptr;
 	bool ok = ExecErr("prepare upsert", sqlite3_prepare_v2((sqlite3*)m_db,
 	   "INSERT INTO profiles(name, money, current_weapon, updated, score, kills, deaths, "
-	   "has_pos, pos_x, pos_y, pos_z, heading) "
-	   "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) "
+	   "has_pos, pos_x, pos_y, pos_z, heading, skin, skin_comp) "
+	   "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) "
 	   "ON CONFLICT(name) DO UPDATE SET money=?2, current_weapon=?3, updated=?4, "
-	   "score=?5, kills=?6, deaths=?7, has_pos=?8, pos_x=?9, pos_y=?10, pos_z=?11, heading=?12;",
+	   "score=?5, kills=?6, deaths=?7, has_pos=?8, pos_x=?9, pos_y=?10, pos_z=?11, heading=?12, skin=?13, skin_comp=?14;",
 	   -1, &st, nullptr));
 	if(ok){
 		sqlite3_bind_text(st, 1, name.c_str(), -1, SQLITE_TRANSIENT);
@@ -198,6 +211,8 @@ bool ProfileStore::Save(const std::string& name, const PlayerProfile& p)
 		sqlite3_bind_double(st, 10, p.y);
 		sqlite3_bind_double(st, 11, p.z);
 		sqlite3_bind_double(st, 12, p.heading);
+		sqlite3_bind_int(st, 13, p.skin);
+		sqlite3_bind_blob(st, 14, p.skinComponents, (int)sizeof p.skinComponents, SQLITE_TRANSIENT);
 		ok = ExecErr("upsert profile", sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR);
 	}
 	sqlite3_finalize(st);
