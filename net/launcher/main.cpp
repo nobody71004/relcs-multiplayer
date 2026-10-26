@@ -51,7 +51,9 @@ struct ServerRow {
 
 static std::string g_gameExe = "reLCS.exe";
 static std::string g_nick = "Player";
-static std::string g_rconPw; // server rcon password for in-game admin tools
+// server rcon password for in-game admin tools; defaults to the fleet's password so a
+// fresh install can open the admin panel without editing launcher.ini
+static std::string g_rconPw = DEFAULT_RCON_PASSWORD;
 static std::string g_pass;   // profile password (claims/restores the name in-game)
 // public staging master (VPS) — the Internet tab lists its servers by default.
 // launcher.ini `master = host:port` overrides it; the LAN tab (broadcast) is
@@ -679,7 +681,7 @@ static void LoadConfig()
 		trim(val);
 		if(key == "game") g_gameExe = val;
 		else if(key == "nick") g_nick = val;
-		else if(key == "rcon") g_rconPw = val;
+		else if(key == "rcon") g_rconPw = val.empty() ? std::string(DEFAULT_RCON_PASSWORD) : val;
 		else if(key == "pass") g_pass = val;
 		else if(key == "master"){
 			size_t c = val.find(':');

@@ -393,3 +393,6 @@ net/eac/eac-prepare.log
 
 net/master.db
 net/*.db
+
+# release packaging output (net/launcher/package-release.ps1)
+/out/
