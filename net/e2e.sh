@@ -128,6 +128,18 @@ echo "server: joins=$JOINS leaves=$LEAVES kills=$KILLS veh_spawns=$VEHS"
 [ "$KILLS" -ge 1 ] || { echo "FAIL: expected >=1 kill"; FAIL=1; }
 [ "$VEHS" -ge 1 ] || { echo "FAIL: expected >=1 vehicle spawn"; FAIL=1; }
 
+# vehicle-sync integrity: no bot may observe a duplicated vehicle entity, and no
+# bot may be force-seated into a car it never entered (the two symptoms of the
+# bug). Every bot prints a VEHSUMMARY line with these counters.
+for f in alice bob charlie driver; do
+	S=$(grep "\[BOT\] VEHSUMMARY" "$OUT/$f.log" | tail -1)
+	DUP=$(echo "$S" | sed -n 's/.*dup_spawns=\([0-9]*\).*/\1/p')
+	FORCED=$(echo "$S" | sed -n 's/.*forced_self_enters=\([0-9]*\).*/\1/p')
+	echo "veh-integrity $f: ${S#*VEHSUMMARY }"
+	[ "${DUP:-1}" = "0" ] || { echo "FAIL: $f observed $DUP duplicate vehicle spawn(s)"; FAIL=1; }
+	[ "${FORCED:-1}" = "0" ] || { echo "FAIL: $f force-seated into $FORCED car(s) it never entered"; FAIL=1; }
+done
+
 # Time-aligned convergence with snapshot-age awareness: every SEES sample
 # carries the age of the relayed snapshot, so the allowed drift is bounded by
 # how far the target itself travelled during that stale window. Windows that
@@ -213,6 +225,71 @@ END {
 	printf "convergence OK (%d samples, %d stale-jump skipped, worst %.2f m = %.0f%% of tolerance)\n", n, rej, worst, worstratio * 100
 	exit 0
 }' "$OUT"/alice.log "$OUT"/bob.log "$OUT"/charlie.log "$OUT"/driver.log || FAIL=1
+
+# ---------------------------------------------------------------- phase 1b
+# Vehicle enter-and-drive single-entity + occupancy test. Three bots each drive
+# their OWN car concurrently while observing the others. Correct behavior:
+#   * every bot sees exactly ONE entity per real car (no duplicate spawn),
+#   * each driver's own car converges on the observers (driver-authoritative
+#     movement replication),
+#   * occupancy stays scoped to the entering player (no bot is ever force-seated
+#     into a car it did not enter).
+step "phase 1b: vehicle enter-and-drive (single entity + scoped occupancy)"
+VBOTS=()
+VBOTS+=($(spawn_bot "$OUT/vdrv1.log" $BIN/relcs-netbot.exe -name VDrv1 -server 127.0.0.1:$PORT -scenario drive -duration 30 -vehmodel 130 -seed 101))
+VBOTS+=($(spawn_bot "$OUT/vdrv2.log" $BIN/relcs-netbot.exe -name VDrv2 -server 127.0.0.1:$PORT -scenario drive -duration 30 -vehmodel 131 -seed 202))
+VBOTS+=($(spawn_bot "$OUT/vdrv3.log" $BIN/relcs-netbot.exe -name VDrv3 -server 127.0.0.1:$PORT -scenario drive -duration 30 -vehmodel 132 -seed 303))
+for f in vdrv1 vdrv2 vdrv3; do
+	wait_result "$OUT/$f.log" 45 || FAIL=1
+done
+for pid in "${VBOTS[@]}"; do
+	[ "$pid" != "-1" ] && wait $pid 2>/dev/null
+done
+sleep 1
+
+for f in vdrv1 vdrv2 vdrv3; do
+	RESULT=$(grep -o "RESULT: [A-Z]*" "$OUT/$f.log" | head -1)
+	[ "$RESULT" = "RESULT: PASS" ] && echo "PASS: $f" || { echo "FAIL: $f (${RESULT:-none})"; FAIL=1; }
+	S=$(grep "\[BOT\] VEHSUMMARY" "$OUT/$f.log" | tail -1)
+	echo "veh-integrity $f: ${S#*VEHSUMMARY }"
+	DUP=$(echo "$S" | sed -n 's/.*dup_spawns=\([0-9]*\).*/\1/p')
+	FORCED=$(echo "$S" | sed -n 's/.*forced_self_enters=\([0-9]*\).*/\1/p')
+	MAXLIVE=$(echo "$S" | sed -n 's/.*max_live=\([0-9]*\).*/\1/p')
+	OWN=$(echo "$S" | sed -n 's/.*own_veh=\([0-9]*\).*/\1/p')
+	ENTERS=$(grep -c "VEH_ENTER self" "$OUT/$f.log")
+	[ "${DUP:-1}" = "0" ] || { echo "FAIL: $f observed $DUP duplicate vehicle spawn(s)"; FAIL=1; }
+	[ "${FORCED:-1}" = "0" ] || { echo "FAIL: $f force-seated into $FORCED car(s) it never entered"; FAIL=1; }
+	# three concurrent drivers => each bot should see no more than 3 live cars at
+	# once (one per driver). A duplicated entity pushes this to >=4.
+	[ "${MAXLIVE:-99}" -le 3 ] || { echo "FAIL: $f saw $MAXLIVE live vehicles (expected <=3, one per driver)"; FAIL=1; }
+	# the bot must have actually driven (entered a car in seat 0)
+	[ "${ENTERS:-0}" -ge 1 ] || { echo "FAIL: $f never entered a vehicle"; FAIL=1; }
+done
+
+# server must have spawned exactly one entity per distinct driver-car: with 3
+# drivers cycling enter/exit the count is bounded, and crucially never duplicates
+# the SAME id (checked per-bot above).
+VSPAWN1B=$(grep -c "\[VEH\] spawn id=" "$OUT/server.log")
+echo "server vehicle spawns so far: $VSPAWN1B"
+
+# ---------------------------------------------------------------- phase 1c
+# Late join. One bot takes a car and keeps driving; a second bot joins well
+# afterwards and must still be told about the world that already exists: the
+# spawned player, the vehicle, who sits in it, and its moving state.
+step "phase 1c: late joiner sees an existing driver and car"
+CRUISER=$(spawn_bot "$OUT/cruiser.log" $BIN/relcs-netbot.exe -name Cruiser -server 127.0.0.1:$PORT -scenario cruise -duration 26 -vehmodel 151 -seed 404)
+sleep 9
+LATE=$(spawn_bot "$OUT/late.log" $BIN/relcs-netbot.exe -name LateJoin -server 127.0.0.1:$PORT -scenario roam -expect-world -duration 14 -seed 505)
+wait_result "$OUT/late.log" 30 || FAIL=1
+wait_result "$OUT/cruiser.log" 30 || FAIL=1
+for pid in $CRUISER $LATE; do
+	[ "$pid" != "-1" ] && wait $pid 2>/dev/null
+done
+for f in cruiser late; do
+	RESULT=$(grep -o "RESULT: [A-Z]*" "$OUT/$f.log" | head -1)
+	[ "$RESULT" = "RESULT: PASS" ] && echo "PASS: $f" || { echo "FAIL: $f ($(grep "RESULT:" "$OUT/$f.log" | head -1))"; FAIL=1; }
+done
+echo "late-join: $(grep -o "WORLDSUMMARY.*" "$OUT/late.log" | tail -1)"
 
 # ---------------------------------------------------------------- phase 2
 step "phase 2: LAN discovery"

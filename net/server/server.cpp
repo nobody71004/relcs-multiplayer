@@ -536,6 +536,22 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			CopyStr(j.name, sizeof j.name, other.name.c_str());
 			WritePlayerJoin(w2, j);
 			SendTo(peer, w2, CHAN_RELIABLE, true);
+			// already in the world: the newcomer missed their MSG_SPAWN, so
+			// replay it from the last accepted state (ahead of the vehicle
+			// snapshot below, so occupants have a body to seat)
+			if(other.spawned && other.alive){
+				BitWriter ws;
+				BeginMsg(ws, MSG_SPAWN);
+				MsgSpawn sp;
+				sp.playerId = other.id; sp.skinModel = other.skin;
+				sp.x = DequantPos(other.state.xMm);
+				sp.y = DequantPos(other.state.yMm);
+				sp.z = DequantPos(other.state.zMm);
+				sp.heading = DequantAngle(other.state.heading);
+				sp.health = other.health; sp.armour = other.armour;
+				WriteSpawn(ws, sp);
+				SendTo(peer, ws, CHAN_RELIABLE, true);
+			}
 		}
 	}
 
@@ -739,6 +755,10 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	// frames every tick (a 20 Hz rubber-band oscillation — seen as alternating
 	// positions in the violation log)
 	if(!(flags & (VAL_TOO_FAST | VAL_TELEPORT))){
+		// occupancy is server-side truth (HandleVehEnter/Exit): relay that, not
+		// the client's claim, so remotes can reconcile seating from any state
+		st.vehicleId = p->state.vehicleId;
+		st.seat = p->state.seat;
 		p->state = st;
 		p->lastStateTime = t;
 	}
@@ -758,9 +778,16 @@ void Server::HandleVehicleState(ServerPlayer* p, BitReader& r)
 	if(dt > 0.5f) dt = 0.5f;
 
 	if(v->lastStateTime > 0.0 && (ValidateVehicleMove(v->state, st, dt) & VAL_TELEPORT)){
-		// don't relay teleports; client will get corrected visually by its own physics
-		return;
+		// don't relay a one-off teleport. A driver that keeps reporting the new
+		// place really is there (warp, respawn in car): adopt it as the reference
+		// after a few drops — never adopting froze the car for everyone forever
+		if(++v->teleportDrops <= 5)
+			return;
+		Log("[VEHSYNC] veh=%d relocated by driver %d to (%.1f, %.1f, %.1f)",
+		    (int)v->id, (int)p->id, st.xMm / 1000.0f, st.yMm / 1000.0f, st.zMm / 1000.0f);
 	}
+	v->teleportDrops = 0;
+	st.modelId = v->modelId;   // the server's record, not the client's claim
 	v->state = st;
 	v->lastStateTime = t;
 
@@ -1028,7 +1055,9 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	uint16_t vid = m.vehicleId;
 
 	if(vid == 0xFFFF){
-		// allocate a new vehicle at the player's position
+		// allocate a new vehicle at the player's position. The spawn is tagged
+		// with the entering player as owner: that client binds the car it already
+		// has locally instead of materializing a duplicate puppet.
 		v = SpawnVehicle(m.modelId, DequantPos(p->state.xMm), DequantPos(p->state.yMm),
 		                 DequantPos(p->state.zMm), DequantAngle(p->state.heading), false, p->id);
 		if(!v){
@@ -1220,7 +1249,44 @@ void Server::Tick()
 	}
 
 	// (vehicle states are relayed directly in HandleVehicleState — driver-paced
-	//  at 20 Hz, no stale re-broadcasts of parked vehicles)
+	//  at 20 Hz)
+
+	// reconciliation heartbeat, 1 Hz: what the in-range 20 Hz streams never
+	// deliver. Players beyond the stream distance still get a slow position
+	// (no ghost frozen where it left range), and every vehicle's last state
+	// reaches everyone but its driver (a parked car that moved while a client
+	// was out of range or not yet connected ends up in the same place for all).
+	if(t - m_lastReconcile >= 1.0){
+		m_lastReconcile = t;
+		for(int i = 0; i < MAX_PLAYERS; i++){
+			ServerPlayer& p = m_players[i];
+			if(!p.active || !p.spawned || p.lastStateTime <= 0.0) continue;
+			BitWriter w;
+			BeginMsg(w, MSG_PLAYER_STATE);
+			WritePlayerState(w, p.state);
+			for(int j = 0; j < MAX_PLAYERS; j++){
+				if(i == j) continue;
+				ServerPlayer& q = m_players[j];
+				if(!q.active || !q.spawned || !q.peer) continue;
+				if(DistMm(p.state.xMm, p.state.yMm, p.state.zMm,
+				          q.state.xMm, q.state.yMm, q.state.zMm) <= m_cfg.streamDistance)
+					continue;   // already streamed at tick rate above
+				SendTo(q.peer, w, CHAN_STATE, false);
+			}
+		}
+		for(int i = 0; i < MAX_VEHICLES; i++){
+			ServerVehicle& v = m_vehicles[i];
+			if(!v.active) continue;
+			BitWriter w;
+			BeginMsg(w, MSG_VEHICLE_STATE);
+			WriteVehicleState(w, v.state);
+			for(int j = 0; j < MAX_PLAYERS; j++){
+				ServerPlayer& q = m_players[j];
+				if(!q.active || !q.spawned || !q.peer || q.id == v.driverId) continue;
+				SendTo(q.peer, w, CHAN_STATE, false);
+			}
+		}
+	}
 
 	// world clock: +1 game minute every 2 real seconds
 	if(t - m_lastWorldUpdate > 2.0){
@@ -1480,6 +1546,7 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	v->modelId = modelId;
 	v->driverId = 0xFF;
 	v->ownerId = ownerId;
+	v->teleportDrops = 0;
 	for(int s = 0; s < 8; s++) v->occupants[s] = 0xFF;
 	v->state = VehicleState();
 	v->state.vehicleId = v->id;
@@ -1661,6 +1728,13 @@ void Server::RestartGameMode()
 	Log("[GAMEMODE] %s restarted", m_gamemode ? m_gamemode->Name() : "?");
 }
 
+// The net projects build with RTTI off (premake rtti "Off"), so dynamic_cast
+// on a GameMode is undefined behaviour there: identify the mode by name.
+static LibertyCitySurvivorMode* AsSurvivor(GameMode* gm)
+{
+	return (gm && strcmp(gm->Name(), "survivor") == 0) ? static_cast<LibertyCitySurvivorMode*>(gm) : nullptr;
+}
+
 void Server::SetServerVar(const std::string& key, const std::string& value)
 {
 	if(key == "hostname") m_cfg.hostname = value;
@@ -1671,11 +1745,11 @@ void Server::SetServerVar(const std::string& key, const std::string& value)
 	else if(key == "hour") m_cfg.hour = (uint8_t)atoi(value.c_str());
 	else if(key == "minute") m_cfg.minute = (uint8_t)atoi(value.c_str());
 	else if(key == "lcs_scorelimit" && m_gamemode){
-		auto* lcs = dynamic_cast<LibertyCitySurvivorMode*>(m_gamemode);
+		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->scoreLimit = atoi(value.c_str());
 	}
 	else if(key == "lcs_roundtime" && m_gamemode){
-		auto* lcs = dynamic_cast<LibertyCitySurvivorMode*>(m_gamemode);
+		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->roundTime = (float)atof(value.c_str());
 	}
 	else {

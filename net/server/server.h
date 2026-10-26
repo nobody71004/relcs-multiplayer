@@ -48,7 +48,7 @@ struct ServerPlayer {
 	bool spawned = false;
 	bool alive = false;
 	rnet::PlayerState state;         // latest client-reported
-	float lastStateTime = 0.0;
+	double lastStateTime = 0.0;
 	double respawnAt = 0.0;          // server clock seconds
 	// authoritative vitals
 	uint8_t health = 100, armour = 0;
@@ -90,7 +90,8 @@ struct ServerVehicle {
 	uint8_t driverId = 0xFF;
 	uint8_t ownerId = 0xFF;            // player whose enter allocated it (0xFF = static/admin)
 	uint8_t occupants[8];            // seat -> playerId (0xFF = free)
-	float lastStateTime = 0.0;
+	int teleportDrops = 0;           // consecutive driver states dropped as teleports
+	double lastStateTime = 0.0;
 };
 
 class GameMode;
@@ -197,6 +198,7 @@ private:
 	double m_lastNetStats = 0.0;
 	double m_lastWorldUpdate = 0.0;
 	double m_lastPingBroadcast = 0.0;
+	double m_lastReconcile = 0.0;     // 1 Hz out-of-range player + vehicle state heartbeat
 	uint64_t m_totalBytesIn = 0, m_totalBytesOut = 0;
 
 	friend class GameMode;

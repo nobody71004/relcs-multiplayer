@@ -390,3 +390,6 @@ net/bin/**/eos.ini
 net/eac/keys/base_private.key
 net/eac/integrity.log
 net/eac/eac-prepare.log
+
+net/master.db
+net/*.db
