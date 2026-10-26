@@ -58,7 +58,6 @@ Write-Host "   staging : $staging"
 # Every entry is something the launcher or its CEF host loads at startup.
 $required = @(
   @{ n = "reLCS-launcher.exe";        why = "the launcher" },
-  @{ n = "launcher.html";             why = "launcher UI" },
   @{ n = "cefui.dll";                 why = "CEF host (static import)" },
   @{ n = "libcef.dll";                why = "Chromium (imported by cefui.dll)" },
   @{ n = "cefsub.exe";                why = "CEF browser subprocess" },
@@ -106,6 +105,19 @@ $sources = @{}
 foreach ($r in $required) {
   $p = Find-File $r.n @($BuildDir)
   if ($p) { $sources[$r.n] = $p } else { $missing += "$($r.n)  ($($r.why))" }
+}
+
+# launcher.html is UI *source*, not a build output. Taking it from $BuildDir shipped
+# v0.3.3 with a brand-new exe and a week-old page (no Browse button), because the
+# build never refreshes that copy. Always package the repo file, and refresh the
+# build folder so a locally-run launcher shows the same UI.
+$uiSource = Join-Path $repo "net\launcher\launcher.html"
+if (-not (Test-Path -LiteralPath $uiSource)) {
+  $missing += "launcher.html  (launcher UI, expected at $uiSource)"
+} else {
+  $sources["launcher.html"] = (Resolve-Path -LiteralPath $uiSource).Path
+  try { Copy-Item -LiteralPath $uiSource -Destination (Join-Path $BuildDir "launcher.html") -Force }
+  catch { Write-Host "WARN: could not refresh $BuildDir\launcher.html" -ForegroundColor Yellow }
 }
 $redistFound = @{}
 foreach ($n in $redist) {
@@ -163,7 +175,16 @@ if (Test-Path -LiteralPath $licDir) {
   }
 }
 
-# --- 3. never ship key material or local state ----------------------------------
+# --- 3. refuse to ship a stale UI -----------------------------------------------
+# Cheap tripwire for the v0.3.3 bug: the manual game-folder control lives behind this id.
+$stagedUi = Join-Path $staging "launcher.html"
+if (-not (Select-String -LiteralPath $stagedUi -SimpleMatch 'id="btnBrowse"' -Quiet)) {
+  Write-Host "ERROR: staged launcher.html has no manual game-folder (Browse) control." -ForegroundColor Red
+  Write-Host "       That is the stale page from the build folder, not net/launcher/launcher.html." -ForegroundColor Red
+  exit 1
+}
+
+# --- 4. never ship key material or local state ----------------------------------
 $forbidden = @("base_private.key", "launcher.ini", "favorites.ini", "usernames.ini", "eos.ini")
 $leaks = Get-ChildItem -LiteralPath $staging -Recurse -File |
          Where-Object { $forbidden -contains $_.Name }
@@ -173,7 +194,7 @@ if ($leaks) {
   exit 1
 }
 
-# --- 4. package notes -----------------------------------------------------------
+# --- 5. package notes -----------------------------------------------------------
 $files = Get-ChildItem -LiteralPath $staging -Recurse -File
 $totalMb = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 $localeList = ($Locale -join ", ")
@@ -220,7 +241,7 @@ Staging size: $totalMb MB in $($files.Count) files
 "@
 Set-Content -LiteralPath (Join-Path $staging "PACKAGE-README.txt") -Value $notes -Encoding UTF8
 
-# --- 5. zip ---------------------------------------------------------------------
+# --- 6. zip ---------------------------------------------------------------------
 $files = Get-ChildItem -LiteralPath $staging -Recurse -File
 Write-Host ""
 Write-Host ("== staged {0} files, {1} MB" -f $files.Count, $totalMb)
