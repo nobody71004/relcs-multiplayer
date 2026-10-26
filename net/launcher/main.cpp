@@ -12,6 +12,9 @@
 //                    launcher.log, exit
 //      -join <ip:port> : connect flow without GUI (spawns the game directly)
 #include "rnet_protocol.h"
+#include "rnet_eos.h"
+#include "eac.h"
+#include "eos_bootstrap.h"
 #include <enet/enet.h>
 
 #include <windows.h>
@@ -56,6 +59,33 @@ static std::string g_pass;   // profile password (claims/restores the name in-ga
 static std::string g_masterHost = "88.214.59.166";
 static uint16_t g_masterPort = DEFAULT_MASTER_PORT;
 static std::vector<std::string> g_profiles;   // saved usernames (usernames.ini)
+
+// EOS client credentials live in eos.ini next to the launcher (never committed:
+// the dev portal value is per-product and rotating it here needs no rebuild).
+static void ReadEosCredentials(std::string& clientId, std::string& clientSecret)
+{
+	clientId.clear();
+	clientSecret.clear();
+	FILE* f = fopen("eos.ini", "r");
+	if(!f) return;
+	char line[512];
+	while(fgets(line, sizeof line, f)){
+		std::string l = line;
+		size_t hash = l.find_first_of("#;");
+		if(hash != std::string::npos) l.resize(hash);
+		size_t eq = l.find('=');
+		if(eq == std::string::npos) continue;
+		std::string k = l.substr(0, eq), v = l.substr(eq + 1);
+		auto trim = [](std::string& s){
+			while(!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+			while(!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
+		};
+		trim(k); trim(v);
+		if(k == "client_id") clientId = v;
+		else if(k == "client_secret") clientSecret = v;
+	}
+	fclose(f);
+}
 
 static FILE* g_log = nullptr;
 static void Log(const char* fmt, ...)
@@ -937,31 +967,31 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 	size_t slash = exeDir.find_last_of('\\');
 	if(slash != std::string::npos) exeDir.resize(slash);
 
-	std::string cmd = "\"" + exe + "\" -connect " + address + " -nick \"" + g_nick + "\"";
+	std::string gameArgs = "-connect " + address + " -nick \"" + g_nick + "\"";
 	// profile password: claims the name / restores the saved wallet + weapons
 	if(!g_pass.empty())
-		cmd += " -password \"" + g_pass + "\"";
+		gameArgs += " -password \"" + g_pass + "\"";
 	// admin tools (broadcast/give/...) need the server's rcon password in-game
 	if(!g_rconPw.empty())
-		cmd += " -rcon \"" + g_rconPw + "\"";
-	Log("[JOIN] %s  (cwd=%s)", cmd.c_str(), exeDir.c_str());
+		gameArgs += " -rcon \"" + g_rconPw + "\"";
 
-	STARTUPINFOA si;
-	PROCESS_INFORMATION pi;
-	memset(&si, 0, sizeof si);
-	memset(&pi, 0, sizeof pi);
-	si.cb = sizeof si;
-	BOOL ok = CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE,
-	                         0, nullptr, exeDir.c_str(), &si, &pi);
-	if(!ok){
-		char err[128];
-		snprintf(err, sizeof err, "CreateProcess failed (error %lu)", GetLastError());
-		g_lastJoinError = err;
-		Log("[JOIN] %s for %s", err, exe.c_str());
+	// Easy Anti-Cheat: refresh the runtime + product config, then start through
+	// the protected bootstrapper so the game is actually covered by EAC.
+	std::string exeName = exe.substr(exe.find_last_of('\\') == std::string::npos ? 0 : exe.find_last_of('\\') + 1);
+	eac::Status ac;
+	eac::Prepare(exeDir, exeName, ac);
+	Log("[EAC] %s", ac.log.empty() ? "prepare skipped" : ac.log.c_str());
+	if(!ac.lastError.empty()) Log("[EAC] %s", ac.lastError.c_str());
+
+	std::string launchErr;
+	bool protectedLaunch = false;
+	Log("[JOIN] args %s  (cwd=%s)", gameArgs.c_str(), exeDir.c_str());
+	if(!eac::Launch(exeDir, exeName, gameArgs, launchErr, protectedLaunch)){
+		g_lastJoinError = launchErr;
+		Log("[JOIN] %s for %s", launchErr.c_str(), exe.c_str());
 		return false;
 	}
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
+	Log("[JOIN] started %s", protectedLaunch ? "EAC-protected build (start_protected_game.exe)" : "bare game (EAC bootstrapper missing)");
 	return true;
 }
 
@@ -1063,7 +1093,50 @@ static void HandleQuery(const char* request, void*)
 
 	Log("[CEF] query: %s", request);
 
-	if(cmd == "loaded"){
+	if(cmd == "eosstatus"){
+		Reply("{\"reply\":\"eosstatus\",\"eos\":" + eosboot::Json() + "}");
+	}else if(cmd == "eacstatus"){
+		std::string how2, gErr2;
+		bool dataOk2 = false;
+		std::string game = DetectGameExe(how2, dataOk2, gErr2);
+		std::string dir = game;
+		size_t s2 = dir.find_last_of('\\');
+		std::string name = "reLCS.exe";
+		if(s2 != std::string::npos){ name = dir.substr(s2 + 1); dir.resize(s2); }
+		eac::Status ac;
+		if(!dir.empty()) eac::Prepare(dir, name, ac);
+		std::string js = "{\"reply\":\"eacstatus\",\"ok\":" + std::string(ac.runtimeInstalled && ac.configWritten ? "true" : "false") +
+		                 ",\"runtime\":" + std::string(ac.runtimeInstalled ? "true" : "false") +
+		                 ",\"config\":" + std::string(ac.configWritten ? "true" : "false") +
+		                 ",\"integrity\":" + std::string(ac.integrityBuilt ? "true" : "false") +
+		                 ",\"version\":\"" + Jesc(ac.version) + "\"" +
+		                 ",\"error\":\"" + Jesc(ac.lastError.empty() ? gErr2 : ac.lastError) + "\"" +
+		                 ",\"log\":\"" + Jesc(ac.log) + "\"}";
+		Reply(js);
+	}else if(cmd == "eacinstall"){
+		std::string how3, gErr3;
+		bool dataOk3 = false;
+		std::string game = DetectGameExe(how3, dataOk3, gErr3);
+		std::string dir = game;
+		size_t s3 = dir.find_last_of('\\');
+		if(s3 != std::string::npos) dir.resize(s3);
+		eac::Status ac;
+		bool ok = !dir.empty() && eac::InstallService(dir, ac);
+		Reply("{\"reply\":\"eacinstall\",\"ok\":" + std::string(ok ? "true" : "false") +
+		      ",\"error\":\"" + Jesc(ac.lastError) + "\",\"log\":\"" + Jesc(ac.log) + "\"}");
+	}else if(cmd == "eacintegrity"){
+		std::string how4, gErr4;
+		bool dataOk4 = false;
+		std::string game = DetectGameExe(how4, dataOk4, gErr4);
+		std::string dir = game, name = "reLCS.exe";
+		size_t s4 = dir.find_last_of('\\');
+		if(s4 != std::string::npos){ name = dir.substr(s4 + 1); dir.resize(s4); }
+		eac::Status ac;
+		bool ok = !dir.empty() && eac::BuildIntegrity(dir, name, ac);
+		Reply("{\"reply\":\"eacintegrity\",\"ok\":" + std::string(ok ? "true" : "false") +
+		      ",\"signed\":" + std::string(ac.integrityBuilt ? "true" : "false") +
+		      ",\"error\":\"" + Jesc(ac.lastError) + "\",\"log\":\"" + Jesc(ac.log) + "\"}");
+	}else if(cmd == "loaded"){
 		g_loaded = true;
 		std::string how, gErr;
 		bool dataOk = false;
@@ -1497,6 +1570,16 @@ static int SelfTest(bool cefLoaded)
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 {
 	g_log = fopen("launcher.log", "w");
+
+	// Epic Online Services bootstrap: start before any CLI path so -eostest can
+	// observe it; the UI polls eosboot::Json() for the step list.
+	std::string eosClientId, eosClientSecret;
+	ReadEosCredentials(eosClientId, eosClientSecret);
+	eosboot::Start(rnet::EOS_PRODUCT_ID, rnet::EOS_SANDBOX_ID, rnet::EOS_DEPLOYMENT_ID,
+	               eosClientId, eosClientSecret);
+	Log("[EOS] bootstrap started (product=%s, client credentials %s)", rnet::EOS_PRODUCT_ID,
+	    eosClientId.empty() ? "MISSING (see eos.ini.example)" : "loaded");
+
 	LoadConfig();
 	LoadProfiles();
 
@@ -1516,6 +1599,50 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 		}
 	}
 	if(!gameOverride.empty()) g_gameExe = gameOverride;
+
+	// headless EOS bootstrap check (CI/runbook)
+	for(int i = 1; i < __argc; i++){
+		if(std::string(__argv[i]) != "-eostest") continue;
+		for(int t = 0; t < 300; t++){
+			eosboot::Status st = eosboot::Get();
+			if(st.loggedIn || !st.error.empty()) break;
+			Sleep(100);
+		}
+		eosboot::Status st = eosboot::Get();
+		Log("[EOS] sdk=%d platform=%d login=%d version=%s puid=%s steps=%s pending=%s error=%s",
+		    (int)st.sdkLoaded, (int)st.platformReady, (int)st.loggedIn, st.version.c_str(),
+		    st.productUserId.c_str(), st.steps.c_str(), st.pendingStep.c_str(), st.error.c_str());
+		if(g_log) fclose(g_log);
+		return st.loggedIn ? 0 : 1;
+	}
+
+	// headless anti-cheat maintenance (E2E + release prep)
+	for(int i = 1; i < __argc; i++){
+		std::string a = __argv[i];
+		if(a == "-eacinstall" || a == "-eacintegrity"){
+			std::string how, gErr;
+			bool dataOk = false;
+			std::string game = DetectGameExe(how, dataOk, gErr);
+			std::string dir = game, name = "reLCS.exe";
+			size_t s = dir.find_last_of('\\');
+			if(s != std::string::npos){ name = dir.substr(s + 1); dir.resize(s); }
+			if(dir.empty()){
+				Log("[EAC] %s", gErr.c_str());
+				if(g_log) fclose(g_log);
+				return 2;
+			}
+			eac::Status ac;
+			bool prepped = eac::Prepare(dir, name, ac);
+			Log("[EAC] prepare %s: %s", prepped ? "ok" : "failed", ac.log.c_str());
+			bool ok = prepped;
+			if(ok && a == "-eacinstall") ok = eac::InstallService(dir, ac);
+			if(ok && a == "-eacintegrity") ok = eac::BuildIntegrity(dir, name, ac);
+			Log("[EAC] %s %s: %s", a.c_str(), ok ? "ok" : "failed",
+			    ac.lastError.empty() ? ac.log.c_str() : ac.lastError.c_str());
+			if(g_log) fclose(g_log);
+			return ok ? 0 : 1;
+		}
+	}
 
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(2, 2), &wsa);

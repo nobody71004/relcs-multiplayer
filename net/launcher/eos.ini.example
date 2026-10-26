@@ -1,0 +1,13 @@
+# Epic Online Services client credentials (launcher + game).
+#
+# Where to get them:
+#   https://dev.epicgames.com/portal  →  your product  →  Clients  →  Create Client
+#   give the client the product's permissions, then copy:
+#     Client ID       -> client_id
+#     Client Secret   -> client_secret
+#
+# EOS SDK 1.19 refuses EOS_Platform_Create without a client credential pair, so
+# the bootstrap stops at "client-credentials-missing" until this file exists.
+# Copy this file to eos.ini (it is git-ignored — never commit the secret).
+client_id=
+client_secret=

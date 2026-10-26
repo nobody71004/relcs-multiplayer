@@ -381,3 +381,12 @@ profiles.db*
 # --- windows net build outputs ---
 net/bin-win/
 net/obj-win/
+
+# --- EOS client credentials (never commit) ---
+net/launcher/eos.ini
+net/bin/**/eos.ini
+
+# --- EAC signing keys / generated catalogues (never commit the private key) ---
+net/eac/keys/base_private.key
+net/eac/integrity.log
+net/eac/eac-prepare.log

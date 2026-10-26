@@ -115,3 +115,11 @@ project "net-launcher"
 	files { "launcher/*.cpp", "launcher/*.h" }
 	netCommon()
 	links { "advapi32", "comctl32", "shell32", "ole32", "iphlpapi" }
+	-- Epic Online Services: the launcher owns the EOS bootstrap and shows the
+	-- Connect login state; the SDK ships next to the launcher at runtime.
+	includedirs { "../vendor/eos-sdk/include" }
+	libdirs { "../vendor/eos-sdk/lib/Win64" }
+	links { "EOSSDK-Win64-Shipping" }
+	postbuildcommands {
+		'{COPYFILE} "%{wks.location}/../../vendor/eos-sdk/bin/Win64/EOSSDK-Win64-Shipping.dll" "%{cfg.targetdir}/EOSSDK-Win64-Shipping.dll"'
+	}

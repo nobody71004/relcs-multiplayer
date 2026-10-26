@@ -2198,6 +2198,10 @@ static CVector s_lastSentPos(0.0f, 0.0f, 0.0f);
 // --- persistent profile sync: wallet + weapon table -------------------------
 static rnet::MsgInventory s_invLast;
 static bool   s_invHave = false;
+// admin give-money that the server has not echoed back in an inventory snapshot
+// yet. Without this, a snapshot generated before the server accepted our higher
+// wallet reverted the grant a few frames later (the cash never stuck).
+static int32_t s_moneyPending = 0;
 static double s_invLastSend = -100.0;
 static bool   s_invForce = false;     // send on next frame regardless of throttle
 static rnet::MsgInventory s_pendingInv; // restore waiting for the player ped
@@ -2239,12 +2243,25 @@ static bool InvDiffers(const rnet::MsgInventory& a, const rnet::MsgInventory& b)
 	return false;
 }
 
-// apply a server profile restore absolutely: wallet + full weapon table
-static void ApplyInventory(const rnet::MsgInventory& m)
+// apply a server profile restore absolutely: wallet + full weapon table.
+// applyWallet=false is for the game-wipe re-apply, which must rebuild the
+// weapon table only — a stale snapshot must never roll the wallet back.
+static void ApplyInventory(const rnet::MsgInventory& m, bool applyWallet = true)
 {
 	CPlayerPed* me = FindPlayerPed();
 	if(!me) return;
-	CWorld::Players[CWorld::PlayerInFocus].m_nMoney = m.money;
+	if(applyWallet){
+		int32_t wallet = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
+		if(s_moneyPending > 0 && m.money < wallet){
+			// a snapshot that predates our grant: keep the cash, spend the grant
+			int32_t diff = wallet - m.money;
+			s_moneyPending -= diff;
+			if(s_moneyPending < 0) s_moneyPending = 0;
+		}else{
+			if(s_moneyPending > 0) s_moneyPending = 0;   // server caught up
+			CWorld::Players[CWorld::PlayerInFocus].m_nMoney = m.money;
+		}
+	}
 	me->ClearWeapons();
 	int selSlot = 0;
 	for(int i = 0; i < m.count; i++){
@@ -2253,6 +2270,7 @@ static void ApplyInventory(const rnet::MsgInventory& m)
 	}
 	me->SetCurrentWeapon(selSlot);
 	s_invLast = m;
+	s_invLast.money = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
 	s_invHave = true;
 	s_invForce = false;
 	// remember the restore: the game's own spawn pipeline (new-game init,
@@ -2801,12 +2819,32 @@ void NetGame_Frame(void)
 			break;
 		}
 		case NetClient::EV_GIVE:{
+			// Money is wallet state, not ped state: apply it even while dead, in a
+			// menu, or before the player ped exists, otherwise an admin grant sent
+			// during a respawn is silently dropped and the cash never arrives.
+			if(ev.kind == rnet::GIVE_MONEY){
+				CWorld::Players[CWorld::PlayerInFocus].m_nMoney += ev.amount;
+				s_moneyPending += ev.amount;
+				if(s_haveRestore) s_restore.money = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
+				// The state tick re-asserts s_invLast.money over the wallet (the
+				// server's validated economy). Without moving that baseline too,
+				// an admin grant was applied here and then reverted on the very
+				// next tick, so give-money never showed up on the client.
+				if(s_invHave) s_invLast.money = CWorld::Players[CWorld::PlayerInFocus].m_nMoney;
+				s_invForce = true;   // report the new wallet immediately
+				snprintf(s_lastRcon, sizeof s_lastRcon, "give money +%d -> $%d", ev.amount,
+				        (int)CWorld::Players[CWorld::PlayerInFocus].m_nMoney);
+				ConsolePrint("$%d received (wallet $%d)", ev.amount,
+				             (int)CWorld::Players[CWorld::PlayerInFocus].m_nMoney);
+				fprintf(stderr, "[NET] admin give money +%d -> %d\n", ev.amount,
+				        (int)CWorld::Players[CWorld::PlayerInFocus].m_nMoney);
+				fflush(stderr);
+				break;
+			}
 			CPlayerPed* me = FindPlayerPed();
 			if(me){
 				switch(ev.kind){
-				case rnet::GIVE_MONEY:
-					CWorld::Players[CWorld::PlayerInFocus].m_nMoney += ev.amount;
-					break;
+				case rnet::GIVE_MONEY: break;   // handled above
 				case rnet::GIVE_WEAPON:
 					me->SetCurrentWeapon(me->GiveWeapon((eWeaponType)ev.arg, (uint32)ev.amount, true));
 					break;
@@ -3294,7 +3332,7 @@ void NetGame_Frame(void)
 		bool wiped = cur && (cur != s_restorePed || BuildInventory().count == 0);
 		if(wiped){
 			s_restoreReapplies++;
-			ApplyInventory(s_restore);
+			ApplyInventory(s_restore, false);
 			fprintf(stderr, "[NET] restore re-applied after game-side wipe (%d)\n", s_restoreReapplies);
 			fflush(stderr);
 		}

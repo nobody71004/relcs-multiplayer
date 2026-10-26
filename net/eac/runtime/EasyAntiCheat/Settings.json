@@ -1,0 +1,11 @@
+{
+	"title"						: "reLCS",
+	"executable"				: "reLCS.exe",
+	"productid"					: "fb155afe4a754a4b91929491873c844e",
+	"sandboxid"					: "515e78d9d395488faf0a3f63041dbba0",
+	"deploymentid"				: "a287ae738e5241829bdcd1d8a0d3b0bb",
+	"requested_splash"			: "EasyAntiCheat/SplashScreen.png",
+	"wait_for_game_process_exit": "false",
+	"hide_bootstrapper"			: "false",
+	"hide_gui"					: "false"
+}

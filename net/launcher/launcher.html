@@ -311,6 +311,24 @@
           </div>
         </div>
 
+        <div class="panel">
+          <div class="panel-head">Epic Online Services &amp; Easy Anti-Cheat</div>
+          <div class="panel-body">
+            <div class="field">
+              <div class="notice" id="eosState">EOS bootstrap: starting…</div>
+              <div class="help" id="eosSteps">waiting for the SDK</div>
+            </div>
+            <div class="field">
+              <div class="notice" id="eacState">Anti-cheat: not checked yet</div>
+              <div class="help" id="eacHint">Join starts the game through start_protected_game.exe so Easy Anti-Cheat is active.</div>
+            </div>
+            <div class="actions">
+              <button class="btn" id="btnEacInstall">Install anti-cheat service</button>
+              <button class="btn" id="btnEacIntegrity">Sign integrity catalogue</button>
+            </div>
+          </div>
+        </div>
+
         <div class="actions">
           <button class="btn primary" id="btnSaveCfg">Save settings</button>
         </div>
@@ -363,6 +381,13 @@ function showPage(name) {
   document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === name));
   $("pageTitle").textContent = PAGE_TITLES[name] || name;
   if (name === "settings") runDiag();
+}
+
+let securityTimer = null;
+function pollSecurity() {
+  send("eosstatus");
+  send("eacstatus");
+  if (!securityTimer) securityTimer = setInterval(() => { send("eosstatus"); send("eacstatus"); }, 1500);
 }
 
 function setStatus(text, cls) {
@@ -563,6 +588,28 @@ window.onCefReply = function (json) {
       showGameState(msg);
       setStatus("ready · protocol v" + (msg.version || "?"));
       refresh();
+      pollSecurity();
+      break;
+    case "eosstatus": {
+      const e = msg.eos || {};
+      const steps = (e.steps || []).map(s => s.replace(/-/g, " ")).join(" → ");
+      const live = e.ok ? "logged in" : (e.error ? "error" : (e.pending ? e.pending : "starting"));
+      $("eosState").textContent = `EOS ${e.version || ""} · ${live}` + (e.puid ? ` · ${e.puid}` : "");
+      $("eosState").className = "notice " + (e.ok ? "ok" : (e.error ? "err" : ""));
+      $("eosSteps").textContent = (steps || "waiting for the SDK") + (e.error ? " — " + e.error : "");
+      break;
+    }
+    case "eacstatus": {
+      const okAll = msg.ok;
+      $("eacState").textContent = `Easy Anti-Cheat · runtime ${msg.runtime ? "installed" : "missing"} · product config ${msg.config ? "ready" : "missing"} · integrity ${msg.integrity ? "signed" : "unsigned"}`;
+      $("eacState").className = "notice " + (okAll ? "ok" : "warn");
+      $("eacHint").textContent = msg.error ? msg.error : (msg.log || "Join starts the game through start_protected_game.exe.");
+      break;
+    }
+    case "eacinstall":
+    case "eacintegrity":
+      $("eacHint").textContent = (msg.ok ? "done: " : "failed: ") + (msg.error || msg.log || "");
+      pollSecurity();
       break;
     case "game":
       if (msg.ok) $("game").value = msg.path;
@@ -793,6 +840,15 @@ $("nick").addEventListener("keydown", e => {
 });
 
 // tell the host we are ready
+document.getElementById("btnEacInstall").addEventListener("click", () => {
+  $("eacHint").textContent = "installing the EasyAntiCheat service (this can prompt for elevation)…";
+  send("eacinstall");
+});
+document.getElementById("btnEacIntegrity").addEventListener("click", () => {
+  $("eacHint").textContent = "hashing the game directory and signing base.bin…";
+  send("eacintegrity");
+});
+
 send("loaded");
 </script>
 </body>
