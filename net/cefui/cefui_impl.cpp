@@ -518,6 +518,23 @@ void CefUi_CloseBrowser(void)
 
 void CefUi_Shutdown(void)
 {
+	// CefShutdown waits for every browser to close, but the game pumps CEF
+	// messages from its main thread — inside CefShutdown that pump stops, so
+	// the wait never completes and the window freezes on its last frame.
+	// Close the browser and pump until OnBeforeClose clears it first.
+	if(g_browser){
+		g_browser->GetHost()->CloseBrowser(true);
+		for(int i = 0; i < 400 && g_browser; i++){
+			CefDoMessageLoopWork();
+			Sleep(5);
+		}
+	}
+	if(g_browser){
+		// Never reached the closed state. Leave CEF (and its DLL) alive: a
+		// stuck CefShutdown would hang the process, and the game is exiting
+		// anyway — the OS reclaims the threads.
+		return;
+	}
 	g_client = nullptr;
 	CefShutdown();
 	g_app = nullptr;

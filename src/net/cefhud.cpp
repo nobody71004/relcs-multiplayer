@@ -212,10 +212,15 @@ void CefHud_Shutdown(void)
 {
 	// idempotent: NetGame_Shutdown may run after Terinate3D already released
 	// the RW-side texture, and a crash handler may call us a second time
-	if(!s_dll && !s_texture) return;
+	static bool s_shut = false;
+	if(s_shut) return;
+	s_shut = true;
 	if(s_ready && p_shutdown) p_shutdown();
 	CefHud_DestroyTexture();
-	if(s_dll){ FreeLibrary(s_dll); s_dll = nullptr; }
+	// Deliberately keep cefui.dll loaded. CEF's helper threads outlive
+	// CefShutdown and a late callback into unloaded code was crashing on exit
+	// (WER: cefui.dll_unloaded, 0xc0000005). The module is only ever needed
+	// until the process ends, so unloading it buys nothing.
 	s_ready = false;
 	s_focused = false;
 }
