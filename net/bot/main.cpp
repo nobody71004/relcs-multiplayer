@@ -212,7 +212,7 @@ int main(int argc, char** argv)
 	bool gotChatExpect = cfg.expectChat.empty();
 	bool sawPeer = false, sawDeath = false, sawScore = false, rconOk = cfg.rconPassword.empty();
 	bool rconCmdOk = cfg.rconPassword.empty();
-	uint8_t selfId = 0;
+	rnet::PlayerId selfId = 0;
 	int statesSent = 0, correctionsReceived = 0, deathsSelf = 0, spawnsSeen = 0;
 	int killsMade = 0, myScore = 0; // fight scenario: kills dealt + latest scoreboard score
 	int vehStatesSeen = 0, vehEntersSeen = 0; // relayed traffic from other drivers
@@ -221,7 +221,7 @@ int main(int argc, char** argv)
 	bool vehMoved = false;     // some relayed vehicle changed position while we watched
 	std::map<uint16_t, VehicleState> vehFirst;   // first relayed state per vehicle
 	std::string failReasons;
-	std::map<uint8_t, PeerView> peers;
+	std::map<rnet::PlayerId, PeerView> peers;
 	PlayerState self;
 	self.health = 100;
 	bool alive = false;
@@ -260,7 +260,7 @@ int main(int argc, char** argv)
 	int unexpectedSelfEnters = 0;
 	// how many DISTINCT other players we saw seated via VEH_ENTER (not us). Used to
 	// confirm occupancy stays scoped to the player who actually entered.
-	std::map<uint8_t, uint16_t> otherOccupant;     // playerId -> vehicleId they entered
+	std::map<rnet::PlayerId, uint16_t> otherOccupant; // playerId -> vehicleId they entered
 
 	// proximity voice (-voice): tone frames out, relayed frames in
 	double lastVoice = 0.0;
@@ -268,7 +268,7 @@ int main(int argc, char** argv)
 	float voicePhase = 0.0f;
 	rnet::VoiceEncoder voiceEnc;
 	struct Heard { int frames = 0; float maxDist = 0.0f; };
-	std::map<uint8_t, Heard> heard;
+	std::map<rnet::PlayerId, Heard> heard;
 
 	auto elapsed = [&]{ return NowSec() - t0; };
 
@@ -432,6 +432,42 @@ int main(int argc, char** argv)
 					}
 					break;
 				}
+				case MSG_STATE_BATCH:{
+					// several states per packet: identical semantics to the single
+					// state message, one read loop per record
+					PlayerState states[MAX_STATES_PER_PACKET];
+					int n = ReadStateBatch(r, states, MAX_STATES_PER_PACKET);
+					for(int i = 0; i < n; i++){
+						const PlayerState& st = states[i];
+						if(st.playerId == selfId) continue;
+						PeerView& pv = peers[st.playerId];
+						pv.state = st;
+						pv.lastSeen = elapsed();
+						sawPeer = true;
+						if(st.vehicleId != VEHICLE_NONE && st.vehicleId != VEHICLE_UNSYNCED)
+							peerSeatedStates++;
+					}
+					break;
+				}
+				case MSG_ROSTER:{
+					MsgRosterEntry es[MAX_ROSTER_PER_PACKET];
+					int n = ReadRoster(r, es, MAX_ROSTER_PER_PACKET);
+					for(int i = 0; i < n; i++){
+						if(es[i].id == selfId) continue;
+						PeerView& pv = peers[es[i].id];
+						pv.state.playerId = es[i].id;
+						if(es[i].flags & ROSTER_SPAWNED){
+							pv.state.xMm = es[i].xMm;
+							pv.state.yMm = es[i].yMm;
+							pv.state.zMm = es[i].zMm;
+							pv.state.heading = es[i].heading;
+							pv.lastSeen = elapsed();
+							sawPeer = true;
+							otherSpawnsSeen++;
+						}
+					}
+					break;
+				}
 				case MSG_CHAT:{
 					MsgChat c;
 					if(ReadChat(r, c)){
@@ -527,7 +563,7 @@ int main(int argc, char** argv)
 					break;
 				}
 				case MSG_PLAYER_QUIT:{
-					uint8_t id = r.ReadU8();
+					rnet::PlayerId id = r.ReadU16();
 					peers.erase(id);
 					break;
 				}
@@ -642,7 +678,7 @@ int main(int argc, char** argv)
 					break;
 				}
 				case MSG_VOICE:{
-					uint8_t from = 0;
+					rnet::PlayerId from = 0;
 					uint8_t packet[VOICE_MAX_PACKET];
 					uint8_t len = 0;
 					if(cfg.voice && ReadVoice(r, from, packet, len) && r.BitsLeft() == 0 && from != selfId){

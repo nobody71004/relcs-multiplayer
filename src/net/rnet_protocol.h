@@ -124,6 +124,177 @@ inline bool ReadVehicleState(BitReader& r, VehicleState& s)
 }
 
 // ---------------------------------------------------------------------------
+// Relayed state delivery (MSG_STATE_BATCH)
+//
+// A remote player's puppet consumes far less than a full PlayerState: where it
+// is, which way it faces, roughly how fast it moves (walk/run anim), its health
+// and its vehicle seat. Those are relayed every tick; the rest (pitch, anim
+// ids, weapon, ammo, wallet, armour, the velocity vector) stays on
+// MSG_PLAYER_STATE.
+//
+// Positions are centimetre offsets from an anchor the packet carries — the
+// receiver's own position — so a 200 m AOI fits signed 16-bit fields. A record
+// more than ~327 m outside the anchor could not; it then carries absolute mm
+// (RELAY_ABS_POS) instead, which keeps the format correct for any configured
+// stream distance and costs the extra 48 bits only on that rare record.
+//
+// Both codecs are bounded by the compiling constant, never by a wire-supplied
+// length: a peer cannot make the reader write past the caller's array.
+// ---------------------------------------------------------------------------
+constexpr uint8_t RELAY_TELEPORT     = 1;   // MOVEFLAG_TELEPORT
+constexpr uint8_t RELAY_INVEHICLE    = 2;   // vehicleId/seat follow the record
+constexpr uint8_t RELAY_ABS_POS      = 4;   // absolute mm instead of cm offsets
+constexpr int     RELAY_MAX_DELTA_CM = 32767;
+constexpr int     RELAY_ANCHOR_BITS  = 16 + 96;   // count + anchor x/y/z in mm
+
+inline bool RelayDeltaCm(int32_t mm, int32_t anchorMm, int16_t& out)
+{
+	int64_t d = (int64_t)mm - (int64_t)anchorMm;
+	// nearest centimetre; halves away from zero
+	int64_t cm = d >= 0 ? (d + 5) / 10 : (d - 5) / 10;
+	if(cm > RELAY_MAX_DELTA_CM || cm < -RELAY_MAX_DELTA_CM) return false;
+	out = (int16_t)cm;
+	return true;
+}
+
+inline bool RelayPosIsDelta(const PlayerState& s, int32_t ax, int32_t ay, int32_t az)
+{
+	int16_t d;
+	return RelayDeltaCm(s.xMm, ax, d) && RelayDeltaCm(s.yMm, ay, d) &&
+	       RelayDeltaCm(s.zMm, az, d);
+}
+
+// Encoded size of one record. The server sizes packets with this before
+// writing them, so the split and the codec cannot disagree about a record.
+inline int RelayEntryBits(const PlayerState& s, int32_t ax, int32_t ay, int32_t az)
+{
+	int bits = 12 + 4 + 8 + 8 + 7;                    // id, flags, heading, speed, health
+	bits += RelayPosIsDelta(s, ax, ay, az) ? 48 : 96;
+	if(s.vehicleId != VEHICLE_NONE) bits += 16 + 3;   // vehicleId, seat
+	return bits;
+}
+
+inline void WriteRelayState(BitWriter& w, const PlayerState& s,
+                            int32_t ax, int32_t ay, int32_t az)
+{
+	int16_t dx = 0, dy = 0, dz = 0;
+	// bitwise & so all three offsets are decoded, not just up to the first
+	// one that overflows the delta range
+	bool delta = RelayDeltaCm(s.xMm, ax, dx) & RelayDeltaCm(s.yMm, ay, dy) &
+	             RelayDeltaCm(s.zMm, az, dz);
+	uint8_t flags = 0;
+	if(s.moveFlags & MOVEFLAG_TELEPORT) flags |= RELAY_TELEPORT;
+	if(s.vehicleId != VEHICLE_NONE)     flags |= RELAY_INVEHICLE;
+	if(!delta)                          flags |= RELAY_ABS_POS;
+
+	w.WriteBits((uint32_t)s.playerId & 0x0FFF, 12);
+	w.WriteBits(flags, 4);
+	if(delta){
+		w.WriteI16(dx); w.WriteI16(dy); w.WriteI16(dz);
+	}else{
+		w.WriteI32(s.xMm); w.WriteI32(s.yMm); w.WriteI32(s.zMm);
+	}
+	w.WriteBits((uint32_t)((uint16_t)s.heading >> 8), 8);   // 1.4 deg steps
+	// horizontal speed in 0.2 m/s steps; the direction is not relayed because
+	// a puppet only uses the magnitude, to pick idle/walk/run
+	float vx = DequantVel(s.velX), vy = DequantVel(s.velY);
+	long spd = std::lround(std::sqrt(vx * vx + vy * vy) * 5.0f);
+	if(spd < 0) spd = 0;
+	if(spd > 255) spd = 255;
+	w.WriteBits((uint32_t)spd, 8);
+	w.WriteBits(s.health > 127 ? 127u : (uint32_t)s.health, 7);
+	if(flags & RELAY_INVEHICLE){
+		w.WriteU16(s.vehicleId);
+		w.WriteBits(s.seat == 0xFF ? 7u : (uint32_t)(s.seat & 7), 3);
+	}
+}
+
+inline bool ReadRelayState(BitReader& r, int32_t ax, int32_t ay, int32_t az, PlayerState& s)
+{
+	s = PlayerState{};      // relay records are sparse, not full snapshots
+	s.playerId = (PlayerId)r.ReadBits(12);
+	uint32_t flags = r.ReadBits(4);
+	if(flags & RELAY_ABS_POS){
+		s.xMm = r.ReadI32(); s.yMm = r.ReadI32(); s.zMm = r.ReadI32();
+	}else{
+		s.xMm = ax + (int32_t)r.ReadI16() * 10;
+		s.yMm = ay + (int32_t)r.ReadI16() * 10;
+		s.zMm = az + (int32_t)r.ReadI16() * 10;
+	}
+	s.heading = (int16_t)(r.ReadBits(8) << 8);
+	// no velocity vector on the wire: keep the horizontal speed in velX (dm/s),
+	// the form every puppet's anim-speed test already reads
+	s.velX = (int16_t)(r.ReadBits(8) * 2);
+	s.health = (uint8_t)r.ReadBits(7);
+	if(flags & RELAY_TELEPORT) s.moveFlags = MOVEFLAG_TELEPORT;
+	if(flags & RELAY_INVEHICLE){
+		s.vehicleId = r.ReadU16();
+		uint32_t seat = r.ReadBits(3);
+		s.seat = seat == 7 ? 0xFF : (uint8_t)seat;
+	}
+	return r.Ok();
+}
+
+inline void WriteStateBatch(BitWriter& w, const PlayerState* states, int count,
+                            int32_t ax, int32_t ay, int32_t az)
+{
+	int n = count;
+	if(n < 0) n = 0;
+	if(n > MAX_STATES_PER_PACKET) n = MAX_STATES_PER_PACKET;
+	w.WriteU16((uint16_t)n);
+	w.WriteI32(ax); w.WriteI32(ay); w.WriteI32(az);
+	for(int i = 0; i < n; i++) WriteRelayState(w, states[i], ax, ay, az);
+}
+
+// count written to `out` (cap entries), or -1 when the frame is malformed.
+inline int ReadStateBatch(BitReader& r, PlayerState* out, int cap)
+{
+	uint16_t n = r.ReadU16();
+	if(!r.Ok() || n > MAX_STATES_PER_PACKET || (int)n > cap) return -1;
+	int32_t ax = r.ReadI32(), ay = r.ReadI32(), az = r.ReadI32();
+	if(!r.Ok()) return -1;
+	for(uint16_t i = 0; i < n; i++){
+		if(!ReadRelayState(r, ax, ay, az, out[i])) return -1;
+	}
+	return (int)n;
+}
+
+inline void WriteRoster(BitWriter& w, const MsgRosterEntry* entries, int count)
+{
+	int n = count;
+	if(n < 0) n = 0;
+	if(n > MAX_ROSTER_PER_PACKET) n = MAX_ROSTER_PER_PACKET;
+	w.WriteU16((uint16_t)n);
+	for(int i = 0; i < n; i++){
+		const MsgRosterEntry& e = entries[i];
+		w.WriteU16(e.id); w.WriteU16(e.skin); w.WriteU8(e.flags);
+		w.WriteU8(e.health); w.WriteU8(e.armour);
+		w.WriteI32(e.xMm); w.WriteI32(e.yMm); w.WriteI32(e.zMm);
+		w.WriteI16(e.heading);
+		w.WriteString(e.name, MAX_NAME_LEN - 1);
+	}
+}
+
+// count written to `out` (cap entries), or -1 when the frame is malformed.
+inline int ReadRoster(BitReader& r, MsgRosterEntry* out, int cap)
+{
+	uint16_t n = r.ReadU16();
+	if(!r.Ok() || n > MAX_ROSTER_PER_PACKET || (int)n > cap) return -1;
+	for(uint16_t i = 0; i < n; i++){
+		MsgRosterEntry& e = out[i];
+		e = MsgRosterEntry();
+		e.id = r.ReadU16(); e.skin = r.ReadU16(); e.flags = r.ReadU8();
+		e.health = r.ReadU8(); e.armour = r.ReadU8();
+		e.xMm = r.ReadI32(); e.yMm = r.ReadI32(); e.zMm = r.ReadI32();
+		e.heading = r.ReadI16();
+		std::string nm = r.ReadString(MAX_NAME_LEN - 1);
+		CopyStr(e.name, sizeof e.name, nm.c_str());
+		if(!r.Ok()) return -1;
+	}
+	return (int)n;
+}
+
+// ---------------------------------------------------------------------------
 // Small message codecs
 // ---------------------------------------------------------------------------
 inline void WriteHello(BitWriter& w, const MsgHello& m)
@@ -144,17 +315,17 @@ inline bool ReadHello(BitReader& r, MsgHello& m)
 
 inline void WriteWelcome(BitWriter& w, const MsgWelcome& m)
 {
-	w.WriteU8(m.playerId); w.WriteU16(m.tickRate); w.WriteF32(m.streamDistance);
+	w.WriteU16(m.playerId); w.WriteU16(m.tickRate); w.WriteF32(m.streamDistance);
 	w.WriteU8(m.hour); w.WriteU8(m.minute); w.WriteU8(m.weather);
 	w.WriteString(m.gameMode, 31);
 	w.WriteString(m.hostname, MAX_HOSTNAME_LEN - 1);
 	// v5: live server info (launcher tooltip: map, players)
-	w.WriteU8(m.players); w.WriteU8(m.maxPlayers);
+	w.WriteU16(m.players); w.WriteU16(m.maxPlayers);
 	w.WriteString(m.mapName, MAX_MAP_LEN - 1);
 }
 inline bool ReadWelcome(BitReader& r, MsgWelcome& m)
 {
-	m.playerId = r.ReadU8(); m.tickRate = r.ReadU16(); m.streamDistance = r.ReadF32();
+	m.playerId = r.ReadU16(); m.tickRate = r.ReadU16(); m.streamDistance = r.ReadF32();
 	m.hour = r.ReadU8(); m.minute = r.ReadU8(); m.weather = r.ReadU8();
 	std::string gm = r.ReadString(31);
 	std::string hn = r.ReadString(MAX_HOSTNAME_LEN - 1);
@@ -164,8 +335,8 @@ inline bool ReadWelcome(BitReader& r, MsgWelcome& m)
 	m.players = m.maxPlayers = 0;
 	m.mapName[0] = 0;
 	if(r.BitsLeft() >= 16 + 16){
-		m.players = r.ReadU8();
-		m.maxPlayers = r.ReadU8();
+		m.players = r.ReadU16();
+		m.maxPlayers = r.ReadU16();
 		if(r.BitsLeft() >= 16){
 			std::string mp = r.ReadString(MAX_MAP_LEN - 1);
 			CopyStr(m.mapName, sizeof m.mapName, mp.c_str());
@@ -176,12 +347,12 @@ inline bool ReadWelcome(BitReader& r, MsgWelcome& m)
 
 inline void WritePlayerJoin(BitWriter& w, const MsgPlayerJoin& m)
 {
-	w.WriteU8(m.playerId); w.WriteU16(m.skinModel);
+	w.WriteU16(m.playerId); w.WriteU16(m.skinModel);
 	w.WriteString(m.name, MAX_NAME_LEN - 1);
 }
 inline bool ReadPlayerJoin(BitReader& r, MsgPlayerJoin& m)
 {
-	m.playerId = r.ReadU8(); m.skinModel = r.ReadU16();
+	m.playerId = r.ReadU16(); m.skinModel = r.ReadU16();
 	std::string n = r.ReadString(MAX_NAME_LEN - 1);
 	CopyStr(m.name, sizeof m.name, n.c_str());
 	return r.Ok();
@@ -189,12 +360,12 @@ inline bool ReadPlayerJoin(BitReader& r, MsgPlayerJoin& m)
 
 inline void WriteChat(BitWriter& w, const MsgChat& m)
 {
-	w.WriteU8(m.fromId);
+	w.WriteU16(m.fromId);
 	w.WriteString(m.text, MAX_CHAT_LEN - 1);
 }
 inline bool ReadChat(BitReader& r, MsgChat& m)
 {
-	m.fromId = r.ReadU8();
+	m.fromId = r.ReadU16();
 	std::string t = r.ReadString(MAX_CHAT_LEN - 1);
 	m.len = (uint16_t)t.size();
 	CopyStr(m.text, sizeof m.text, t.c_str());
@@ -203,13 +374,13 @@ inline bool ReadChat(BitReader& r, MsgChat& m)
 
 inline void WriteSpawn(BitWriter& w, const MsgSpawn& m)
 {
-	w.WriteU8(m.playerId); w.WriteU16(m.skinModel);
+	w.WriteU16(m.playerId); w.WriteU16(m.skinModel);
 	w.WriteF32(m.x); w.WriteF32(m.y); w.WriteF32(m.z); w.WriteF32(m.heading);
 	w.WriteU8(m.health); w.WriteU8(m.armour);
 }
 inline bool ReadSpawn(BitReader& r, MsgSpawn& m)
 {
-	m.playerId = r.ReadU8(); m.skinModel = r.ReadU16();
+	m.playerId = r.ReadU16(); m.skinModel = r.ReadU16();
 	m.x = r.ReadF32(); m.y = r.ReadF32(); m.z = r.ReadF32(); m.heading = r.ReadF32();
 	m.health = r.ReadU8(); m.armour = r.ReadU8();
 	return r.Ok();
@@ -217,32 +388,32 @@ inline bool ReadSpawn(BitReader& r, MsgSpawn& m)
 
 inline void WriteDeath(BitWriter& w, const MsgDeath& m)
 {
-	w.WriteU8(m.victimId); w.WriteU8(m.killerId); w.WriteU8(m.weaponId);
+	w.WriteU16(m.victimId); w.WriteU16(m.killerId); w.WriteU8(m.weaponId);
 }
 inline bool ReadDeath(BitReader& r, MsgDeath& m)
 {
-	m.victimId = r.ReadU8(); m.killerId = r.ReadU8(); m.weaponId = r.ReadU8();
+	m.victimId = r.ReadU16(); m.killerId = r.ReadU16(); m.weaponId = r.ReadU8();
 	return r.Ok();
 }
 
 inline void WriteDamage(BitWriter& w, const MsgDamage& m)
 {
-	w.WriteU8(m.targetId); w.WriteU8(m.attackerId); w.WriteU8(m.weaponId); w.WriteU16(m.damage);
+	w.WriteU16(m.targetId); w.WriteU16(m.attackerId); w.WriteU8(m.weaponId); w.WriteU16(m.damage);
 }
 inline bool ReadDamage(BitReader& r, MsgDamage& m)
 {
-	m.targetId = r.ReadU8(); m.attackerId = r.ReadU8(); m.weaponId = r.ReadU8(); m.damage = r.ReadU16();
+	m.targetId = r.ReadU16(); m.attackerId = r.ReadU16(); m.weaponId = r.ReadU8(); m.damage = r.ReadU16();
 	return r.Ok();
 }
 
 inline void WriteGive(BitWriter& w, const MsgGive& m)
 {
-	w.WriteU8(m.targetId); w.WriteU8(m.kind);
+	w.WriteU16(m.targetId); w.WriteU8(m.kind);
 	w.WriteI32(m.amount); w.WriteU16(m.arg);
 }
 inline bool ReadGive(BitReader& r, MsgGive& m)
 {
-	m.targetId = r.ReadU8(); m.kind = r.ReadU8();
+	m.targetId = r.ReadU16(); m.kind = r.ReadU8();
 	m.amount = r.ReadI32(); m.arg = r.ReadU16();
 	return r.Ok();
 }
@@ -265,28 +436,28 @@ inline bool ReadKick(BitReader& r, MsgKick& m)
 
 inline void WriteVehEnter(BitWriter& w, const MsgVehEnter& m)
 {
-	w.WriteU8(m.playerId); w.WriteU16(m.vehicleId); w.WriteU8(m.seat); w.WriteU16(m.modelId);
+	w.WriteU16(m.playerId); w.WriteU16(m.vehicleId); w.WriteU8(m.seat); w.WriteU16(m.modelId);
 }
 inline bool ReadVehEnter(BitReader& r, MsgVehEnter& m)
 {
-	m.playerId = r.ReadU8(); m.vehicleId = r.ReadU16(); m.seat = r.ReadU8(); m.modelId = r.ReadU16();
+	m.playerId = r.ReadU16(); m.vehicleId = r.ReadU16(); m.seat = r.ReadU8(); m.modelId = r.ReadU16();
 	return r.Ok();
 }
 
-inline void WriteVehExit(BitWriter& w, const MsgVehExit& m) { w.WriteU8(m.playerId); w.WriteU16(m.vehicleId); }
-inline bool ReadVehExit(BitReader& r, MsgVehExit& m) { m.playerId = r.ReadU8(); m.vehicleId = r.ReadU16(); return r.Ok(); }
+inline void WriteVehExit(BitWriter& w, const MsgVehExit& m) { w.WriteU16(m.playerId); w.WriteU16(m.vehicleId); }
+inline bool ReadVehExit(BitReader& r, MsgVehExit& m) { m.playerId = r.ReadU16(); m.vehicleId = r.ReadU16(); return r.Ok(); }
 
 inline void WriteVehSpawn(BitWriter& w, const MsgVehSpawn& m)
 {
 	w.WriteU16(m.vehicleId); w.WriteU16(m.modelId);
 	w.WriteF32(m.x); w.WriteF32(m.y); w.WriteF32(m.z); w.WriteF32(m.heading);
-	w.WriteU8(m.ownerId);
+	w.WriteU16(m.ownerId);
 }
 inline bool ReadVehSpawn(BitReader& r, MsgVehSpawn& m)
 {
 	m.vehicleId = r.ReadU16(); m.modelId = r.ReadU16();
 	m.x = r.ReadF32(); m.y = r.ReadF32(); m.z = r.ReadF32(); m.heading = r.ReadF32();
-	m.ownerId = r.ReadU8();
+	m.ownerId = r.ReadU16();
 	return r.Ok();
 }
 
@@ -314,16 +485,16 @@ inline bool ReadPickup(BitReader& r, MsgPickup& m)
 // MSG_VOICE payload: [u8 fromId][u8 len][len x u8 Opus packet]. The client
 // sends its own id (ignored: the server stamps the real sender). `packet` must
 // hold VOICE_MAX_PACKET bytes.
-inline void WriteVoice(BitWriter& w, uint8_t fromId, const uint8_t* packet, uint8_t len)
+inline void WriteVoice(BitWriter& w, PlayerId fromId, const uint8_t* packet, uint8_t len)
 {
-	w.WriteU8(fromId);
+	w.WriteU16(fromId);
 	w.WriteU8(len);
 	for(int i = 0; i < len; i++) w.WriteU8(packet[i]);
 }
 // false on a short read or a length outside 1..VOICE_MAX_PACKET
-inline bool ReadVoice(BitReader& r, uint8_t& fromId, uint8_t* packet, uint8_t& len)
+inline bool ReadVoice(BitReader& r, PlayerId& fromId, uint8_t* packet, uint8_t& len)
 {
-	fromId = r.ReadU8();
+	fromId = r.ReadU16();
 	len = r.ReadU8();
 	if(!r.Ok() || len == 0 || len > VOICE_MAX_PACKET) return false;
 	for(int i = 0; i < len; i++) packet[i] = r.ReadU8();
@@ -365,7 +536,7 @@ inline void WriteScoreUpdate(BitWriter& w, const MsgScoreUpdate& m)
 {
 	w.WriteU8(m.count);
 	for(uint8_t i = 0; i < m.count && i < MAX_SCORE_ENTRIES; i++){
-		w.WriteU8(m.entries[i].playerId);
+		w.WriteU16(m.entries[i].playerId);
 		w.WriteI32(m.entries[i].score);
 		w.WriteU16(m.entries[i].kills); w.WriteU16(m.entries[i].deaths);
 	}
@@ -375,7 +546,7 @@ inline bool ReadScoreUpdate(BitReader& r, MsgScoreUpdate& m)
 	m.count = r.ReadU8();
 	if(m.count > MAX_SCORE_ENTRIES){ return false; }
 	for(uint8_t i = 0; i < m.count; i++){
-		m.entries[i].playerId = r.ReadU8();
+		m.entries[i].playerId = r.ReadU16();
 		m.entries[i].score = r.ReadI32();
 		m.entries[i].kills = r.ReadU16(); m.entries[i].deaths = r.ReadU16();
 	}
@@ -387,7 +558,7 @@ inline void WritePlayerPing(BitWriter& w, const MsgPlayerPing& m)
 	uint8_t n = m.count < MAX_PING_ENTRIES ? m.count : (uint8_t)MAX_PING_ENTRIES;
 	w.WriteU8(n);
 	for(uint8_t i = 0; i < n; i++){
-		w.WriteU8(m.entries[i].playerId);
+		w.WriteU16(m.entries[i].playerId);
 		w.WriteU16(m.entries[i].pingMs);
 		w.WriteI32(m.entries[i].score);
 		w.WriteU16(m.entries[i].kills); w.WriteU16(m.entries[i].deaths);
@@ -398,7 +569,7 @@ inline bool ReadPlayerPing(BitReader& r, MsgPlayerPing& m)
 	m.count = r.ReadU8();
 	if(m.count > MAX_PING_ENTRIES){ return false; }
 	for(uint8_t i = 0; i < m.count; i++){
-		m.entries[i].playerId = r.ReadU8();
+		m.entries[i].playerId = r.ReadU16();
 		m.entries[i].pingMs = r.ReadU16();
 		m.entries[i].score = r.ReadI32();
 		m.entries[i].kills = r.ReadU16(); m.entries[i].deaths = r.ReadU16();
@@ -408,12 +579,12 @@ inline bool ReadPlayerPing(BitReader& r, MsgPlayerPing& m)
 
 inline void WriteGamemodeEvent(BitWriter& w, const MsgGamemodeEvent& m)
 {
-	w.WriteU8(m.type); w.WriteU8(m.arg1); w.WriteU8(m.arg2);
+	w.WriteU8(m.type); w.WriteU16(m.arg1); w.WriteU16(m.arg2);
 	w.WriteString(m.text, MAX_CHAT_LEN - 1);
 }
 inline bool ReadGamemodeEvent(BitReader& r, MsgGamemodeEvent& m)
 {
-	m.type = r.ReadU8(); m.arg1 = r.ReadU8(); m.arg2 = r.ReadU8();
+	m.type = r.ReadU8(); m.arg1 = r.ReadU16(); m.arg2 = r.ReadU16();
 	std::string t = r.ReadString(MAX_CHAT_LEN - 1);
 	m.len = (uint16_t)t.size();
 	CopyStr(m.text, sizeof m.text, t.c_str());
@@ -491,7 +662,7 @@ inline bool ReadAcPayload(BitReader& r, MsgAcPayload& m)
 // ---------------------------------------------------------------------------
 inline void WriteMasterAnnounce(BitWriter& w, const MsgMasterAnnounce& m)
 {
-	w.WriteU16(m.gamePort); w.WriteU8(m.players); w.WriteU8(m.maxPlayers); w.WriteU16(m.protocolVersion);
+	w.WriteU16(m.gamePort); w.WriteU16(m.players); w.WriteU16(m.maxPlayers); w.WriteU16(m.protocolVersion);
 	w.WriteString(m.hostname, MAX_HOSTNAME_LEN - 1);
 	w.WriteString(m.gameMode, 31);
 	w.WriteString(m.mapName, MAX_MAP_LEN - 1);   // v5
@@ -499,7 +670,7 @@ inline void WriteMasterAnnounce(BitWriter& w, const MsgMasterAnnounce& m)
 }
 inline bool ReadMasterAnnounce(BitReader& r, MsgMasterAnnounce& m)
 {
-	m.gamePort = r.ReadU16(); m.players = r.ReadU8(); m.maxPlayers = r.ReadU8(); m.protocolVersion = r.ReadU16();
+	m.gamePort = r.ReadU16(); m.players = r.ReadU16(); m.maxPlayers = r.ReadU16(); m.protocolVersion = r.ReadU16();
 	std::string hn = r.ReadString(MAX_HOSTNAME_LEN - 1);
 	std::string gm = r.ReadString(31);
 	CopyStr(m.hostname, sizeof m.hostname, hn.c_str());
@@ -518,7 +689,7 @@ inline bool ReadMasterAnnounce(BitReader& r, MsgMasterAnnounce& m)
 inline void WriteMasterEntry(BitWriter& w, const MasterListEntry& e)
 {
 	w.WriteU32(e.ipv4); w.WriteU16(e.gamePort);
-	w.WriteU8(e.players); w.WriteU8(e.maxPlayers); w.WriteU16(e.pingMs);
+	w.WriteU16(e.players); w.WriteU16(e.maxPlayers); w.WriteU16(e.pingMs);
 	w.WriteString(e.hostname, MAX_HOSTNAME_LEN - 1);
 	w.WriteString(e.gameMode, 31);
 	w.WriteString(e.mapName, MAX_MAP_LEN - 1);   // v5
@@ -527,7 +698,7 @@ inline void WriteMasterEntry(BitWriter& w, const MasterListEntry& e)
 inline bool ReadMasterEntry(BitReader& r, MasterListEntry& e)
 {
 	e.ipv4 = r.ReadU32(); e.gamePort = r.ReadU16();
-	e.players = r.ReadU8(); e.maxPlayers = r.ReadU8(); e.pingMs = r.ReadU16();
+	e.players = r.ReadU16(); e.maxPlayers = r.ReadU16(); e.pingMs = r.ReadU16();
 	std::string hn = r.ReadString(MAX_HOSTNAME_LEN - 1);
 	std::string gm = r.ReadString(31);
 	CopyStr(e.hostname, sizeof e.hostname, hn.c_str());

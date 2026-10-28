@@ -9,7 +9,7 @@
 #include <deque>
 
 struct NetChatLine {
-	uint8_t fromId = 0;
+	rnet::PlayerId fromId = 0;
 	std::string text;
 };
 
@@ -56,7 +56,7 @@ public:
 
 	struct Event {
 		int type = EV_NONE;
-		uint8_t id = 0;
+		rnet::PlayerId id = 0;   // player this event is about (16-bit since v8)
 		uint8_t kind = 0;
 		int32_t amount = 0;
 		uint16_t arg = 0;
@@ -93,17 +93,17 @@ public:
 
 	bool Connected() const { return m_connected; }
 	bool Spawned() const { return m_spawned; }
-	uint8_t MyId() const { return m_myId; }
+	rnet::PlayerId MyId() const { return m_myId; }
 	const char* Hostname() const { return m_hostname.c_str(); }
 	const char* GameMode() const { return m_gameMode.c_str(); }
 	const char* MapName() const { return m_mapName.c_str(); }
-	uint8_t Players() const { return m_players; }
-	uint8_t MaxPlayers() const { return m_maxPlayers; }
+	uint16_t Players() const { return m_players; }
+	uint16_t MaxPlayers() const { return m_maxPlayers; }
 	const char* MyName() const { return m_nick.c_str(); }
 
 	bool PopEvent(Event& ev);
 
-	std::map<uint8_t, NetRemotePlayer> remotes;
+	std::map<rnet::PlayerId, NetRemotePlayer> remotes;
 	std::deque<NetChatLine> chat;   // ring; game layer draws it
 	rnet::PlayerState myState;
 	rnet::MsgResList resList;       // server mod/resource inventory (admin panel)
@@ -117,11 +117,11 @@ private:
 	bool m_connected = false;
 	bool m_welcomed = false;
 	bool m_spawned = false;
-	uint8_t m_myId = 0;
+	rnet::PlayerId m_myId = 0;
 	std::string m_nick;
 	std::string m_password;   // claim/restore the server-side profile (sent in MSG_HELLO)
 	std::string m_hostname, m_gameMode, m_mapName;
-	uint8_t m_players = 0, m_maxPlayers = 0;
+	uint16_t m_players = 0, m_maxPlayers = 0;
 	std::deque<Event> m_events;
 	bool m_acHelloSent = false;
 	uint8_t m_acStatus = 0xFF;      // 0xFF = no answer yet, else AcRegisterResult

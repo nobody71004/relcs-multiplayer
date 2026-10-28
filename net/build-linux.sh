@@ -50,6 +50,10 @@ echo "== net-bot =="
 $CXX $CXXFLAGS $OPUS_CFLAGS -c bot/main.cpp -o obj/bot_main.o
 $CXX -o bin/relcs-netbot obj/bot_main.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS $OPUS_LIBS
 
+echo "== net-loadgen =="
+$CXX $CXXFLAGS -c loadgen/main.cpp -o obj/loadgen_main.o
+$CXX -o bin/relcs-loadgen obj/loadgen_main.o obj/enet_*.o -lpthread $LDFLAGS
+
 echo "== net-tests =="
 # tests/main.cpp lives in tests/ but includes "profiles.h"/"resource.h" from
 # server/ (the VS target has includedirs { "server" } for the same reason).
@@ -57,4 +61,4 @@ $CXX $CXXFLAGS $OPUS_CFLAGS -Iserver -c tests/main.cpp -o obj/tests_main.o
 $CXX -o bin/relcs-net-tests obj/tests_main.o obj/profiles.o obj/resource.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS $OPUS_LIBS
 
 echo "built:"
-ls -la bin/reLCS-server bin/reLCS-master bin/relcs-netbot bin/relcs-net-tests
+ls -la bin/reLCS-server bin/reLCS-master bin/relcs-netbot bin/relcs-loadgen bin/relcs-net-tests

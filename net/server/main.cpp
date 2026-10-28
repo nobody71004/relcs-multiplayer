@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <fstream>
@@ -59,6 +60,8 @@ static void ApplyKeyVal(ServerConfig& cfg, const std::string& key, const std::st
 	else if(key == "minute") cfg.minute = (uint8_t)atoi(val.c_str());
 	else if(key == "weather") cfg.weather = (uint8_t)atoi(val.c_str());
 	else if(key == "netstats_interval") cfg.netstatsInterval = atoi(val.c_str());
+	else if(key == "log_file") cfg.logFile = val;
+	else if(key == "verbose_join") cfg.verboseJoin = (atoi(val.c_str()) != 0);
 	else if(key == "profiles") cfg.profilesDb = val;
 	else if(key == "resources") cfg.resourcesDir = val;
 	else if(key == "vehicles") cfg.vehiclesFile = val;
@@ -129,15 +132,18 @@ int main(int argc, char** argv)
 	signal(SIGTERM, SignalHandler);
 #endif
 
-	Server server;
-	g_server = &server;
-	if(!server.Init(cfg))
+	// Heap, not stack: the player table alone is MAX_PLAYERS (2048) slots, so
+	// `Server server;` on the default 1 MB thread stack overflows before Init
+	// can log a single line (0xC00000FD with maxplayers raised for load tests).
+	auto server = std::make_unique<Server>();
+	g_server = server.get();
+	if(!server->Init(cfg))
 		return 1;
 
 	std::thread console(ConsoleThread);
 	console.detach();
 
-	server.Run();
+	server->Run();
 
 	g_server = nullptr;
 	enet_deinitialize();

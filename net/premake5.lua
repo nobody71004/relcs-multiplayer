@@ -85,6 +85,15 @@ project "net-bot"
 	netCommon()
 	netOpus()
 
+-- load generator: N simulated players from one host (2k-player load tests)
+project "net-loadgen"
+	kind "ConsoleApp"
+	language "C++"
+	cppdialect "C++17"
+	targetname "relcs-loadgen"
+	files { "loadgen/*.cpp", "loadgen/*.h" }
+	netCommon()
+
 project "net-master"
 	kind "ConsoleApp"
 	language "C++"

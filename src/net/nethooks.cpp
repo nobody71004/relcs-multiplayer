@@ -131,7 +131,7 @@ static uint8_t s_mySeat = 0xFF;
 static CVehicle* s_lastMyVeh = nil;
 static CVehicle* s_pendingVeh = nil;   // local car waiting for its server id
 static uint16_t s_pendingModel = 0;
-static std::map<uint8_t, std::pair<uint16_t, uint8_t>> s_pendingSeat; // remote ped -> (veh, seat)
+static std::map<rnet::PlayerId, std::pair<uint16_t, uint8_t>> s_pendingSeat; // remote ped -> (veh, seat)
 
 // Bind a game vehicle to a net id. The pool handle is kept so a pointer the
 // engine has since freed (or reused for another vehicle) is never trusted.
@@ -653,13 +653,13 @@ struct RemotePed {
 	int  model = MI_MALE01;   // the ped model this remote should render as (appearance sync)
 	float seatMismatch = 0.0f; // seconds the relayed seat has disagreed with the puppet
 };
-static std::map<uint8_t, RemotePed> s_remotes;
+static std::map<rnet::PlayerId, RemotePed> s_remotes;
 
 // A player's chosen look may arrive (MSG_APPEARANCE) before the ped exists, or
 // be changed mid-session. Remember the model they asked for -- the RAW id, not
 // the resolved one -- so a custom ped that only streams in later still wins:
 // resolving at store time would freeze the fallback in place forever.
-static std::map<uint8_t, uint16_t> s_remoteModel;
+static std::map<rnet::PlayerId, uint16_t> s_remoteModel;
 
 // Only ped models are valid avatars; a vehicle/other model would crash the ped
 // clump build. Fall back to the default civilian if the id is not a ped model.
@@ -672,7 +672,7 @@ static int ResolvePedModel(uint16_t model)
 	return MI_MALE01;
 }
 
-static void RemoveRemote(uint8_t id)
+static void RemoveRemote(rnet::PlayerId id)
 {
 	auto it = s_remotes.find(id);
 	if(it != s_remotes.end()){
@@ -690,7 +690,7 @@ static void RemoveRemote(uint8_t id)
 	// on EV_REMOTE_QUIT instead.
 }
 
-static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
+static void SpawnRemote(rnet::PlayerId id, float x, float y, float z, float heading)
 {
 	if(!s_connected)
 		return;
@@ -759,7 +759,7 @@ static void SpawnRemote(uint8_t id, float x, float y, float z, float heading)
 // id, and if the ped already exists re-skin it in place: SetModelIndex rebuilds
 // the RenderWare clump, so the puppet instantly renders as the new character.
 // (LCS renders a ped by model index; the component slots are carried for mods.)
-static void ApplyRemoteAppearance(uint8_t id, const rnet::MsgAppearance& ap)
+static void ApplyRemoteAppearance(rnet::PlayerId id, const rnet::MsgAppearance& ap)
 {
 	int model = ResolvePedModel(ap.model);
 	s_remoteModel[id] = ap.model;   // raw: ResolvePedModel runs again once it loads
@@ -782,7 +782,7 @@ static void ApplyRemoteAppearance(uint8_t id, const rnet::MsgAppearance& ap)
 	fflush(stderr);
 }
 
-static void ApplyRemote(uint8_t id, const rnet::PlayerState& st, float dt)
+static void ApplyRemote(rnet::PlayerId id, const rnet::PlayerState& st, float dt)
 {
 	float tx = st.xMm / 1000.0f, ty = st.yMm / 1000.0f, tz = st.zMm / 1000.0f;
 	// never move or materialize a puppet from an out-of-world position
@@ -2497,7 +2497,7 @@ static const float VOICE_VOLUME     = 1.0f;
 struct VoiceSource {
 	rnet::VoiceDecoder dec;       // Opus state of the current speaker
 	bool used = false;
-	uint8_t speaker = 0;
+	rnet::PlayerId speaker = rnet::PLAYER_ID_NONE;
 	ALuint src = 0;
 	ALuint bufs[VOICE_BUFS] = {};
 	bool busy[VOICE_BUFS] = {};   // buffer is queued on the source
@@ -2595,7 +2595,7 @@ static void VoiceShutdown(void)
 }
 
 // a speaker's source: the one already playing them, else a free one
-static VoiceSource* VoiceSourceFor(uint8_t speaker, ULONGLONG now)
+static VoiceSource* VoiceSourceFor(rnet::PlayerId speaker, ULONGLONG now)
 {
 	for(int i = 0; i < VOICE_SRC_MAX; i++)
 		if(s_vsrc[i].used && s_vsrc[i].speaker == speaker) return &s_vsrc[i];
@@ -2613,7 +2613,7 @@ static VoiceSource* VoiceSourceFor(uint8_t speaker, ULONGLONG now)
 }
 
 // incoming frame from the server (EV_VOICE): decode and queue on the speaker's source
-static void VoiceOnFrame(uint8_t speaker, const std::string& packet)
+static void VoiceOnFrame(rnet::PlayerId speaker, const std::string& packet)
 {
 	if(!s_outOk || packet.empty() || packet.size() > (size_t)VOICE_MAX_PACKET) return;
 	if(s_net.remotes.find(speaker) == s_net.remotes.end()) return;   // no position: cannot place it
@@ -3687,7 +3687,7 @@ void NetGame_Shutdown(void)
 		s_connected = false;
 	}
 	for(auto it = s_remotes.begin(); it != s_remotes.end(); ){
-		uint8_t id = it->first;
+		rnet::PlayerId id = it->first;
 		++it;
 		RemoveRemote(id);
 	}

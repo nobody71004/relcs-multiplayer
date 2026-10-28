@@ -1082,9 +1082,9 @@ static void TestWelcomeLiveInfo()
 	CHECK(strcmp(w2.mapName, "Liberty City") == 0);
 	CHECK(strcmp(w2.hostname, "i8 Showroom") == 0);
 
-	// a v4 server stops after the hostname: the v5 tail must read as empty
+	// a server that stops after the hostname: the optional tail reads as empty
 	BitWriter w4;
-	w4.WriteU8(1); w4.WriteU16(20); w4.WriteF32(200.0f);
+	w4.WriteU16(1); w4.WriteU16(20); w4.WriteF32(200.0f);
 	w4.WriteU8(12); w4.WriteU8(0); w4.WriteU8(0);
 	w4.WriteString("freeroam", 31);
 	w4.WriteString("old server", MAX_HOSTNAME_LEN - 1);
@@ -1211,10 +1211,10 @@ static void TestMasterEntryLiveInfo()
 	CHECK(strcmp(e2.mapName, "Liberty City") == 0);
 	CHECK(e2.protocolVersion == PROTOCOL_VERSION);
 
-	// a v4 entry stops after the game mode
+	// an entry without the optional tails stops after the game mode
 	BitWriter w4;
 	w4.WriteU32(0x0100007F); w4.WriteU16(7777);
-	w4.WriteU8(1); w4.WriteU8(32); w4.WriteU16(0);
+	w4.WriteU16(1); w4.WriteU16(32); w4.WriteU16(0);
 	w4.WriteString("old", MAX_HOSTNAME_LEN - 1);
 	w4.WriteString("survivor", 31);
 	BitReader r4(w4.Data(), w4.ByteSize());
@@ -1242,9 +1242,9 @@ static void TestMasterEntryLiveInfo()
 	CHECK(strcmp(a2.mapName, "Liberty City") == 0);
 	CHECK(a2.advertisedIp == 0x0A000005);
 
-	// a v4 announce has only the advertised IP tail
+	// an announce without the map tail carries only the advertised IP
 	BitWriter wa4;
-	wa4.WriteU16(7777); wa4.WriteU8(0); wa4.WriteU8(32); wa4.WriteU16(4);
+	wa4.WriteU16(7777); wa4.WriteU16(0); wa4.WriteU16(32); wa4.WriteU16(4);
 	wa4.WriteString("old", MAX_HOSTNAME_LEN - 1);
 	wa4.WriteString("freeroam", 31);
 	wa4.WriteU32(0x0A000006);
@@ -1302,14 +1302,15 @@ static void TestVoiceCodec()
 	for(int k = 0; k < VOICE_FRAME_SAMPLES; k++) if(std::abs((int)out[k]) > peak) peak = std::abs((int)out[k]);
 	CHECK(peak <= 64);
 
-	// packet codec: fromId, length, then the packet, exact size on the wire
+	// packet codec: fromId (v8: 16-bit), length, then the packet, exact size on the wire
 	uint8_t body[VOICE_MAX_PACKET];
 	for(int i = 0; i < 37; i++) body[i] = (uint8_t)(i * 7 + 3);
 	BitWriter w;
 	WriteVoice(w, 7, body, 37);
-	CHECK(w.ByteSize() == (size_t)(37 + 2));
+	CHECK(w.ByteSize() == (size_t)(37 + 3));
 	BitReader r(w.Data(), w.ByteSize());
-	uint8_t fromId = 0, back[VOICE_MAX_PACKET] = {}, backLen = 0;
+	rnet::PlayerId fromId = 0;
+	uint8_t back[VOICE_MAX_PACKET] = {}, backLen = 0;
 	CHECK(ReadVoice(r, fromId, back, backLen));
 	CHECK(fromId == 7 && backLen == 37);
 	CHECK(std::memcmp(body, back, 37) == 0);
@@ -1317,16 +1318,16 @@ static void TestVoiceCodec()
 
 	// a zero length or one past the maximum is malformed, and so is a short body
 	BitWriter zero;
-	zero.WriteU8(7); zero.WriteU8(0);
+	zero.WriteU16(7); zero.WriteU8(0);
 	BitReader rZero(zero.Data(), zero.ByteSize());
 	CHECK(!ReadVoice(rZero, fromId, back, backLen));
 	BitWriter big;
-	big.WriteU8(7); big.WriteU8((uint8_t)(VOICE_MAX_PACKET + 1));
+	big.WriteU16(7); big.WriteU8((uint8_t)(VOICE_MAX_PACKET + 1));
 	for(int i = 0; i < VOICE_MAX_PACKET + 1; i++) big.WriteU8(1);
 	BitReader rBig(big.Data(), big.ByteSize());
 	CHECK(!ReadVoice(rBig, fromId, back, backLen));
 	BitWriter shortBody;
-	shortBody.WriteU8(7); shortBody.WriteU8(10); shortBody.WriteU8(1);
+	shortBody.WriteU16(7); shortBody.WriteU8(10); shortBody.WriteU8(1);
 	BitReader rShort(shortBody.Data(), shortBody.ByteSize());
 	CHECK(!ReadVoice(rShort, fromId, back, backLen));
 }
@@ -1477,6 +1478,196 @@ static void TestAcConfig()
 	CHECK(tight.registerTimeout == 30);
 }
 
+// ---------------------------------------------------------------------------
+// v8: 16-bit player identity + batched entity delivery
+// v9: relayed state batches (receiver-relative, ~11 bytes per record)
+// ---------------------------------------------------------------------------
+static void TestHighPlayerCount()
+{
+	CHECK(PROTOCOL_VERSION == 9);
+	// a 2k load test needs ids above 255 and slots above the old 200 ceiling
+	CHECK(MAX_PLAYERS >= 2048);
+	CHECK(MAX_SERVER_PLAYERS == 2000);
+	CHECK(PLAYER_ID_NONE == 0xFFFF);
+	CHECK(PLAYER_ID_SERVER == 0);
+
+	const PlayerId high = 1500;
+
+	MsgWelcome wel;
+	wel.playerId = high;
+	wel.players = 1499;
+	wel.maxPlayers = 2000;
+	CopyStr(wel.hostname, sizeof wel.hostname, "big server");
+	BitWriter bw;
+	WriteWelcome(bw, wel);
+	BitReader br(bw.Data(), bw.ByteSize());
+	MsgWelcome wel2;
+	CHECK(ReadWelcome(br, wel2));
+	CHECK(wel2.playerId == high && wel2.players == 1499 && wel2.maxPlayers == 2000);
+
+	// every message that names a player must survive an id above 255
+	{
+		MsgPlayerJoin j; j.playerId = high; j.skinModel = 7;
+		CopyStr(j.name, sizeof j.name, "Load1500");
+		BitWriter w; WritePlayerJoin(w, j);
+		BitReader r(w.Data(), w.ByteSize()); MsgPlayerJoin j2;
+		CHECK(ReadPlayerJoin(r, j2) && j2.playerId == high && strcmp(j2.name, "Load1500") == 0);
+	}
+	{
+		MsgChat c; c.fromId = high; CopyStr(c.text, sizeof c.text, "hi");
+		BitWriter w; WriteChat(w, c);
+		BitReader r(w.Data(), w.ByteSize()); MsgChat c2;
+		CHECK(ReadChat(r, c2) && c2.fromId == high);
+	}
+	{
+		MsgSpawn sp; sp.playerId = high; sp.x = 1.0f;
+		BitWriter w; WriteSpawn(w, sp);
+		BitReader r(w.Data(), w.ByteSize()); MsgSpawn sp2;
+		CHECK(ReadSpawn(r, sp2) && sp2.playerId == high);
+	}
+	{
+		MsgDeath d; d.victimId = high; d.killerId = PLAYER_ID_NONE; d.weaponId = 5;
+		BitWriter w; WriteDeath(w, d);
+		BitReader r(w.Data(), w.ByteSize()); MsgDeath d2;
+		CHECK(ReadDeath(r, d2) && d2.victimId == high && d2.killerId == PLAYER_ID_NONE);
+	}
+	{
+		MsgDamage d; d.targetId = high; d.attackerId = 1999; d.damage = 12;
+		BitWriter w; WriteDamage(w, d);
+		BitReader r(w.Data(), w.ByteSize()); MsgDamage d2;
+		CHECK(ReadDamage(r, d2) && d2.targetId == high && d2.attackerId == 1999);
+	}
+	{
+		MsgVehSpawn vs; vs.vehicleId = 3; vs.ownerId = high;
+		BitWriter w; WriteVehSpawn(w, vs);
+		BitReader r(w.Data(), w.ByteSize()); MsgVehSpawn vs2;
+		CHECK(ReadVehSpawn(r, vs2) && vs2.ownerId == high);
+	}
+	{
+		MsgScoreUpdate su; su.count = 1; su.entries[0].playerId = high; su.entries[0].score = 42;
+		BitWriter w; WriteScoreUpdate(w, su);
+		BitReader r(w.Data(), w.ByteSize()); MsgScoreUpdate su2;
+		CHECK(ReadScoreUpdate(r, su2) && su2.entries[0].playerId == high);
+	}
+	{
+		MsgPlayerPing pp; pp.count = 1; pp.entries[0].playerId = high; pp.entries[0].pingMs = 90;
+		BitWriter w; WritePlayerPing(w, pp);
+		BitReader r(w.Data(), w.ByteSize()); MsgPlayerPing pp2;
+		CHECK(ReadPlayerPing(r, pp2) && pp2.entries[0].playerId == high);
+	}
+	{
+		MsgGamemodeEvent ev; ev.type = GMEV_KILL; ev.arg1 = high; ev.arg2 = 1999;
+		BitWriter w; WriteGamemodeEvent(w, ev);
+		BitReader r(w.Data(), w.ByteSize()); MsgGamemodeEvent ev2;
+		CHECK(ReadGamemodeEvent(r, ev2) && ev2.arg1 == high && ev2.arg2 == 1999);
+	}
+
+	// MSG_STATE_BATCH: relayed states are delta-coded against the receiver
+	{
+		PlayerState st[MAX_STATES_PER_PACKET];
+		const int32_t ax = 1000000, ay = -2000000, az = 30000;   // 1 km, -2 km, 30 m
+		for(int i = 0; i < 5; i++){
+			st[i].playerId = (PlayerId)(1000 + i);
+			st[i].xMm = ax + i * 1000;         // whole metres: exact in cm
+			st[i].yMm = ay;
+			st[i].zMm = az;
+			st[i].heading = (int16_t)(i * 4096);
+			st[i].velX = 100;                  // 10 m/s
+			st[i].health = 90;
+		}
+		BitWriter w;
+		WriteStateBatch(w, st, 5, ax, ay, az);
+		BitReader r(w.Data(), w.ByteSize());
+		PlayerState out[MAX_STATES_PER_PACKET];
+		CHECK(ReadStateBatch(r, out, MAX_STATES_PER_PACKET) == 5);
+		CHECK(out[4].playerId == 1004 && out[4].xMm == ax + 4000);
+		CHECK(out[4].yMm == ay && out[4].zMm == az);
+		CHECK(out[4].heading == 16384);      // 8-bit angle step, exact here
+		CHECK(out[4].velX == 100);               // 0.2 m/s steps round-trip
+		CHECK(out[4].health == 90);
+		CHECK(out[4].vehicleId == VEHICLE_NONE);
+		// 5 on-foot records are 87 bits each: five states in well under 100 bytes
+		CHECK(w.ByteSize() <= 100);
+
+		// a record beyond the 16-bit cm range falls back to absolute mm
+		{
+			PlayerState far1[1];
+			far1[0].playerId = 7;
+			far1[0].xMm = ax + 400000;         // 400 m away
+			far1[0].yMm = ay;
+			far1[0].zMm = az;
+			far1[0].health = 55;
+			BitWriter fw;
+			WriteStateBatch(fw, far1, 1, ax, ay, az);
+			BitReader fr(fw.Data(), fw.ByteSize());
+			PlayerState fout[MAX_STATES_PER_PACKET];
+			CHECK(ReadStateBatch(fr, fout, MAX_STATES_PER_PACKET) == 1);
+			CHECK(fout[0].xMm == ax + 400000 && fout[0].health == 55);
+		}
+
+		// vehicle occupancy and the teleport flag ride only when set
+		{
+			PlayerState veh[1];
+			veh[0].playerId = 9;
+			veh[0].xMm = ax; veh[0].yMm = ay; veh[0].zMm = az;
+			veh[0].vehicleId = 42;
+			veh[0].seat = 3;
+			veh[0].moveFlags = MOVEFLAG_TELEPORT;
+			BitWriter vw;
+			WriteStateBatch(vw, veh, 1, ax, ay, az);
+			BitReader vr(vw.Data(), vw.ByteSize());
+			PlayerState vout[MAX_STATES_PER_PACKET];
+			CHECK(ReadStateBatch(vr, vout, MAX_STATES_PER_PACKET) == 1);
+			CHECK(vout[0].vehicleId == 42 && vout[0].seat == 3);
+			CHECK(vout[0].moveFlags == MOVEFLAG_TELEPORT);
+			// on foot is the compact form: 87 bits vs 106 seated
+			CHECK(RelayEntryBits(veh[0], ax, ay, az) == 106);
+			CHECK(RelayEntryBits(st[0], ax, ay, az) == 87);
+		}
+
+		// a count above the format limit is rejected instead of read past the frame
+		BitWriter over;
+		over.WriteU16((uint16_t)(MAX_STATES_PER_PACKET + 1));
+		BitReader rOver(over.Data(), over.ByteSize());
+		CHECK(ReadStateBatch(rOver, out, MAX_STATES_PER_PACKET) == -1);
+
+		// ... and so is one that does not fit the caller's array
+		BitWriter two;
+		two.WriteU16(2);
+		two.WriteU16(1);
+		BitReader rTwo(two.Data(), two.ByteSize());
+		CHECK(ReadStateBatch(rTwo, out, 1) == -1);
+	}
+
+	// MSG_ROSTER: batched identity + last spawn
+	{
+		MsgRosterEntry e[2];
+		e[0].id = 2000;
+		e[0].skin = 7;
+		e[0].flags = ROSTER_SPAWNED | ROSTER_ALIVE;
+		e[0].health = 80;
+		e[0].xMm = 1234; e[0].yMm = -5678; e[0].zMm = 9000;
+		e[0].heading = 1234;
+		CopyStr(e[0].name, sizeof e[0].name, "Load2000");
+		e[1].id = 1999;
+		CopyStr(e[1].name, sizeof e[1].name, "Load1999");
+
+		BitWriter w;
+		WriteRoster(w, e, 2);
+		BitReader r(w.Data(), w.ByteSize());
+		MsgRosterEntry out[2];
+		CHECK(ReadRoster(r, out, 2) == 2);
+		CHECK(out[0].id == 2000 && (out[0].flags & ROSTER_SPAWNED) && out[0].xMm == 1234 &&
+		      out[0].yMm == -5678 && out[0].heading == 1234 && strcmp(out[0].name, "Load2000") == 0);
+		CHECK(out[1].id == 1999 && out[1].flags == 0);
+
+		BitWriter over;
+		over.WriteU16((uint16_t)(MAX_ROSTER_PER_PACKET + 1));
+		BitReader rOver(over.Data(), over.ByteSize());
+		CHECK(ReadRoster(rOver, out, MAX_ROSTER_PER_PACKET) == -1);
+	}
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
@@ -1484,6 +1675,7 @@ int main()
 	TestAcConfig();
 	TestVoiceCodec();
 	TestWelcomeLiveInfo();
+	TestHighPlayerCount();
 	TestVehDespawnCodec();
 	TestFavoritesCodec();
 	TestMasterEntryLiveInfo();

@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -20,7 +21,7 @@
 struct ServerConfig {
 	std::string hostname = "reLCS Server";
 	uint16_t port = rnet::DEFAULT_PORT;
-	int maxPlayers = 32;
+	int maxPlayers = 32;                   // clamped to rnet::MAX_SERVER_PLAYERS (2000)
 	std::string gamemode = "survivor";     // survivor | freeroam
 	bool announce = false;                 // list on master server
 	std::string master = "127.0.0.1";      // master server host
@@ -32,6 +33,8 @@ struct ServerConfig {
 	int tickRate = rnet::TICK_RATE;
 	uint8_t hour = 12, minute = 0, weather = 0;
 	int netstatsInterval = 0;		// >0: log bandwidth/rtt stats every N seconds
+	std::string logFile;                     // "" = stdout only; else tee every line here
+	bool verboseJoin = true;                 // log one line per join/leave/refusal
 	std::string profilesDb = "profiles.db";  // SQLite player profiles ("" disables)
 	std::string resourcesDir = "resources";  // mod/resource packs ("" disables)
 	std::string vehiclesFile = "vehicles.cfg"; // static vehicle spawn list ("" disables)
@@ -41,7 +44,7 @@ struct ServerConfig {
 
 struct ServerPlayer {
 	bool active = false;
-	uint8_t id = 0;
+	rnet::PlayerId id = 0;
 	ENetPeer* peer = nullptr;
 	uint32_t ip = 0;
 	uint16_t port = 0;
@@ -51,6 +54,8 @@ struct ServerPlayer {
 	bool alive = false;
 	rnet::PlayerState state;         // latest client-reported
 	double lastStateTime = 0.0;
+	double joinTime = 0.0;           // Now() at HELLO (session-length logging)
+	int statesReceived = 0;          // MSG_PLAYER_STATE packets accepted
 	double respawnAt = 0.0;          // server clock seconds
 	// authoritative vitals
 	uint8_t health = 100, armour = 0;
@@ -97,9 +102,9 @@ struct ServerVehicle {
 	uint16_t id = 0;
 	uint16_t modelId = 0;
 	rnet::VehicleState state;
-	uint8_t driverId = 0xFF;
-	uint8_t ownerId = 0xFF;            // player whose enter allocated it (0xFF = static/admin)
-	uint8_t occupants[8];            // seat -> playerId (0xFF = free)
+	rnet::PlayerId driverId = rnet::PLAYER_ID_NONE;
+	rnet::PlayerId ownerId = rnet::PLAYER_ID_NONE; // player whose enter allocated it
+	rnet::PlayerId occupants[8];     // seat -> playerId (PLAYER_ID_NONE = free)
 	int teleportDrops = 0;           // consecutive driver states dropped as teleports
 	double lastStateTime = 0.0;
 };
@@ -119,26 +124,29 @@ public:
 	bool HandleCommand(const std::string& line, int respondTo = -1); // -1=console, else playerId for RCON
 
 	// --- gamemode API ---
-	ServerPlayer* FindPlayer(uint8_t id);
+	ServerPlayer* FindPlayer(rnet::PlayerId id);
 	ServerVehicle* FindVehicle(uint16_t id);
 	int ActivePlayerCount() const;
 
-	void BroadcastChat(const char* text, uint8_t fromId = 0);
-	void SendChatTo(uint8_t playerId, const char* text, uint8_t fromId = 0);
-	void BroadcastEvent(uint8_t type, uint8_t arg1 = 0, uint8_t arg2 = 0, const char* text = "");
+	void BroadcastChat(const char* text, rnet::PlayerId fromId = rnet::PLAYER_ID_SERVER);
+	void SendChatTo(rnet::PlayerId playerId, const char* text,
+	                rnet::PlayerId fromId = rnet::PLAYER_ID_SERVER);
+	void BroadcastEvent(uint8_t type, rnet::PlayerId arg1 = 0, rnet::PlayerId arg2 = 0,
+	                    const char* text = "");
 	void BroadcastWorld(void);   // MSG_WORLD clock/weather sync to everyone
 	void BroadcastResList(void); // MSG_RES_LIST mod/resource inventory to everyone
 	void SendResList(ENetPeer* peer);
-	void SpawnPlayer(uint8_t playerId, float x, float y, float z, float heading,
+	void SpawnPlayer(rnet::PlayerId playerId, float x, float y, float z, float heading,
 	                 uint16_t skin, uint8_t health, uint8_t armour);
-	void KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId);
-	void TeleportPlayer(uint8_t playerId, float x, float y, float z, float heading);
-	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent, uint8_t ownerId = 0xFF);
+	void KillPlayer(rnet::PlayerId victimId, rnet::PlayerId killerId, uint8_t weaponId);
+	void TeleportPlayer(rnet::PlayerId playerId, float x, float y, float z, float heading);
+	ServerVehicle* SpawnVehicle(uint16_t modelId, float x, float y, float z, float heading, bool permanent,
+	                            rnet::PlayerId ownerId = rnet::PLAYER_ID_NONE);
 	void RemoveVehicle(uint16_t vehicleId);
-	void SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour);
+	void SetPlayerVitals(rnet::PlayerId playerId, uint8_t health, uint8_t armour);
 	void BroadcastScores();
 	void BroadcastPlayerPing();   // MSG_PLAYER_PING: ping/score rows for the scoreboard
-	void KickPlayer(uint8_t playerId, const char* reason);
+	void KickPlayer(rnet::PlayerId playerId, const char* reason);
 	void RestartGameMode();
 	void SaveProfile(ServerPlayer* p);      // write wallet + inventory to the DB
 	void FlushProfiles();                   // save all dirty profiles
@@ -162,7 +170,7 @@ private:
 	// message handlers
 	void HandleHello(ServerPlayer* p, rnet::BitReader& r, ENetPeer* peer, uint8_t flagsProbe);
 	void HandlePlayerState(ServerPlayer* p, rnet::BitReader& r);
-	void SendGive(uint8_t targetId, uint8_t kind, int32_t amount, uint16_t arg);
+	void SendGive(rnet::PlayerId targetId, uint8_t kind, int32_t amount, uint16_t arg);
 	void HandleVehicleState(ServerPlayer* p, rnet::BitReader& r);
 	void HandleChat(ServerPlayer* p, rnet::BitReader& r);
 	void HandleVoice(ServerPlayer* p, rnet::BitReader& r);
@@ -191,8 +199,20 @@ private:
 
 	// helpers
 	void SendTo(ENetPeer* peer, const rnet::BitWriter& w, uint8_t channel, bool reliable);
-	void Broadcast(const rnet::BitWriter& w, uint8_t channel, bool reliable, uint8_t exceptId = 0);
+	void Broadcast(const rnet::BitWriter& w, uint8_t channel, bool reliable,
+	               rnet::PlayerId exceptId = rnet::PLAYER_ID_SERVER);
 	void Log(const char* fmt, ...);
+
+	// --- snapshot / roster delivery ---------------------------------------
+	// RelayStates groups every state a client can see into MSG_STATE_BATCH
+	// packets: one send per player per tick instead of one per (state,
+	// receiver) pair, which is what makes 1000+ players affordable.
+	void RelayStates();
+	void SendRoster(ENetPeer* peer, rnet::PlayerId skipId = rnet::PLAYER_ID_SERVER);
+
+	// --- capture-grade telemetry ------------------------------------------
+	void LogNetStats(double t);       // 1 Hz: players, tick time, packets, bytes, rtt
+	void ResetTickStats();
 	void UpdateMasterAnnounce();
 	void InitDiscovery();
 	void PumpDiscovery();
@@ -207,6 +227,13 @@ private:
 
 	ServerPlayer m_players[rnet::MAX_PLAYERS];   // index = id-1
 	ServerVehicle m_vehicles[rnet::MAX_VEHICLES];
+
+	// AOI grid, rebuilt every tick: intrusive linked lists per cell, so a
+	// neighbour scan never allocates and never walks the whole player table.
+	std::vector<int> m_aoiHead;      // cell -> first player index (-1 = empty)
+	std::vector<int> m_aoiNext;      // player index -> next in the same cell
+	int m_aoiDim = 0;                // cells per side (m_aoiDim² cells)
+	float m_aoiCell = 200.0f;        // cell width in metres (= stream distance)
 	std::vector<uint32_t> m_bannedIps;
 
 	GameMode* m_gamemode = nullptr;
@@ -229,6 +256,26 @@ private:
 	double m_lastPingBroadcast = 0.0;
 	double m_lastReconcile = 0.0;     // 1 Hz out-of-range player + vehicle state heartbeat
 	uint64_t m_totalBytesIn = 0, m_totalBytesOut = 0;
+	uint64_t m_totalPacketsIn = 0, m_totalPacketsOut = 0;
+
+	// capture telemetry (all reset once a second by LogNetStats)
+	std::mutex m_logMutex;
+	std::ofstream m_logFile;
+	double m_statsWindowStart = 0.0;
+	uint64_t m_statsTicks = 0, m_statsStates = 0, m_statsStatePackets = 0;
+	uint64_t m_statsJoins = 0, m_statsLeaves = 0, m_statsRefusals = 0, m_statsKicks = 0;
+	uint64_t m_statsInboundPackets = 0, m_statsInboundBad = 0;
+	double m_statsTickMsSum = 0.0, m_statsTickMsMax = 0.0;
+	// per-phase tick cost: which stage is eating the 50 ms budget is the
+	// question a 1k/2k capture exists to answer
+	double m_statsPumpMsSum = 0.0, m_statsPumpMsMax = 0.0;
+	double m_statsRelayMsSum = 0.0, m_statsRelayMsMax = 0.0;
+	double m_statsFlushMsSum = 0.0, m_statsFlushMsMax = 0.0;
+	// AOI relay volume, counted where it is produced (SendTo also carries
+	// chat/roster/reconcile traffic, so its counter is not a relay measure)
+	uint64_t m_statsRelayStates = 0, m_statsRelayBatches = 0;
+	int m_reconcileCursor = 0;       // staggered 1 Hz reconciliation sweep
+	int m_relayPhase = 0;            // alternate ticks carry the far-AOI sweep
 
 	friend class GameMode;
 };

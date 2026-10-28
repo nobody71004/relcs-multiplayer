@@ -1,6 +1,8 @@
 // net/server/gamemode.h — server-side gamemode API + built-in modes.
 #pragma once
 
+#include "rnet_common.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,19 +17,19 @@ class GameMode {
 public:
 	virtual ~GameMode() {}
 	virtual const char* Name() const = 0;
-	virtual void OnPlayerConnect(Server& server, uint8_t playerId) { (void)server; (void)playerId; }
-	virtual void OnPlayerDisconnect(Server& server, uint8_t playerId) { (void)server; (void)playerId; }
+	virtual void OnPlayerConnect(Server& server, rnet::PlayerId playerId) { (void)server; (void)playerId; }
+	virtual void OnPlayerDisconnect(Server& server, rnet::PlayerId playerId) { (void)server; (void)playerId; }
 	// decide where/how a player spawns; call server.SpawnPlayer(...)
-	virtual void OnPlayerSpawnRequest(Server& server, uint8_t playerId) = 0;
-	virtual void OnPlayerDeath(Server& server, uint8_t victimId, uint8_t killerId, uint8_t weaponId)
+	virtual void OnPlayerSpawnRequest(Server& server, rnet::PlayerId playerId) = 0;
+	virtual void OnPlayerDeath(Server& server, rnet::PlayerId victimId, rnet::PlayerId killerId, uint8_t weaponId)
 	{ (void)server; (void)victimId; (void)killerId; (void)weaponId; }
 	virtual void OnTick(Server& server, float dt) { (void)server; (void)dt; }
-	virtual bool OnChat(Server& server, uint8_t playerId, const char* text)
+	virtual bool OnChat(Server& server, rnet::PlayerId playerId, const char* text)
 	{ (void)server; (void)playerId; (void)text; return true; }  // false = suppress
-	virtual bool OnPlayerCommand(Server& server, uint8_t playerId, const std::string& cmd)
+	virtual bool OnPlayerCommand(Server& server, rnet::PlayerId playerId, const std::string& cmd)
 	{ (void)server; (void)playerId; (void)cmd; return false; }  // true = handled
 	virtual void OnRoundStart(Server& server) { (void)server; }
-	virtual void OnRoundEnd(Server& server, uint8_t winnerId) { (void)server; (void)winnerId; }
+	virtual void OnRoundEnd(Server& server, rnet::PlayerId winnerId) { (void)server; (void)winnerId; }
 	virtual float RespawnDelay() const { return 3.0f; }
 	virtual void Reset(Server& server) { (void)server; }
 };
@@ -36,7 +38,7 @@ public:
 class FreeRoamMode : public GameMode {
 public:
 	const char* Name() const override { return "freeroam"; }
-	void OnPlayerSpawnRequest(Server& server, uint8_t playerId) override;
+	void OnPlayerSpawnRequest(Server& server, rnet::PlayerId playerId) override;
 };
 
 // Official PSP LCS mode #1: Liberty City Survivor — deathmatch to kill limit or timer.
@@ -44,11 +46,11 @@ class LibertyCitySurvivorMode : public GameMode {
 public:
 	LibertyCitySurvivorMode();
 	const char* Name() const override { return "survivor"; }
-	void OnPlayerSpawnRequest(Server& server, uint8_t playerId) override;
-	void OnPlayerDeath(Server& server, uint8_t victimId, uint8_t killerId, uint8_t weaponId) override;
+	void OnPlayerSpawnRequest(Server& server, rnet::PlayerId playerId) override;
+	void OnPlayerDeath(Server& server, rnet::PlayerId victimId, rnet::PlayerId killerId, uint8_t weaponId) override;
 	void OnTick(Server& server, float dt) override;
 	void OnRoundStart(Server& server) override;
-	void OnRoundEnd(Server& server, uint8_t winnerId) override;
+	void OnRoundEnd(Server& server, rnet::PlayerId winnerId) override;
 	void Reset(Server& server) override;
 
 	int scoreLimit = 20;

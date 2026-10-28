@@ -417,7 +417,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		break;
 	}
 	case MSG_VOICE:{
-		uint8_t from = 0;
+		PlayerId from = 0;
 		uint8_t packet[VOICE_MAX_PACKET];
 		uint8_t len = 0;
 		if(ReadVoice(r, from, packet, len) && r.BitsLeft() == 0 && from != m_myId){
@@ -426,6 +426,58 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			e.id = from;
 			e.text.assign((const char*)packet, len);
 			m_events.push_back(e);
+		}
+		break;
+	}
+	case MSG_STATE_BATCH:{
+		// v8: the server groups every state we are in range of into a handful of
+		// packets. Apply each record exactly like a single MSG_PLAYER_STATE, so
+		// the game layer cannot tell which form delivered a snapshot.
+		PlayerState states[MAX_STATES_PER_PACKET];
+		int n = ReadStateBatch(r, states, MAX_STATES_PER_PACKET);
+		if(n <= 0) break;
+		for(int i = 0; i < n; i++){
+			PlayerState& st = states[i];
+			if(st.playerId == m_myId) continue;
+			NetRemotePlayer& rp = remotes[st.playerId];
+			rp.state = st;
+			rp.spawned = true;
+			rp.lastUpdate = 0.0; // refreshed by Pump caller via wall clock if needed
+		}
+		break;
+	}
+	case MSG_ROSTER:{
+		// v8: batched identity of everyone already on the server. This replaces
+		// the one-JOIN-plus-one-SPAWN-per-player replay, so it is also where a
+		// late joiner's puppets get their names and first position.
+		MsgRosterEntry entries[MAX_ROSTER_PER_PACKET];
+		int n = ReadRoster(r, entries, MAX_ROSTER_PER_PACKET);
+		if(n <= 0) break;
+		for(int i = 0; i < n; i++){
+			const MsgRosterEntry& re = entries[i];
+			if(re.id == m_myId) continue;
+			NetRemotePlayer& rp = remotes[re.id];
+			rp.name = re.name;
+			if(!(re.flags & ROSTER_SPAWNED)) continue;
+
+			bool firstSpawn = !rp.spawned;
+			rp.spawned = true;
+			rp.state.playerId = re.id;
+			rp.state.xMm = re.xMm;
+			rp.state.yMm = re.yMm;
+			rp.state.zMm = re.zMm;
+			rp.state.heading = re.heading;
+			rp.state.health = re.health;
+			rp.state.armour = re.armour;
+			rp.lastUpdate = NowSeconds();
+			if(firstSpawn && (re.flags & ROSTER_ALIVE)){
+				Event e;
+				e.type = EV_REMOTE_SPAWN;
+				e.id = re.id;
+				e.model = re.skin;
+				e.state = rp.state;
+				m_events.push_back(e);
+			}
 		}
 		break;
 	}
@@ -450,7 +502,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		break;
 	}
 	case MSG_PLAYER_QUIT:{
-		uint8_t id = r.ReadU8();
+		PlayerId id = r.ReadU16();
 		fprintf(stderr, "[NET] QUIT id=%d\n", (int)id);
 		fflush(stderr);
 		remotes.erase(id);
@@ -511,13 +563,13 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			// store it on the remote (own id still flows through so the game layer
 			// can confirm/apply its own restored look)
 			if(m.playerId != m_myId){
-				NetRemotePlayer& rp = remotes[(uint8_t)m.playerId];
+				NetRemotePlayer& rp = remotes[m.playerId];
 				rp.appearance = m;
 				rp.haveAppearance = true;
 			}
 			Event e;
 			e.type = EV_APPEARANCE;
-			e.id = (uint8_t)m.playerId;
+			e.id = m.playerId;
 			e.appearance = m;
 			m_events.push_back(e);
 		}

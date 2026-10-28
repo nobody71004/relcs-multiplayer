@@ -41,13 +41,13 @@ SpawnPoint RandomSpawnPoint()
 // which meant every spawn (join *and* respawn) told the client "no saved look":
 // the first-join character creator reopened after every death and remote puppets
 // were built with model 0 until the next appearance message.
-static uint16_t SpawnSkinFor(Server& server, uint8_t playerId)
+static uint16_t SpawnSkinFor(Server& server, rnet::PlayerId playerId)
 {
 	ServerPlayer* p = server.FindPlayer(playerId);
 	return p ? p->skin : 0;
 }
 
-void FreeRoamMode::OnPlayerSpawnRequest(Server& server, uint8_t playerId)
+void FreeRoamMode::OnPlayerSpawnRequest(Server& server, rnet::PlayerId playerId)
 {
 	SpawnPoint sp = RandomSpawnPoint();
 	server.SpawnPlayer(playerId, sp.x, sp.y, sp.z, sp.heading, SpawnSkinFor(server, playerId), 100, 0);
@@ -63,7 +63,7 @@ LibertyCitySurvivorMode::LibertyCitySurvivorMode()
 	m_roundStarted = false;
 }
 
-void LibertyCitySurvivorMode::OnPlayerSpawnRequest(Server& server, uint8_t playerId)
+void LibertyCitySurvivorMode::OnPlayerSpawnRequest(Server& server, rnet::PlayerId playerId)
 {
 	SpawnPoint sp = RandomSpawnPoint();
 	server.SpawnPlayer(playerId, sp.x, sp.y, sp.z, sp.heading, SpawnSkinFor(server, playerId), 100, 0);
@@ -72,7 +72,7 @@ void LibertyCitySurvivorMode::OnPlayerSpawnRequest(Server& server, uint8_t playe
 		OnRoundStart(server);
 }
 
-void LibertyCitySurvivorMode::OnPlayerDeath(Server& server, uint8_t victimId, uint8_t killerId, uint8_t weaponId)
+void LibertyCitySurvivorMode::OnPlayerDeath(Server& server, rnet::PlayerId victimId, rnet::PlayerId killerId, uint8_t weaponId)
 {
 	(void)victimId; (void)weaponId;
 	if(m_phase == Phase::Active && killerId != victimId){
@@ -89,9 +89,9 @@ void LibertyCitySurvivorMode::OnTick(Server& server, float dt)
 		m_phaseTimer += dt;
 		if(m_phaseTimer >= roundTime){
 			// highest score wins
-			uint8_t best = 0;
+			rnet::PlayerId best = 0;
 			int32_t bestScore = -1;
-			for(uint8_t id = 1; id <= rnet::MAX_PLAYERS; id++){
+			for(rnet::PlayerId id = 1; id < (rnet::PlayerId)rnet::MAX_PLAYERS; id++){
 				ServerPlayer* p = server.FindPlayer(id);
 				if(p && p->score > bestScore){ bestScore = p->score; best = id; }
 			}
@@ -119,7 +119,7 @@ void LibertyCitySurvivorMode::OnRoundStart(Server& server)
 	server.BroadcastEvent(GMEV_ROUND_START, 0, 0, msg);
 }
 
-void LibertyCitySurvivorMode::OnRoundEnd(Server& server, uint8_t winnerId)
+void LibertyCitySurvivorMode::OnRoundEnd(Server& server, rnet::PlayerId winnerId)
 {
 	m_phase = Phase::Ended;
 	m_phaseTimer = 0.0f;
