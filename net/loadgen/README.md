@@ -120,29 +120,53 @@ weapon, ammo, wallet, armour and the velocity vector stay on
 health and vehicle occupancy. Both codecs are covered by the net-tests round
 trip (including the far-position fallback and the teleport/seat flags).
 
+## Send path: batched datagrams (`vendor/enet`)
+
+A 2000-player tick produces ~2000 state datagrams, and ENet sent each with its
+own `sendmsg()`/`WSASendTo()`: ~7 µs per call on Linux, ~15 µs on this Windows
+host, i.e. 14–30 ms of a 50 ms tick. `enet_socket_send()` now queues the
+finished datagram (a memcpy of at most the path MTU) and
+`enet_socket_send_batch_flush()` drains the queue:
+
+* **Linux**: one `sendmmsg()` per batch (up to 4096 datagrams per syscall).
+* **Windows**: Windows has no send-many syscall, so the queue is drained by a
+  persistent pool of three sender threads plus the calling thread (sockets are
+  safe for concurrent datagram sends; ENet's sequencing is inside the
+  datagrams, so ordering requirements are unchanged). Batches under 32
+  datagrams are sent inline.
+* The queue is drained inside the same `enet_host_flush()` /
+  `enet_host_service()` call that filled it — flush paths also carry the ACKs
+  and pings ENet generates while servicing — so packet latency is unchanged.
+* One process-global queue, drained before another socket could be queued: the
+  client, server, master and bot each run one host per thread.
+
 ## Measured (2026-10-28, bots on the same host, dense 1500 m placement)
 
-Protocol v9, one 1.2 KB datagram per client per tick (records are ~11 B, so a
-200 m AOI of ~110 bodies is ~1.2 KB — the batch splits on encoded size, not on
-a fixed record count):
+Protocol v9 with batched sends, one 1.2 KB datagram per client per tick
+(records are ~11 B, so a 200 m AOI of ~110 bodies is ~1.2 KB — the batch splits
+on encoded size, not on a fixed record count):
 
 | host | fleet | welcomed / spawned | tick_ms (budget 50) | pump / relay / flush | RTT avg | loss | kicks |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Windows | 1000 | 1000 / 1000 | **18.7** mean (max 30.9) | 5.5 / 5.5 / 11.8 ms | 17 ms | 1.1 % | 0 |
-| Windows | 2000 | 2000 / 2000 | **52.3** mean (max 103.3) | 11.1 / 17.7 / 29.5 ms | 38 ms | 9.2 % | 0 |
-| Linux (WSL) | 2000 | 2000 / 2000 | **25.6** mean (max 49.1) | 4.3 / 12.9 / 8.6 ms | 8 ms | 1.0 % | 0 |
+| Windows | 1000 | 1000 / 1000 | **6.7** mean (max 11.5) | 3.0 / 3.1 / 2.8 ms | 7 ms | 1.1 % | 0 |
+| Windows | 2000 | 2000 / 2000 | **29.5** mean (max 46.4) | 5.3 / 14.8 / 10.9 ms | 10 ms | 2.0 % | 0 |
+| Linux (WSL) | 2000 | 2000 / 2000 | **22.9** mean (max 40.3) | 4.0 / 12.7 / 6.9 ms | 8 ms | 1.7 % | 0 |
 
-Against the v8 numbers this is 25.3 → 18.7 ms at 1k, 37.1 → 25.6 ms on Linux
-at 2k and 104–121 → 52.3 ms on Windows at 2k. Linux relays 2.09 M states/s in
-47 MB/s of egress (was ~90 MB/s) and built 63 k packets/s in total, of which
-~40 k are the per-client state datagrams — 1.0 per client per tick, down from
-~4. On Windows, `flush_ms` fell from 64–74 ms to 29.5 ms for the same reason:
-`sendto` is still ~15 µs here, but a client now needs one call, not four.
+Progression on the same hosts, same scenario: v8 was 25.3 / 104–121 / 37.1 ms,
+v9 alone reached 18.7 / 52.3 / 25.6 ms, and the batched send path brings it to
+6.7 / 29.5 / 22.9 ms. The 2k Linux run relays 2.10 M states/s in 47 MB/s and
+moves 62 k packets/s — the Windows 2k row is now ~3 ms *under* the 50 ms
+budget with 2.10 M states/s relayed, and its loss dropped from 9.2 % to 2.0 %
+because the tick no longer bursts 2000 blocking syscalls.
 
-The Windows 2k row still sits just over the 50 ms budget and its `loss_max`
-is high because the load fleet shares this host with the server; the Linux row
-is the deployment target (see `net/build-linux.sh`). Measure on the platform
-you deploy on, and run the shards from another machine for a clean number.
+`flush_ms` on Linux is now mostly ENet packet assembly (header, checksum, queue
+bookkeeping), not syscalls — `sendmmsg` alone removed the per-datagram calls.
+On Windows the 10.9 ms is the 2000 sends spread over four threads plus
+assembly; one `sendto` (~15 µs) is still the unit of work, there is just no
+longer a single thread paying for all of them.
+
+The load fleet shares this host with the server, so both rows include CPU
+contention; run the shards from another machine for a clean server number.
 
 ### Fixed while measuring
 
@@ -165,16 +189,14 @@ you deploy on, and run the shards from another machine for a clean number.
 
 ### Where the remaining time goes (2k)
 
-With v9 in place the split on Linux is relay ~13 ms, flush ~9 ms, pump ~4 ms —
-inside budget. On Windows the same tick is ~52 ms because flush alone is
-~30 ms: ENet sends one datagram per `enet_peer_send`, and this host charges
-~15 µs per `sendto` for 2 000 peers, so one packet per client per tick is the
-floor. Remaining levers, in order:
+With v9 and batched sends the split on Linux is relay ~13 ms, flush ~7 ms,
+pump ~4 ms; on Windows relay ~15 ms, flush ~11 ms, pump ~5 ms — both inside
+the 50 ms budget. Remaining levers, in order:
 
-1. Send-side batching (`sendmmsg` on Linux) — ENet has no multi-datagram send
-   API, so this means patching the send path. It is the only way to get below
-   one syscall per client per tick on Windows.
+1. The relay itself (13–15 ms): the AOI scan visits every candidate in the
+   3x3 cell block on every tick. A per-cell distance cache, or sorting the
+   near ring out of the scan, would cut the repeated distance work.
 2. Shared multicast per AOI cell for dense fights (one datagram to many peers).
 3. Drop the far tier to 5 Hz for giant crowds (near ring stays 20 Hz).
 4. Compress further (bit-pack the position to 2 cm steps, drop health from the
-   far tier): ~1-2 bytes per record, marginal next to the syscall cost.
+   far tier): ~1-2 bytes per record, marginal next to the send cost.
