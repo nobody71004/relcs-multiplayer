@@ -53,8 +53,14 @@ done
 wait
 ```
 
-2000 players: same loop over `0 1 2 3`, `-grid-total 2000`, `-duration 55
--ramp 25`. Every process needs its own `-name-prefix`, `-seed` and `-csv`.
+2000 players: the same loop over `0 1 2 3` (500 peers each) saturates this
+host — RTT climbs to seconds, the server's flood guard starts dropping
+catch-up bursts and the movement validator kicks starved bots, so the fleet
+decays to ~1 800 even though the server tick is fine. Shard smaller: eight
+shards of 250 (`-count 250`, loop `0..7`, `-grid-base $((i*250))`,
+`-grid-total 2000`, `-duration 60 -ramp 25`) holds 2000/2000 with RTT in the
+tens of milliseconds. Every process needs its own `-name-prefix`, `-seed`
+and `-csv`.
 
 Useful flags:
 
@@ -93,6 +99,10 @@ netstats: players=1000/2000 spawned=1000 peers=1000 tick_ms avg=64.11 max=72.96 
   per-tick `enet_host_flush`.
 * `relay_states/s` is states copied into batches, `relay_batches/s` packets
   built; `pkts_out/s`/`pkts_in/s` are what ENet actually moved.
+* `states_in/s` / `states_apply/s` / `coalesced/s` are the inbound path: states
+  staged on arrival, states adopted by a tick (at most one per client per
+  tick), and staged frames superseded before they were used. `coalesced/s` is
+  0 when clients pace at or below the tick rate, and rises with arrival jitter.
 * `rtt_avg/max` and `loss_max` come from ENet peer stats; client-side loss also
   shows up here as elevated RTT.
 * `kicks` is per window. Any kick reason in the log is a real finding — but
@@ -151,6 +161,18 @@ on encoded size, not on a fixed record count):
 | Windows | 1000 | 1000 / 1000 | **6.7** mean (max 11.5) | 3.0 / 3.1 / 2.8 ms | 7 ms | 1.1 % | 0 |
 | Windows | 2000 | 2000 / 2000 | **29.5** mean (max 46.4) | 5.3 / 14.8 / 10.9 ms | 10 ms | 2.0 % | 0 |
 | Linux (WSL) | 2000 | 2000 / 2000 | **22.9** mean (max 40.3) | 4.0 / 12.7 / 6.9 ms | 8 ms | 1.7 % | 0 |
+
+Re-measured with inbound state coalescing (2026-10-28, 8 × 250 shards on this
+host): 2000 / 2000 welcomed and spawned, 0 kicks, 35 one-second samples at
+≥1900 players. Two runs: tick **27.7 and 33.2 ms mean (max 46.7 / 48.8)**, relay
+1.83–1.98 M states/s, RTT 15–19 ms, loss 1.4–1.7 %. The tick saw ~40 500
+inbound states/s, applied ~35–38 k and superseded 2 881 (7 %) and 5 716 (14 %)
+of them — states that arrived clumped inside a tick and are now dropped after
+decode, before validation and the wallet/anti-cheat work. The *same* fleet
+against the pre-change binary measured 27.5 ms mean (max 49.6): coalescing does
+not move the tick when clients pace at exactly 20 Hz, which is the steady case;
+its saving is in the jittered and overloaded cases, and `coalesced/s` is how
+you see it.
 
 Progression on the same hosts, same scenario: v8 was 25.3 / 104–121 / 37.1 ms,
 v9 alone reached 18.7 / 52.3 / 25.6 ms, and the batched send path brings it to

@@ -799,19 +799,20 @@ void Server::HandleAppearance(ServerPlayer* p, BitReader& r)
 	Log("[appearance] %s is model %d", p->name.c_str(), (int)m.model);
 }
 
+// A client state is only *staged* here: the tick drains one slot per client
+// (ApplyPendingStates). A client that clumps two states into a single tick —
+// arrival jitter, or catching up after a stall — used to pay full validation,
+// ledger and anti-cheat work twice, the second time on a frame the relay never
+// needed. The tick now validates exactly the frame it will relay.
 void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 {
 	PlayerState st;
 	if(!ReadPlayerState(r, st)) return;
 
-	// rcon-authed admins run admin tools (noclip, teleports, self-granted
-	// money) that legitimately trip every anti-cheat budget — exempt them
-	// from all penalties while keeping payload sanity as a hard floor
-	bool admin = p->rconAuthed;
-
-	// tough payload sanity first: garbage states never touch game logic
+	// tough payload sanity first, at the ingress: garbage never occupies the
+	// pending slot, so it can never be adopted when the tick drains it
 	if(!ValidateStateSanity(st)){
-		if(admin){
+		if(p->rconAuthed){
 			Log("[anticheat] %s insane state payload (admin — ignored)", p->name.c_str());
 			return;
 		}
@@ -823,7 +824,40 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	}
 	st.ammo = ClampAmmo(st.ammo);
 
-	double t = Now();
+	// newest wins: the slot holds one frame, the freshest one received
+	if(p->statePending) m_statsStateCoalesced++;
+	p->pendingState = st;
+	p->pendingStateTime = Now();
+	p->statePending = true;
+	m_statsStateMsgs++;
+}
+
+// Drain the per-client state slots once per tick, before the relay is built:
+// this is the "one player state per client per tick" contract the validation,
+// wallet ledger and relay are sized for.
+void Server::ApplyPendingStates()
+{
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active || !p.statePending) continue;
+		p.statePending = false;
+		// arrival, not now: a client pacing at 10 Hz keeps an honest 100 ms dt
+		// even though the state is applied on the tick it landed in
+		ApplyPlayerState(&p, p.pendingState, p.pendingStateTime);
+		m_statsStatesApplied++;
+	}
+}
+
+void Server::ApplyPlayerState(ServerPlayer* p, const PlayerState& stIn, double arrival)
+{
+	PlayerState st = stIn;
+	double t = arrival;
+
+	// rcon-authed admins run admin tools (noclip, teleports, self-granted
+	// money) that legitimately trip every anti-cheat budget — exempt them
+	// from all penalties while keeping payload sanity as a hard floor
+	bool admin = p->rconAuthed;
+
 	float dt = (float)(t - p->lastStateTime);
 	// arrival jitter can compress gaps and make a legal step look faster than
 	// it really was: never evaluate a step quicker than the nominal tick, and
@@ -1564,6 +1598,10 @@ void Server::Tick()
 		}
 	}
 
+	// inbound player states: one validation + adoption per client per tick,
+	// before the relay and the gamemode read them
+	ApplyPendingStates();
+
 	// respawns
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& p = m_players[i];
@@ -1812,7 +1850,9 @@ void Server::LogNetStats(double t)
 	double nTicks = m_statsTicks ? (double)m_statsTicks : 1.0;
 	Log("netstats: players=%d/%d spawned=%d peers=%d tick_ms avg=%.2f max=%.2f budget=%.1f "
 	    "pump_ms %.2f/%.2f relay_ms %.2f/%.2f flush_ms %.2f/%.2f "
-	    "relay_states/s=%llu relay_batches/s=%llu pkts_out/s=%llu pkts_in/s=%llu "
+	    "relay_states/s=%llu relay_batches/s=%llu "
+	    "states_in/s=%llu states_apply/s=%llu coalesced/s=%llu "
+	    "pkts_out/s=%llu pkts_in/s=%llu "
 	    "in=%.1fKB/s out=%.1fKB/s "
 	    "rtt_avg=%ums rtt_max=%ums loss_max=%.1f%% joins=%llu leaves=%llu kicks=%llu",
 	    active, m_cfg.maxPlayers, spawned, peers,
@@ -1822,6 +1862,9 @@ void Server::LogNetStats(double t)
 	    m_statsFlushMsSum / nTicks, m_statsFlushMsMax,
 	    (unsigned long long)m_statsRelayStates,
 	    (unsigned long long)m_statsRelayBatches,
+	    (unsigned long long)m_statsStateMsgs,
+	    (unsigned long long)m_statsStatesApplied,
+	    (unsigned long long)m_statsStateCoalesced,
 	    (unsigned long long)pkOut, (unsigned long long)pkIn,
 	    inRate / 1024.0, outRate / 1024.0,
 	    (unsigned)(rttN ? rttSum / rttN : 0), (unsigned)rttMax,
@@ -1846,6 +1889,9 @@ void Server::ResetTickStats()
 	m_statsTicks = 0;
 	m_statsStates = 0;
 	m_statsStatePackets = 0;
+	m_statsStateMsgs = 0;
+	m_statsStatesApplied = 0;
+	m_statsStateCoalesced = 0;
 	m_statsTickMsSum = 0.0;
 	m_statsTickMsMax = 0.0;
 	m_statsPumpMsSum = 0.0;

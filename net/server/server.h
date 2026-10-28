@@ -56,6 +56,11 @@ struct ServerPlayer {
 	double lastStateTime = 0.0;
 	double joinTime = 0.0;           // Now() at HELLO (session-length logging)
 	int statesReceived = 0;          // MSG_PLAYER_STATE packets accepted
+	// Ingress coalescing: an arriving state is staged here and only the
+	// freshest frame per client is applied per tick (ApplyPendingStates).
+	rnet::PlayerState pendingState;
+	double pendingStateTime = 0.0;
+	bool statePending = false;
 	double respawnAt = 0.0;          // server clock seconds
 	// authoritative vitals
 	uint8_t health = 100, armour = 0;
@@ -111,6 +116,11 @@ struct ServerVehicle {
 
 class GameMode;
 
+// net-tests drives PumpNetwork/Tick directly (there is no Run() loop in the
+// test), so "two states inside one tick" is exact instead of a timing race.
+// The peer is defined in net/tests/main.cpp; nothing else can reach internals.
+struct ServerTestPeer;
+
 class Server {
 public:
 	~Server();
@@ -157,6 +167,8 @@ public:
 	ResourceManager& Resources() { return m_resources; }
 
 private:
+	friend struct ServerTestPeer;
+
 	void PumpNetwork();
 	void SendRefusal(ENetPeer* peer, uint8_t code, const char* reason); // MSG_DISCONNECT + JoinRefused code
 	void OnConnect(ENetPeer* peer);
@@ -170,6 +182,9 @@ private:
 	// message handlers
 	void HandleHello(ServerPlayer* p, rnet::BitReader& r, ENetPeer* peer, uint8_t flagsProbe);
 	void HandlePlayerState(ServerPlayer* p, rnet::BitReader& r);
+	// apply at most one staged state per client, at the top of Tick
+	void ApplyPendingStates();
+	void ApplyPlayerState(ServerPlayer* p, const rnet::PlayerState& st, double arrival);
 	void SendGive(rnet::PlayerId targetId, uint8_t kind, int32_t amount, uint16_t arg);
 	void HandleVehicleState(ServerPlayer* p, rnet::BitReader& r);
 	void HandleChat(ServerPlayer* p, rnet::BitReader& r);
@@ -271,6 +286,10 @@ private:
 	std::ofstream m_logFile;
 	double m_statsWindowStart = 0.0;
 	uint64_t m_statsTicks = 0, m_statsStates = 0, m_statsStatePackets = 0;
+	// inbound state coalescing: staged packets vs ticks they reached
+	uint64_t m_statsStateMsgs = 0;      // MSG_PLAYER_STATE accepted into a slot
+	uint64_t m_statsStatesApplied = 0;  // one per client per tick at most
+	uint64_t m_statsStateCoalesced = 0; // staged states superseded before use
 	uint64_t m_statsJoins = 0, m_statsLeaves = 0, m_statsRefusals = 0, m_statsKicks = 0;
 	uint64_t m_statsInboundPackets = 0, m_statsInboundBad = 0;
 	double m_statsTickMsSum = 0.0, m_statsTickMsMax = 0.0;
