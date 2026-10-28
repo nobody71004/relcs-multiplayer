@@ -199,6 +199,10 @@ private:
 
 	// helpers
 	void SendTo(ENetPeer* peer, const rnet::BitWriter& w, uint8_t channel, bool reliable);
+	// same send without the BitWriter: the relay path packs straight into a
+	// stack frame and hands the bytes over (see RelayStates)
+	void SendToBytes(ENetPeer* peer, const uint8_t* data, size_t bytes,
+	                 uint8_t channel, bool reliable);
 	void Broadcast(const rnet::BitWriter& w, uint8_t channel, bool reliable,
 	               rnet::PlayerId exceptId = rnet::PLAYER_ID_SERVER);
 	void Log(const char* fmt, ...);
@@ -234,6 +238,10 @@ private:
 	std::vector<int> m_aoiNext;      // player index -> next in the same cell
 	int m_aoiDim = 0;                // cells per side (m_aoiDim² cells)
 	float m_aoiCell = 200.0f;        // cell width in metres (= stream distance)
+	// Quantized, receiver-independent half of a relayed record, rebuilt with
+	// the grid each tick so the per-receiver pass only does the delta
+	// conversion and the packing (rnet_protocol.h: RelayWireRecord).
+	rnet::RelayWireRecord m_relayWire[rnet::MAX_PLAYERS];
 	std::vector<uint32_t> m_bannedIps;
 
 	GameMode* m_gamemode = nullptr;

@@ -1668,6 +1668,147 @@ static void TestHighPlayerCount()
 	}
 }
 
+// The server's relay fast path must be a pure speed-up: same bytes on the
+// wire as WriteStateBatch, which stays the reference encoder.
+static void TestRelayFastPath()
+{
+	uint32_t seed = 0x5EED1234u;
+	auto rnd = [&]() -> uint32_t {
+		seed = seed * 1664525u + 1013904223u;
+		return seed >> 8;
+	};
+
+	const int32_t ax = 1234567, ay = -765432, az = 42000;   // 1.2 km, -0.8 km, 42 m
+	PlayerState st[MAX_STATES_PER_PACKET];
+	RelayWireRecord wire[MAX_STATES_PER_PACKET];
+	RelaySendEntry entry[MAX_STATES_PER_PACKET];
+	// equivalence is checked on whole batches, which may exceed one datagram;
+	// the budget (and the server's split) is a separate property below
+	std::vector<uint8_t> frame(4 * (1 + RELAY_PAYLOAD_BYTES));
+
+	int mismatches = 0, bitMismatches = 0, decodeMismatches = 0;
+	for(int trial = 0; trial < 40; trial++){
+		const int count = 1 + (int)(rnd() % MAX_STATES_PER_PACKET);
+		for(int i = 0; i < count; i++){
+			PlayerState& s = st[i];
+			s = PlayerState{};
+			s.playerId = (PlayerId)(rnd() % 4096);
+			// mostly inside a 200 m AOI, sometimes far enough to need absolute mm
+			int32_t reach = (trial % 5 == 4) ? 900000 : 190000;
+			s.xMm = ax + (int32_t)(rnd() % (uint32_t)(reach * 2)) - reach;
+			s.yMm = ay + (int32_t)(rnd() % (uint32_t)(reach * 2)) - reach;
+			s.zMm = az + (int32_t)(rnd() % 200000) - 100000;
+			s.heading = (int16_t)rnd();
+			s.velX = (int16_t)(rnd() % 1200);
+			s.velY = (int16_t)(rnd() % 1200);
+			s.health = (uint8_t)(rnd() % 200);
+			if(trial % 3 == 0 && (rnd() & 1)){
+				s.vehicleId = (uint16_t)(rnd() % MAX_VEHICLES);
+				s.seat = (rnd() & 1) ? 0xFF : (uint8_t)(rnd() % 8);
+			}
+			if(rnd() & 1) s.moveFlags = MOVEFLAG_TELEPORT;
+
+			MakeRelayWireRecord(s, wire[i]);
+			int16_t dx = 0, dy = 0, dz = 0;
+			bool delta = RelayDeltaCm(wire[i].xMm, ax, dx) &
+			             RelayDeltaCm(wire[i].yMm, ay, dy) &
+			             RelayDeltaCm(wire[i].zMm, az, dz);
+			if(RelayWireRecordBits(wire[i], delta) != RelayEntryBits(s, ax, ay, az))
+				bitMismatches++;
+			entry[i].rec = &wire[i];
+			entry[i].dx = dx; entry[i].dy = dy; entry[i].dz = dz;
+			entry[i].abs = delta ? 0 : 1;
+		}
+
+		BitWriter ref;
+		BeginMsg(ref, MSG_STATE_BATCH);
+		WriteStateBatch(ref, st, count, ax, ay, az);
+
+		BitSink sink(frame.data(), frame.size());
+		BeginMsg(sink, MSG_STATE_BATCH);
+		WriteRelayBatch(sink, entry, count, ax, ay, az);
+		size_t bytes = sink.Finish();
+		if(!sink.Ok() || bytes != ref.ByteSize() ||
+		   std::memcmp(frame.data(), ref.Data(), bytes) != 0) mismatches++;
+
+		// both frames decode to the same states (the reader starts after the
+		// message-type byte, as the client's dispatcher does)
+		BitReader rRef(ref.Data(), ref.ByteSize());
+		BitReader rNew(frame.data(), bytes);
+		CHECK(rRef.ReadU8() == MSG_STATE_BATCH);
+		CHECK(rNew.ReadU8() == MSG_STATE_BATCH);
+		PlayerState outRef[MAX_STATES_PER_PACKET], outNew[MAX_STATES_PER_PACKET];
+		int nRef = ReadStateBatch(rRef, outRef, MAX_STATES_PER_PACKET);
+		int nNew = ReadStateBatch(rNew, outNew, MAX_STATES_PER_PACKET);
+		if(nRef != count || nNew != count) decodeMismatches++;
+		else{
+			for(int i = 0; i < count; i++){
+				if(outRef[i].playerId != outNew[i].playerId ||
+				   outRef[i].xMm != outNew[i].xMm || outRef[i].yMm != outNew[i].yMm ||
+				   outRef[i].zMm != outNew[i].zMm ||
+				   outRef[i].heading != outNew[i].heading ||
+				   outRef[i].velX != outNew[i].velX ||
+				   outRef[i].health != outNew[i].health ||
+				   outRef[i].vehicleId != outNew[i].vehicleId ||
+				   outRef[i].seat != outNew[i].seat ||
+				   outRef[i].moveFlags != outNew[i].moveFlags) decodeMismatches++;
+			}
+		}
+	}
+	CHECK(mismatches == 0);
+	CHECK(bitMismatches == 0);
+	CHECK(decodeMismatches == 0);
+
+	// The server's split rule (relay_ms budget accounting in RelayStates) must
+	// still keep every frame inside one datagram's payload, including the wide
+	// absolute-position records, and lose nothing across the splits.
+	{
+		uint8_t pkt[1 + RELAY_PAYLOAD_BYTES + 8];
+		const int budgetBits = RELAY_PAYLOAD_BYTES * 8;
+		int n = 0, batchBits = RELAY_ANCHOR_BITS, seen = 0, frames = 0;
+		bool budgetOk = true;
+		const int total = MAX_STATES_PER_PACKET;
+		RelaySendEntry sent[MAX_STATES_PER_PACKET];
+		auto flush = [&]{
+			if(n == 0) return;
+			BitSink sink(pkt, sizeof pkt);
+			BeginMsg(sink, MSG_STATE_BATCH);
+			WriteRelayBatch(sink, sent, n, ax, ay, az);
+			size_t bytes = sink.Finish();
+			if(!sink.Ok()) budgetOk = false;
+			BitReader r(sink.Ok() ? pkt : nullptr, sink.Ok() ? bytes : 0);
+			PlayerState out[MAX_STATES_PER_PACKET];
+			if(!sink.Ok() || r.ReadU8() != MSG_STATE_BATCH ||
+			   ReadStateBatch(r, out, MAX_STATES_PER_PACKET) != n) budgetOk = false;
+			seen += n;
+			frames++;
+			n = 0;
+			batchBits = RELAY_ANCHOR_BITS;
+		};
+		for(int i = 0; i < total; i++){
+			RelaySendEntry e;
+			e.rec = &wire[i % 40];
+			e.abs = (i % 3) == 2;                     // every third record falls back
+			int bits = RelayWireRecordBits(*e.rec, !e.abs);
+			if(n > 0 && batchBits + bits > budgetBits) flush();
+			sent[n++] = e;
+			batchBits += bits;
+		}
+		flush();
+		CHECK(budgetOk);
+		CHECK(seen == total);
+		CHECK(frames > 1);            // 128 wide records cannot fit one datagram
+	}
+
+	// an empty batch is a legal (if pointless) frame: count 0 + anchor
+	{
+		BitSink sink(frame.data(), frame.size());
+		BeginMsg(sink, MSG_STATE_BATCH);
+		WriteRelayBatch(sink, entry, 0, ax, ay, az);
+		CHECK(sink.Finish() == 15);            // type 8b + count 16b + anchor 96b
+	}
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
@@ -1676,6 +1817,7 @@ int main()
 	TestVoiceCodec();
 	TestWelcomeLiveInfo();
 	TestHighPlayerCount();
+	TestRelayFastPath();
 	TestVehDespawnCodec();
 	TestFavoritesCodec();
 	TestMasterEntryLiveInfo();

@@ -254,13 +254,19 @@ double Server::Now() const
 // of Tick. The old per-packet enet_host_flush made a 2k-player tick cost one
 // syscall per (state, receiver) pair, which is exactly what a load test
 // measures itself against.
-void Server::SendTo(ENetPeer* peer, const BitWriter& w, uint8_t channel, bool reliable)
+void Server::SendToBytes(ENetPeer* peer, const uint8_t* data, size_t bytes,
+                         uint8_t channel, bool reliable)
 {
 	if(!peer) return;
-	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(),
+	ENetPacket* pkt = enet_packet_create(data, bytes,
 	                                     reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
 	enet_peer_send(peer, channel, pkt);
 	m_statsStatePackets++;
+}
+
+void Server::SendTo(ENetPeer* peer, const BitWriter& w, uint8_t channel, bool reliable)
+{
+	SendToBytes(peer, w.Data(), w.ByteSize(), channel, reliable);
 }
 
 void Server::Broadcast(const BitWriter& w, uint8_t channel, bool reliable, rnet::PlayerId exceptId)
@@ -1682,9 +1688,15 @@ void Server::RelayStates()
 		int c = AoiCellOf(p.state.xMm, p.state.yMm, m_aoiCell, m_aoiDim);
 		m_aoiNext[(size_t)i] = m_aoiHead[(size_t)c];
 		m_aoiHead[(size_t)c] = i;
+		// Identity, facing, speed, health and vehicle are the same for every
+		// receiver: quantize them once here instead of once per receiver.
+		MakeRelayWireRecord(p.state, m_relayWire[i]);
 	}
 
-	PlayerState batch[MAX_STATES_PER_PACKET];
+	// Entries carry the receiver's own cm offsets, so a receiver's batch is
+	// packed straight from the cache without re-deriving anything.
+	RelaySendEntry batch[MAX_STATES_PER_PACKET];
+	uint8_t frame[1 + RELAY_PAYLOAD_BYTES + 8];   // type byte + payload budget
 	int n = 0;
 	int batchBits = RELAY_ANCHOR_BITS;          // count + anchor already counted
 	const int budgetBits = RELAY_PAYLOAD_BYTES * 8;
@@ -1710,12 +1722,12 @@ void Server::RelayStates()
 		n = 0;
 		auto flushQ = [&](){
 			if(n == 0) return;
-			BitWriter w;
-			BeginMsg(w, MSG_STATE_BATCH);
 			// positions ride as deltas from the receiver, so a 200 m AOI fits
 			// 16-bit centimetre offsets and a whole update fits one datagram
-			WriteStateBatch(w, batch, n, qxMm, qyMm, qzMm);
-			SendTo(q.peer, w, CHAN_STATE, false);
+			BitSink sink(frame, sizeof frame);
+			BeginMsg(sink, MSG_STATE_BATCH);
+			WriteRelayBatch(sink, batch, n, qxMm, qyMm, qzMm);
+			SendToBytes(q.peer, frame, sink.Finish(), CHAN_STATE, false);
 			m_statsRelayStates += (uint64_t)n;
 			m_statsRelayBatches++;
 			n = 0;
@@ -1731,21 +1743,30 @@ void Server::RelayStates()
 				for(int pi = m_aoiHead[(size_t)(y * m_aoiDim + x)]; pi >= 0;
 				    pi = m_aoiNext[(size_t)pi]){
 					if(pi == qi) continue;
-					ServerPlayer& p = m_players[pi];
-					if(p.lastStateTime <= 0.0) continue;
-					float dx = (p.state.xMm - qxMm) * 0.001f;
-					float dy = (p.state.yMm - qyMm) * 0.001f;
-					float dz = (p.state.zMm - qzMm) * 0.001f;
-					float d2 = dx * dx + dy * dy + dz * dz;
+					if(m_players[pi].lastStateTime <= 0.0) continue;
+					const RelayWireRecord& rec = m_relayWire[pi];
+					float dxm = (rec.xMm - qxMm) * 0.001f;
+					float dym = (rec.yMm - qyMm) * 0.001f;
+					float dzm = (rec.zMm - qzMm) * 0.001f;
+					float d2 = dxm * dxm + dym * dym + dzm * dzm;
 					if(d2 > stream2) continue;
 					if(!farSweep && d2 > near2) continue;   // far tier is due next tick
-					int entryBits = RelayEntryBits(p.state, qxMm, qyMm, qzMm);
+					// bitwise & so all three offsets are converted, not just up to
+					// the first one that overflows the delta range
+					int16_t dx = 0, dy = 0, dz = 0;
+					bool delta = RelayDeltaCm(rec.xMm, qxMm, dx) &
+					             RelayDeltaCm(rec.yMm, qyMm, dy) &
+					             RelayDeltaCm(rec.zMm, qzMm, dz);
+					int entryBits = RelayWireRecordBits(rec, delta);
 					// split on encoded size as well as record count: a record can
 					// be wider than its neighbours (absolute position, in a
 					// vehicle) and the packet must never cross the payload budget
 					if(n > 0 && (n == MAX_STATES_PER_PACKET ||
 					   batchBits + entryBits > budgetBits)) flushQ();
-					batch[n++] = p.state;
+					RelaySendEntry& e = batch[n++];
+					e.rec = &rec;
+					e.dx = dx; e.dy = dy; e.dz = dz;
+					e.abs = delta ? 0 : 1;
 					batchBits += entryBits;
 				}
 			}

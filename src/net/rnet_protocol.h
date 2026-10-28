@@ -259,6 +259,144 @@ inline int ReadStateBatch(BitReader& r, PlayerState* out, int cap)
 	return (int)n;
 }
 
+// ---------------------------------------------------------------------------
+// Relay write path (server hot loop)
+// ---------------------------------------------------------------------------
+// The server builds one MSG_STATE_BATCH per receiver, so everything in a
+// record except the three position offsets is identical for every receiver of
+// the same player. Quantizing it once per tick (RelayWireRecord) and only
+// converting positions per receiver is what makes a 2000-player tick fit its
+// budget: the per-receiver step then costs three subtractions and the bit
+// packing, not another sqrt/heading/vehicle quantization.
+struct RelayWireRecord {
+	int32_t  xMm = 0, yMm = 0, zMm = 0;   // absolute position (RELAY_ABS_POS)
+	uint16_t id = 0;                      // 12 bits
+	uint8_t  flags = 0;                   // RELAY_TELEPORT | RELAY_INVEHICLE
+	uint8_t  heading = 0;                 // 256 steps
+	uint8_t  speed = 0;                   // 0.2 m/s steps
+	uint8_t  health = 0;                  // 7 bits
+	uint16_t vehicleId = VEHICLE_NONE;
+	uint8_t  seat = 7;                    // 3 bits, 7 = 0xFF
+};
+
+// receiver-independent half of WriteRelayState
+inline void MakeRelayWireRecord(const PlayerState& s, RelayWireRecord& r)
+{
+	r.xMm = s.xMm; r.yMm = s.yMm; r.zMm = s.zMm;
+	r.id = (uint16_t)((uint32_t)s.playerId & 0x0FFF);
+	uint8_t flags = 0;
+	if(s.moveFlags & MOVEFLAG_TELEPORT) flags |= RELAY_TELEPORT;
+	if(s.vehicleId != VEHICLE_NONE)     flags |= RELAY_INVEHICLE;
+	r.flags = flags;
+	r.heading = (uint8_t)((uint16_t)s.heading >> 8);
+	float vx = DequantVel(s.velX), vy = DequantVel(s.velY);
+	long spd = std::lround(std::sqrt(vx * vx + vy * vy) * 5.0f);
+	if(spd < 0) spd = 0;
+	if(spd > 255) spd = 255;
+	r.speed = (uint8_t)spd;
+	r.health = s.health > 127 ? 127 : s.health;
+	r.vehicleId = s.vehicleId;
+	r.seat = s.seat == 0xFF ? 7 : (uint8_t)(s.seat & 7);
+}
+
+// Encoded size of one record from the cached halves; `delta` is whether the
+// receiver's anchor keeps all three offsets inside the 16-bit cm range.
+inline int RelayWireRecordBits(const RelayWireRecord& r, bool delta)
+{
+	int bits = 12 + 4 + 8 + 8 + 7 + (delta ? 48 : 96);
+	if(r.flags & RELAY_INVEHICLE) bits += 16 + 3;
+	return bits;
+}
+
+// MSB-first packer over a caller-owned buffer. BitWriter grows a std::vector
+// and re-checks it on every call, which is the right trade for the one-shot
+// codecs but not for the ~2000 per-tick relay batches: this keeps the pending
+// bits in an accumulator and writes whole bytes straight into the packet.
+class BitSink {
+public:
+	BitSink(uint8_t* out, size_t capacity) : m_out(out), m_cap(capacity) {}
+
+	inline void Put(uint32_t value, int bits)
+	{
+		if(bits <= 0) return;
+		uint64_t v = bits >= 32 ? (uint64_t)value
+		                        : ((uint64_t)value & ((1ull << bits) - 1));
+		m_acc = (m_acc << bits) | v;
+		m_bits += bits;
+		while(m_bits >= 8){
+			m_bits -= 8;
+			if(m_len < m_cap) m_out[m_len] = (uint8_t)(m_acc >> m_bits);
+			m_len++;
+			m_acc &= (1ull << m_bits) - 1;
+		}
+	}
+
+	// Zero-padded tail byte, then the frame length (BitWriter does the same)
+	size_t Finish()
+	{
+		if(m_bits){
+			if(m_len < m_cap) m_out[m_len] = (uint8_t)(m_acc << (8 - m_bits));
+			m_len++;
+			m_bits = 0;
+			m_acc = 0;
+		}
+		return m_len;
+	}
+	bool Ok() const { return m_len <= m_cap; }
+	size_t ByteSize() const { return m_len + (m_bits ? 1 : 0); }
+
+private:
+	uint8_t* m_out;
+	size_t   m_cap;
+	uint64_t m_acc = 0;
+	int      m_bits = 0;
+	size_t   m_len = 0;
+};
+
+// One record on its way to a specific receiver: the cached halves plus the
+// offsets from that receiver's anchor (unused, and left at zero, when `abs`).
+struct RelaySendEntry {
+	const RelayWireRecord* rec = nullptr;
+	int16_t dx = 0, dy = 0, dz = 0;
+	uint8_t abs = 0;                 // position did not fit the cm range
+};
+
+inline void BeginMsg(BitSink& w, MsgType type) { w.Put((uint32_t)type, 8); }
+
+// Byte-for-byte the same frame WriteStateBatch produces, without re-deriving
+// anything the caller already decided.
+inline void WriteRelayBatch(BitSink& w, const RelaySendEntry* entries, int count,
+                            int32_t ax, int32_t ay, int32_t az)
+{
+	int n = count;
+	if(n < 0) n = 0;
+	if(n > MAX_STATES_PER_PACKET) n = MAX_STATES_PER_PACKET;
+	w.Put((uint32_t)n, 16);
+	w.Put((uint32_t)ax, 32); w.Put((uint32_t)ay, 32); w.Put((uint32_t)az, 32);
+	for(int i = 0; i < n; i++){
+		const RelaySendEntry& e = entries[i];
+		const RelayWireRecord& r = *e.rec;
+		w.Put(r.id, 12);
+		w.Put((uint32_t)r.flags | (e.abs ? RELAY_ABS_POS : 0u), 4);
+		if(e.abs){
+			w.Put((uint32_t)r.xMm, 32);
+			w.Put((uint32_t)r.yMm, 32);
+			w.Put((uint32_t)r.zMm, 32);
+		}else{
+			w.Put((uint16_t)e.dx, 16);
+			w.Put((uint16_t)e.dy, 16);
+			w.Put((uint16_t)e.dz, 16);
+		}
+		w.Put(r.heading, 8);
+		w.Put(r.speed, 8);
+		w.Put(r.health, 7);
+		if(r.flags & RELAY_INVEHICLE){
+			w.Put(r.vehicleId, 16);
+			w.Put(r.seat, 3);
+		}
+	}
+}
+
 inline void WriteRoster(BitWriter& w, const MsgRosterEntry* entries, int count)
 {
 	int n = count;
