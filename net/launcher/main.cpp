@@ -166,27 +166,41 @@ static bool LoadCefUi()
 // ---------------------------------------------------------------------------
 // queries (worker threads)
 // ---------------------------------------------------------------------------
-static std::vector<ServerRow> QueryMaster(const std::string& host, uint16_t port)
+// `outErr` explains an empty list (unreachable vs. a master with no servers),
+// `outAnswered` is true only when the master actually replied with a list.
+static std::vector<ServerRow> QueryMaster(const std::string& host, uint16_t port,
+                                          std::string* outErr = nullptr,
+                                          bool* outAnswered = nullptr)
 {
 	std::vector<ServerRow> rows;
+	if(outAnswered) *outAnswered = false;
 	ENetHost* client = enet_host_create(nullptr, 1, 2, 0, 0);
-	if(!client) return rows;
+	if(!client){
+		if(outErr) *outErr = "no network stack";
+		return rows;
+	}
 
 	ENetAddress addr;
 	if(enet_address_set_host(&addr, host.c_str()) < 0){
 		enet_host_destroy(client);
+		if(outErr) *outErr = "cannot resolve " + host;
 		return rows;
 	}
 	addr.port = port;
 	ENetPeer* peer = enet_host_connect(client, &addr, 2, 0);
-	if(!peer){ enet_host_destroy(client); return rows; }
+	if(!peer){
+		enet_host_destroy(client);
+		if(outErr) *outErr = "cannot start a connection";
+		return rows;
+	}
 
 	double t0 = GetTickCount64() / 1000.0;
-	bool sent = false;
+	bool sent = false, connected = false, answered = false;
 	while(GetTickCount64() / 1000.0 - t0 < 3.0){
 		ENetEvent ev;
 		while(enet_host_service(client, &ev, 0) > 0){
 			if(ev.type == ENET_EVENT_TYPE_CONNECT && !sent){
+				connected = true;
 				BitWriter w;
 				BeginMsg(w, MSG_MASTER_LIST_REQ);
 				ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(),
@@ -198,6 +212,7 @@ static std::vector<ServerRow> QueryMaster(const std::string& host, uint16_t port
 				BitReader r(ev.packet->data, ev.packet->dataLength);
 				MsgType type = (MsgType)r.ReadU8();
 				if(type == MSG_MASTER_LIST_RESP){
+					answered = true;
 					uint16_t count = r.ReadU16();
 					for(uint16_t i = 0; i < count; i++){
 						MasterListEntry e;
@@ -221,10 +236,15 @@ static std::vector<ServerRow> QueryMaster(const std::string& host, uint16_t port
 				enet_packet_destroy(ev.packet);
 			}
 		}
-		if(sent && !rows.empty()) break;
+		if(answered) break;
 		Sleep(10);
 	}
 	enet_host_destroy(client);
+	if(outAnswered) *outAnswered = answered;
+	if(outErr){
+		if(!connected) *outErr = "no answer within 3 s";
+		else if(!answered) *outErr = "connected but no list reply";
+	}
 	return rows;
 }
 
@@ -266,9 +286,10 @@ static bool ProbeMaster(const std::string& host, uint16_t port, std::string& err
 	return connected;
 }
 
-static std::vector<ServerRow> QueryMasterDefault()
+static std::vector<ServerRow> QueryMasterDefault(std::string* outErr = nullptr,
+                                                bool* outAnswered = nullptr)
 {
-	return QueryMaster(g_masterHost, g_masterPort);
+	return QueryMaster(g_masterHost, g_masterPort, outErr, outAnswered);
 }
 
 // masterHints (optional): "ip:port" of masters hinted by LAN responders
@@ -512,6 +533,24 @@ static bool ProbeIntoRow(const std::string& address, ServerRow& row, std::string
 	row.pingMs = info.pingMs;
 	row.protocolVersion = info.protocolVersion;
 	return true;
+}
+
+// Drop rows advertising a protocol this client cannot speak: the server refuses
+// the handshake ("protocol version mismatch"), so listing them only makes the
+// browser look like it has playable servers. Returns how many were removed.
+// Rows with protocolVersion 0 (the master list does not advertise it) stay and
+// are flagged as stale by the UI once they are probed.
+static size_t DropOutdated(std::vector<ServerRow>& rows)
+{
+	std::vector<ServerRow> keep;
+	keep.reserve(rows.size());
+	size_t outdated = 0;
+	for(const ServerRow& r : rows){
+		if(r.protocolVersion && r.protocolVersion != PROTOCOL_VERSION){ outdated++; continue; }
+		keep.push_back(r);
+	}
+	rows.swap(keep);
+	return outdated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,22 +1508,50 @@ static void HandleQuery(const char* request, void*)
 				}
 			}
 			else {
-				rows = QueryMasterDefault();
+				std::string mErr;
+				bool answered = false;
+				rows = QueryMasterDefault(&mErr, &answered);
 				if(rows.empty()){
-					// configured master unreachable (fresh machines default to
-					// 127.0.0.1) — fall back to a master discovered on the LAN
-					std::vector<std::string> hints;
-					QueryLan(&hints);
-					for(const std::string& h : hints){
-						size_t c = h.rfind(':');
-						if(c == std::string::npos) continue;
-						rows = QueryMaster(h.substr(0, c), (uint16_t)atoi(h.substr(c + 1).c_str()));
-						if(!rows.empty()){
-							Log("[QUERY] master fallback via %s", h.c_str());
-							break;
+					// A master found on the LAN is the fallback for an install that
+					// has no master configured (fresh machines default to
+					// loopback) — it must never stand in for the internet list.
+					// Doing that is how the launcher ends up showing a private
+					// dev box while the public master is down, without saying so.
+					const bool unconfigured = g_masterHost.empty() ||
+					    g_masterHost == "127.0.0.1" || g_masterHost == "localhost" ||
+					    g_masterHost == "::1";
+					if(unconfigured){
+						std::vector<std::string> hints;
+						QueryLan(&hints);
+						for(const std::string& h : hints){
+							size_t c = h.rfind(':');
+							if(c == std::string::npos) continue;
+							rows = QueryMaster(h.substr(0, c), (uint16_t)atoi(h.substr(c + 1).c_str()));
+							if(!rows.empty()){
+								note = "no master configured — showing the LAN master " + h;
+								Log("[QUERY] master fallback via %s", h.c_str());
+								break;
+							}
 						}
+					}else if(!answered){
+						note = "master " + g_masterHost + ":" +
+						       std::to_string((int)g_masterPort) + " unreachable (" + mErr +
+						       ") — LAN servers are on the LAN tab";
+						Log("[QUERY] %s", note.c_str());
+					}else{
+						note = "master answered but lists no servers";
 					}
 				}
+			}
+			// unjoinable rows (old protocol) never reach the browser; tell the
+			// player how many were hidden instead of listing dead servers
+			if(size_t outdated = DropOutdated(rows)){
+				std::string why = std::to_string(outdated) +
+				    (outdated == 1 ? " outdated server hidden" : " outdated servers hidden") +
+				    " (protocol v" + std::to_string((int)PROTOCOL_VERSION) + " only)";
+				note = note.empty() ? why : note + " · " + why;
+				Log("[QUERY] hid %zu outdated server(s) (protocol != v%d)", outdated,
+				    (int)PROTOCOL_VERSION);
 			}
 			{
 				// remember what the UI is showing: probe/pingall address rows by index
@@ -1812,7 +1879,8 @@ static int SelfTest(bool cefLoaded)
 		    r.hostname.c_str(), r.address.c_str(), r.players, r.maxPlayers, r.gameMode.c_str());
 
 	auto lan = QueryLan();
-	Log("[SELFTEST] lan -> %zu servers", lan.size());
+	size_t lanStale = DropOutdated(lan);
+	Log("[SELFTEST] lan -> %zu servers (%zu outdated hidden)", lan.size(), lanStale);
 	for(auto& r : lan)
 		Log("[SELFTEST] lan: \"%s\" %s %d/%d mode=%s",
 		    r.hostname.c_str(), r.address.c_str(), r.players, r.maxPlayers, r.gameMode.c_str());
@@ -1898,8 +1966,10 @@ static int SelfTest(bool cefLoaded)
 	Log("[SELFTEST] cef: dll=%d page_loaded=%d host_js_host_roundtrip=%d",
 	    (int)cefLoaded, (int)uiLoaded, (int)uiEcho);
 
-	bool pass = !master.empty() && !lan.empty() && userOk && cefLoaded && uiLoaded && uiEcho &&
-	            favOk && probeOk;
+	// a LAN that answered only with outdated servers still proves the discovery
+	// path; the rows are hidden from the browser on purpose, so don't fail here
+	bool pass = !master.empty() && (!lan.empty() || lanStale > 0) && userOk && cefLoaded &&
+	            uiLoaded && uiEcho && favOk && probeOk;
 	Log("[SELFTEST] RESULT: %s", pass ? "PASS" : "FAIL");
 	return pass ? 0 : 1;
 }
