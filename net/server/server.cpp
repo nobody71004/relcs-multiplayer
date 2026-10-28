@@ -254,13 +254,19 @@ double Server::Now() const
 // of Tick. The old per-packet enet_host_flush made a 2k-player tick cost one
 // syscall per (state, receiver) pair, which is exactly what a load test
 // measures itself against.
-void Server::SendTo(ENetPeer* peer, const BitWriter& w, uint8_t channel, bool reliable)
+void Server::SendToBytes(ENetPeer* peer, const uint8_t* data, size_t bytes,
+                         uint8_t channel, bool reliable)
 {
 	if(!peer) return;
-	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(),
+	ENetPacket* pkt = enet_packet_create(data, bytes,
 	                                     reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
 	enet_peer_send(peer, channel, pkt);
 	m_statsStatePackets++;
+}
+
+void Server::SendTo(ENetPeer* peer, const BitWriter& w, uint8_t channel, bool reliable)
+{
+	SendToBytes(peer, w.Data(), w.ByteSize(), channel, reliable);
 }
 
 void Server::Broadcast(const BitWriter& w, uint8_t channel, bool reliable, rnet::PlayerId exceptId)
@@ -793,19 +799,20 @@ void Server::HandleAppearance(ServerPlayer* p, BitReader& r)
 	Log("[appearance] %s is model %d", p->name.c_str(), (int)m.model);
 }
 
+// A client state is only *staged* here: the tick drains one slot per client
+// (ApplyPendingStates). A client that clumps two states into a single tick —
+// arrival jitter, or catching up after a stall — used to pay full validation,
+// ledger and anti-cheat work twice, the second time on a frame the relay never
+// needed. The tick now validates exactly the frame it will relay.
 void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 {
 	PlayerState st;
 	if(!ReadPlayerState(r, st)) return;
 
-	// rcon-authed admins run admin tools (noclip, teleports, self-granted
-	// money) that legitimately trip every anti-cheat budget — exempt them
-	// from all penalties while keeping payload sanity as a hard floor
-	bool admin = p->rconAuthed;
-
-	// tough payload sanity first: garbage states never touch game logic
+	// tough payload sanity first, at the ingress: garbage never occupies the
+	// pending slot, so it can never be adopted when the tick drains it
 	if(!ValidateStateSanity(st)){
-		if(admin){
+		if(p->rconAuthed){
 			Log("[anticheat] %s insane state payload (admin — ignored)", p->name.c_str());
 			return;
 		}
@@ -817,7 +824,40 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	}
 	st.ammo = ClampAmmo(st.ammo);
 
-	double t = Now();
+	// newest wins: the slot holds one frame, the freshest one received
+	if(p->statePending) m_statsStateCoalesced++;
+	p->pendingState = st;
+	p->pendingStateTime = Now();
+	p->statePending = true;
+	m_statsStateMsgs++;
+}
+
+// Drain the per-client state slots once per tick, before the relay is built:
+// this is the "one player state per client per tick" contract the validation,
+// wallet ledger and relay are sized for.
+void Server::ApplyPendingStates()
+{
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active || !p.statePending) continue;
+		p.statePending = false;
+		// arrival, not now: a client pacing at 10 Hz keeps an honest 100 ms dt
+		// even though the state is applied on the tick it landed in
+		ApplyPlayerState(&p, p.pendingState, p.pendingStateTime);
+		m_statsStatesApplied++;
+	}
+}
+
+void Server::ApplyPlayerState(ServerPlayer* p, const PlayerState& stIn, double arrival)
+{
+	PlayerState st = stIn;
+	double t = arrival;
+
+	// rcon-authed admins run admin tools (noclip, teleports, self-granted
+	// money) that legitimately trip every anti-cheat budget — exempt them
+	// from all penalties while keeping payload sanity as a hard floor
+	bool admin = p->rconAuthed;
+
 	float dt = (float)(t - p->lastStateTime);
 	// arrival jitter can compress gaps and make a legal step look faster than
 	// it really was: never evaluate a step quicker than the nominal tick, and
@@ -1558,6 +1598,10 @@ void Server::Tick()
 		}
 	}
 
+	// inbound player states: one validation + adoption per client per tick,
+	// before the relay and the gamemode read them
+	ApplyPendingStates();
+
 	// respawns
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& p = m_players[i];
@@ -1682,9 +1726,15 @@ void Server::RelayStates()
 		int c = AoiCellOf(p.state.xMm, p.state.yMm, m_aoiCell, m_aoiDim);
 		m_aoiNext[(size_t)i] = m_aoiHead[(size_t)c];
 		m_aoiHead[(size_t)c] = i;
+		// Identity, facing, speed, health and vehicle are the same for every
+		// receiver: quantize them once here instead of once per receiver.
+		MakeRelayWireRecord(p.state, m_relayWire[i]);
 	}
 
-	PlayerState batch[MAX_STATES_PER_PACKET];
+	// Entries carry the receiver's own cm offsets, so a receiver's batch is
+	// packed straight from the cache without re-deriving anything.
+	RelaySendEntry batch[MAX_STATES_PER_PACKET];
+	uint8_t frame[1 + RELAY_PAYLOAD_BYTES + 8];   // type byte + payload budget
 	int n = 0;
 	int batchBits = RELAY_ANCHOR_BITS;          // count + anchor already counted
 	const int budgetBits = RELAY_PAYLOAD_BYTES * 8;
@@ -1710,12 +1760,12 @@ void Server::RelayStates()
 		n = 0;
 		auto flushQ = [&](){
 			if(n == 0) return;
-			BitWriter w;
-			BeginMsg(w, MSG_STATE_BATCH);
 			// positions ride as deltas from the receiver, so a 200 m AOI fits
 			// 16-bit centimetre offsets and a whole update fits one datagram
-			WriteStateBatch(w, batch, n, qxMm, qyMm, qzMm);
-			SendTo(q.peer, w, CHAN_STATE, false);
+			BitSink sink(frame, sizeof frame);
+			BeginMsg(sink, MSG_STATE_BATCH);
+			WriteRelayBatch(sink, batch, n, qxMm, qyMm, qzMm);
+			SendToBytes(q.peer, frame, sink.Finish(), CHAN_STATE, false);
 			m_statsRelayStates += (uint64_t)n;
 			m_statsRelayBatches++;
 			n = 0;
@@ -1731,21 +1781,30 @@ void Server::RelayStates()
 				for(int pi = m_aoiHead[(size_t)(y * m_aoiDim + x)]; pi >= 0;
 				    pi = m_aoiNext[(size_t)pi]){
 					if(pi == qi) continue;
-					ServerPlayer& p = m_players[pi];
-					if(p.lastStateTime <= 0.0) continue;
-					float dx = (p.state.xMm - qxMm) * 0.001f;
-					float dy = (p.state.yMm - qyMm) * 0.001f;
-					float dz = (p.state.zMm - qzMm) * 0.001f;
-					float d2 = dx * dx + dy * dy + dz * dz;
+					if(m_players[pi].lastStateTime <= 0.0) continue;
+					const RelayWireRecord& rec = m_relayWire[pi];
+					float dxm = (rec.xMm - qxMm) * 0.001f;
+					float dym = (rec.yMm - qyMm) * 0.001f;
+					float dzm = (rec.zMm - qzMm) * 0.001f;
+					float d2 = dxm * dxm + dym * dym + dzm * dzm;
 					if(d2 > stream2) continue;
 					if(!farSweep && d2 > near2) continue;   // far tier is due next tick
-					int entryBits = RelayEntryBits(p.state, qxMm, qyMm, qzMm);
+					// bitwise & so all three offsets are converted, not just up to
+					// the first one that overflows the delta range
+					int16_t dx = 0, dy = 0, dz = 0;
+					bool delta = RelayDeltaCm(rec.xMm, qxMm, dx) &
+					             RelayDeltaCm(rec.yMm, qyMm, dy) &
+					             RelayDeltaCm(rec.zMm, qzMm, dz);
+					int entryBits = RelayWireRecordBits(rec, delta);
 					// split on encoded size as well as record count: a record can
 					// be wider than its neighbours (absolute position, in a
 					// vehicle) and the packet must never cross the payload budget
 					if(n > 0 && (n == MAX_STATES_PER_PACKET ||
 					   batchBits + entryBits > budgetBits)) flushQ();
-					batch[n++] = p.state;
+					RelaySendEntry& e = batch[n++];
+					e.rec = &rec;
+					e.dx = dx; e.dy = dy; e.dz = dz;
+					e.abs = delta ? 0 : 1;
 					batchBits += entryBits;
 				}
 			}
@@ -1791,7 +1850,9 @@ void Server::LogNetStats(double t)
 	double nTicks = m_statsTicks ? (double)m_statsTicks : 1.0;
 	Log("netstats: players=%d/%d spawned=%d peers=%d tick_ms avg=%.2f max=%.2f budget=%.1f "
 	    "pump_ms %.2f/%.2f relay_ms %.2f/%.2f flush_ms %.2f/%.2f "
-	    "relay_states/s=%llu relay_batches/s=%llu pkts_out/s=%llu pkts_in/s=%llu "
+	    "relay_states/s=%llu relay_batches/s=%llu "
+	    "states_in/s=%llu states_apply/s=%llu coalesced/s=%llu "
+	    "pkts_out/s=%llu pkts_in/s=%llu "
 	    "in=%.1fKB/s out=%.1fKB/s "
 	    "rtt_avg=%ums rtt_max=%ums loss_max=%.1f%% joins=%llu leaves=%llu kicks=%llu",
 	    active, m_cfg.maxPlayers, spawned, peers,
@@ -1801,6 +1862,9 @@ void Server::LogNetStats(double t)
 	    m_statsFlushMsSum / nTicks, m_statsFlushMsMax,
 	    (unsigned long long)m_statsRelayStates,
 	    (unsigned long long)m_statsRelayBatches,
+	    (unsigned long long)m_statsStateMsgs,
+	    (unsigned long long)m_statsStatesApplied,
+	    (unsigned long long)m_statsStateCoalesced,
 	    (unsigned long long)pkOut, (unsigned long long)pkIn,
 	    inRate / 1024.0, outRate / 1024.0,
 	    (unsigned)(rttN ? rttSum / rttN : 0), (unsigned)rttMax,
@@ -1825,6 +1889,9 @@ void Server::ResetTickStats()
 	m_statsTicks = 0;
 	m_statsStates = 0;
 	m_statsStatePackets = 0;
+	m_statsStateMsgs = 0;
+	m_statsStatesApplied = 0;
+	m_statsStateCoalesced = 0;
 	m_statsTickMsSum = 0.0;
 	m_statsTickMsMax = 0.0;
 	m_statsPumpMsSum = 0.0;

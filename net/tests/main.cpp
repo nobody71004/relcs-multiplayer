@@ -5,15 +5,19 @@
 #include "profiles.h"
 #include "passhash.h"
 #include "anticheat_config.h"
+#include "server.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1668,6 +1672,423 @@ static void TestHighPlayerCount()
 	}
 }
 
+// The server's relay fast path must be a pure speed-up: same bytes on the
+// wire as WriteStateBatch, which stays the reference encoder.
+static void TestRelayFastPath()
+{
+	uint32_t seed = 0x5EED1234u;
+	auto rnd = [&]() -> uint32_t {
+		seed = seed * 1664525u + 1013904223u;
+		return seed >> 8;
+	};
+
+	const int32_t ax = 1234567, ay = -765432, az = 42000;   // 1.2 km, -0.8 km, 42 m
+	PlayerState st[MAX_STATES_PER_PACKET];
+	RelayWireRecord wire[MAX_STATES_PER_PACKET];
+	RelaySendEntry entry[MAX_STATES_PER_PACKET];
+	// equivalence is checked on whole batches, which may exceed one datagram;
+	// the budget (and the server's split) is a separate property below
+	std::vector<uint8_t> frame(4 * (1 + RELAY_PAYLOAD_BYTES));
+
+	int mismatches = 0, bitMismatches = 0, decodeMismatches = 0;
+	for(int trial = 0; trial < 40; trial++){
+		const int count = 1 + (int)(rnd() % MAX_STATES_PER_PACKET);
+		for(int i = 0; i < count; i++){
+			PlayerState& s = st[i];
+			s = PlayerState{};
+			s.playerId = (PlayerId)(rnd() % 4096);
+			// mostly inside a 200 m AOI, sometimes far enough to need absolute mm
+			int32_t reach = (trial % 5 == 4) ? 900000 : 190000;
+			s.xMm = ax + (int32_t)(rnd() % (uint32_t)(reach * 2)) - reach;
+			s.yMm = ay + (int32_t)(rnd() % (uint32_t)(reach * 2)) - reach;
+			s.zMm = az + (int32_t)(rnd() % 200000) - 100000;
+			s.heading = (int16_t)rnd();
+			s.velX = (int16_t)(rnd() % 1200);
+			s.velY = (int16_t)(rnd() % 1200);
+			s.health = (uint8_t)(rnd() % 200);
+			if(trial % 3 == 0 && (rnd() & 1)){
+				s.vehicleId = (uint16_t)(rnd() % MAX_VEHICLES);
+				s.seat = (rnd() & 1) ? 0xFF : (uint8_t)(rnd() % 8);
+			}
+			if(rnd() & 1) s.moveFlags = MOVEFLAG_TELEPORT;
+
+			MakeRelayWireRecord(s, wire[i]);
+			int16_t dx = 0, dy = 0, dz = 0;
+			bool delta = RelayDeltaCm(wire[i].xMm, ax, dx) &
+			             RelayDeltaCm(wire[i].yMm, ay, dy) &
+			             RelayDeltaCm(wire[i].zMm, az, dz);
+			if(RelayWireRecordBits(wire[i], delta) != RelayEntryBits(s, ax, ay, az))
+				bitMismatches++;
+			entry[i].rec = &wire[i];
+			entry[i].dx = dx; entry[i].dy = dy; entry[i].dz = dz;
+			entry[i].abs = delta ? 0 : 1;
+		}
+
+		BitWriter ref;
+		BeginMsg(ref, MSG_STATE_BATCH);
+		WriteStateBatch(ref, st, count, ax, ay, az);
+
+		BitSink sink(frame.data(), frame.size());
+		BeginMsg(sink, MSG_STATE_BATCH);
+		WriteRelayBatch(sink, entry, count, ax, ay, az);
+		size_t bytes = sink.Finish();
+		if(!sink.Ok() || bytes != ref.ByteSize() ||
+		   std::memcmp(frame.data(), ref.Data(), bytes) != 0) mismatches++;
+
+		// both frames decode to the same states (the reader starts after the
+		// message-type byte, as the client's dispatcher does)
+		BitReader rRef(ref.Data(), ref.ByteSize());
+		BitReader rNew(frame.data(), bytes);
+		CHECK(rRef.ReadU8() == MSG_STATE_BATCH);
+		CHECK(rNew.ReadU8() == MSG_STATE_BATCH);
+		PlayerState outRef[MAX_STATES_PER_PACKET], outNew[MAX_STATES_PER_PACKET];
+		int nRef = ReadStateBatch(rRef, outRef, MAX_STATES_PER_PACKET);
+		int nNew = ReadStateBatch(rNew, outNew, MAX_STATES_PER_PACKET);
+		if(nRef != count || nNew != count) decodeMismatches++;
+		else{
+			for(int i = 0; i < count; i++){
+				if(outRef[i].playerId != outNew[i].playerId ||
+				   outRef[i].xMm != outNew[i].xMm || outRef[i].yMm != outNew[i].yMm ||
+				   outRef[i].zMm != outNew[i].zMm ||
+				   outRef[i].heading != outNew[i].heading ||
+				   outRef[i].velX != outNew[i].velX ||
+				   outRef[i].health != outNew[i].health ||
+				   outRef[i].vehicleId != outNew[i].vehicleId ||
+				   outRef[i].seat != outNew[i].seat ||
+				   outRef[i].moveFlags != outNew[i].moveFlags) decodeMismatches++;
+			}
+		}
+	}
+	CHECK(mismatches == 0);
+	CHECK(bitMismatches == 0);
+	CHECK(decodeMismatches == 0);
+
+	// The server's split rule (relay_ms budget accounting in RelayStates) must
+	// still keep every frame inside one datagram's payload, including the wide
+	// absolute-position records, and lose nothing across the splits.
+	{
+		uint8_t pkt[1 + RELAY_PAYLOAD_BYTES + 8];
+		const int budgetBits = RELAY_PAYLOAD_BYTES * 8;
+		int n = 0, batchBits = RELAY_ANCHOR_BITS, seen = 0, frames = 0;
+		bool budgetOk = true;
+		const int total = MAX_STATES_PER_PACKET;
+		RelaySendEntry sent[MAX_STATES_PER_PACKET];
+		auto flush = [&]{
+			if(n == 0) return;
+			BitSink sink(pkt, sizeof pkt);
+			BeginMsg(sink, MSG_STATE_BATCH);
+			WriteRelayBatch(sink, sent, n, ax, ay, az);
+			size_t bytes = sink.Finish();
+			if(!sink.Ok()) budgetOk = false;
+			BitReader r(sink.Ok() ? pkt : nullptr, sink.Ok() ? bytes : 0);
+			PlayerState out[MAX_STATES_PER_PACKET];
+			if(!sink.Ok() || r.ReadU8() != MSG_STATE_BATCH ||
+			   ReadStateBatch(r, out, MAX_STATES_PER_PACKET) != n) budgetOk = false;
+			seen += n;
+			frames++;
+			n = 0;
+			batchBits = RELAY_ANCHOR_BITS;
+		};
+		for(int i = 0; i < total; i++){
+			RelaySendEntry e;
+			e.rec = &wire[i % 40];
+			e.abs = (i % 3) == 2;                     // every third record falls back
+			int bits = RelayWireRecordBits(*e.rec, !e.abs);
+			if(n > 0 && batchBits + bits > budgetBits) flush();
+			sent[n++] = e;
+			batchBits += bits;
+		}
+		flush();
+		CHECK(budgetOk);
+		CHECK(seen == total);
+		CHECK(frames > 1);            // 128 wide records cannot fit one datagram
+	}
+
+	// an empty batch is a legal (if pointless) frame: count 0 + anchor
+	{
+		BitSink sink(frame.data(), frame.size());
+		BeginMsg(sink, MSG_STATE_BATCH);
+		WriteRelayBatch(sink, entry, 0, ax, ay, az);
+		CHECK(sink.Finish() == 15);            // type 8b + count 16b + anchor 96b
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Server: inbound player-state coalescing
+//
+// Two MSG_PLAYER_STATE frames from one client inside a single tick must leave
+// only the freshest frame validated and adopted. The test drives the server
+// directly (PumpNetwork, then one Tick), so "inside one tick" is exact rather
+// than a timing race: both frames are staged by the pump, nothing validates
+// them until the tick drains the client's slot.
+//
+// The superseded frame is deliberately illegal (a 40 m step on foot). Without
+// coalescing the server validated it on arrival, emitted MSG_CORRECTION and
+// recorded a violation before adopting the freshest frame; the test asserts
+// that correction is gone, that the relay carries the freshest position, and
+// a negative control (the same illegal frame sent alone) still corrects.
+// ---------------------------------------------------------------------------
+struct ServerTestPeer {
+	static void Pump(Server& s) { s.PumpNetwork(); }
+	static void Tick(Server& s) { s.Tick(); }
+	static uint64_t Staged(const Server& s) { return s.m_statsStateMsgs; }
+	static uint64_t Applied(const Server& s) { return s.m_statsStatesApplied; }
+	static uint64_t Coalesced(const Server& s) { return s.m_statsStateCoalesced; }
+	static int Violations(Server& s, PlayerId id)
+	{
+		ServerPlayer* p = s.FindPlayer(id);
+		return p ? p->violations : -1;
+	}
+};
+
+namespace {
+
+struct CoalesceClient {
+	ENetHost* host = nullptr;
+	ENetPeer* peer = nullptr;
+	char name[32] = {};
+	PlayerId id = 0;
+	PlayerId remoteId = 0;
+	bool welcomed = false;
+	bool spawned = false;
+	bool refused = false;
+	bool gotCorrection = false;
+	int32_t correctionX = 0;
+	bool gotRemote = false;
+	int32_t remoteX = 0;
+};
+
+bool CoalesceOpen(CoalesceClient& c, uint16_t port, const char* name)
+{
+	CopyStr(c.name, sizeof c.name, name);
+	c.host = enet_host_create(nullptr, 1, 2, 0, 0);
+	if(!c.host) return false;
+	ENetAddress addr;
+	if(enet_address_set_host(&addr, "127.0.0.1") != 0){
+		enet_host_destroy(c.host); c.host = nullptr;
+		return false;
+	}
+	addr.port = port;
+	c.peer = enet_host_connect(c.host, &addr, 2, 0);
+	if(!c.peer){
+		enet_host_destroy(c.host); c.host = nullptr;
+		return false;
+	}
+	return true;
+}
+
+void CoalesceClose(CoalesceClient& c)
+{
+	if(c.host){
+		if(c.peer) enet_peer_reset(c.peer);
+		enet_host_destroy(c.host);
+		c.host = nullptr; c.peer = nullptr;
+	}
+}
+
+PlayerState CoalesceState(PlayerId id, float x, float y, uint8_t moveFlags)
+{
+	PlayerState st;
+	st.playerId = id;
+	st.xMm = QuantPos(x); st.yMm = QuantPos(y); st.zMm = QuantPos(0.0f);
+	st.velX = st.velY = st.velZ = 0;
+	st.heading = QuantAngle(90.0f); st.pitch = 0;
+	st.animId = 0; st.animFlags = 0;
+	st.health = 100; st.armour = 0;
+	st.weapon = 0; st.ammo = 0; st.money = 0;
+	st.vehicleId = VEHICLE_NONE; st.seat = 0xFF;
+	st.moveFlags = moveFlags;
+	return st;
+}
+
+void CoalesceSend(CoalesceClient& c, const PlayerState& st)
+{
+	BitWriter w;
+	BeginMsg(w, MSG_PLAYER_STATE);
+	WritePlayerState(w, st);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), 0);   // unreliable, like the game
+	enet_peer_send(c.peer, CHAN_STATE, pkt);
+}
+
+void CoalesceService(CoalesceClient& c)
+{
+	if(!c.host) return;
+	ENetEvent ev;
+	while(enet_host_service(c.host, &ev, 0) > 0){
+		switch(ev.type){
+		case ENET_EVENT_TYPE_CONNECT:{
+			// HELLO as soon as the transport is up
+			BitWriter w;
+			BeginMsg(w, MSG_HELLO);
+			MsgHello hello;
+			hello.protocolVersion = PROTOCOL_VERSION;
+			CopyStr(hello.name, sizeof hello.name, c.name);
+			WriteHello(w, hello);
+			ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+			enet_peer_send(ev.peer, CHAN_RELIABLE, pkt);
+			break;
+		}
+		case ENET_EVENT_TYPE_RECEIVE:{
+			BitReader r(ev.packet->data, ev.packet->dataLength);
+			MsgType type = (MsgType)r.ReadU8();
+			switch(type){
+			case MSG_WELCOME:{
+				MsgWelcome wel;
+				if(ReadWelcome(r, wel)){
+					c.id = wel.playerId;
+					c.welcomed = true;
+					BitWriter w;
+					BeginMsg(w, MSG_SPAWN_REQ);
+					ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+					enet_peer_send(ev.peer, CHAN_RELIABLE, pkt);
+				}
+				break;
+			}
+			case MSG_SPAWN:{
+				MsgSpawn sp;
+				if(ReadSpawn(r, sp) && sp.playerId == c.id) c.spawned = true;
+				break;
+			}
+			case MSG_CORRECTION:{
+				PlayerState st;
+				if(ReadPlayerState(r, st)){
+					c.gotCorrection = true;
+					c.correctionX = st.xMm;
+				}
+				break;
+			}
+			case MSG_STATE_BATCH:{
+				PlayerState states[MAX_STATES_PER_PACKET];
+				int n = ReadStateBatch(r, states, MAX_STATES_PER_PACKET);
+				for(int i = 0; i < n; i++){
+					if(states[i].playerId == c.remoteId){
+						c.gotRemote = true;
+						c.remoteX = states[i].xMm;
+					}
+				}
+				break;
+			}
+			case MSG_KICK:
+			case MSG_DISCONNECT:
+				c.refused = true;
+				break;
+			default:
+				break;
+			}
+			enet_packet_destroy(ev.packet);
+			break;
+		}
+		case ENET_EVENT_TYPE_DISCONNECT:
+			c.refused = true;
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+} // namespace
+
+static void TestServerStateCoalescing()
+{
+	std::unique_ptr<Server> srv(new Server());
+	ServerConfig cfg;
+	cfg.hostname = "coalesce test";
+	cfg.maxPlayers = 8;
+	cfg.gamemode = "freeroam";
+	cfg.announce = false;
+	cfg.lanDiscover = false;
+	cfg.profilesDb = "";
+	cfg.resourcesDir = "";
+	cfg.vehiclesFile = "";
+	cfg.logFile = "";
+	cfg.ac.enabled = false;
+	cfg.ac.requireProtected = false;
+
+	uint16_t port = 0;
+	for(uint16_t p = 17777; p <= 17796 && !port; p++){
+		cfg.port = p;
+		if(srv->Init(cfg)) port = p;
+	}
+	CHECK(port != 0);
+	if(!port) return;
+
+	CoalesceClient a, b;
+	CHECK(CoalesceOpen(a, port, "CoalesceA"));
+	CHECK(CoalesceOpen(b, port, "CoalesceB"));
+	if(!a.host || !b.host){ CoalesceClose(a); CoalesceClose(b); return; }
+
+	auto step = [&](int ms){
+		for(int i = 0; i < ms; i++){
+			ServerTestPeer::Pump(*srv);
+			CoalesceService(a);
+			CoalesceService(b);
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	};
+	auto tick = [&]{
+		ServerTestPeer::Tick(*srv);
+		CoalesceService(a);
+		CoalesceService(b);
+	};
+
+	for(int i = 0; i < 3000 && !(a.spawned && b.spawned) && !a.refused && !b.refused; i++) step(1);
+	CHECK(a.spawned && b.spawned);
+	if(!(a.spawned && b.spawned)){ CoalesceClose(a); CoalesceClose(b); return; }
+	a.remoteId = b.id;
+	b.remoteId = a.id;
+
+	// a known, adjacent pair: the game's own relocations carry the teleport flag
+	CoalesceSend(a, CoalesceState(a.id, 100.0f, 0.0f, MOVEFLAG_TELEPORT));
+	CoalesceSend(b, CoalesceState(b.id, 110.0f, 0.0f, MOVEFLAG_TELEPORT));
+	enet_host_flush(a.host);
+	enet_host_flush(b.host);
+	step(10);
+	tick();
+
+	const uint64_t staged0 = ServerTestPeer::Staged(*srv);
+	const uint64_t applied0 = ServerTestPeer::Applied(*srv);
+	const uint64_t coalesced0 = ServerTestPeer::Coalesced(*srv);
+	const int violations0 = ServerTestPeer::Violations(*srv, a.id);
+	CHECK(violations0 == 0);
+
+	// two frames, one tick: the illegal 40 m step (400 m/s at the tick floor)
+	// is superseded by the legal 0.5 m step before anything is validated
+	a.gotCorrection = false;
+	b.gotRemote = false;
+	CoalesceSend(a, CoalesceState(a.id, 140.0f, 0.0f, 0));
+	CoalesceSend(a, CoalesceState(a.id, 100.5f, 0.0f, 0));
+	enet_host_flush(a.host);
+	for(int i = 0; i < 100 && ServerTestPeer::Staged(*srv) < staged0 + 2; i++) step(1);
+	CHECK(ServerTestPeer::Staged(*srv) == staged0 + 2);          // both arrived
+	CHECK(ServerTestPeer::Coalesced(*srv) == coalesced0 + 1);   // one superseded
+	ServerTestPeer::Tick(*srv);
+	CoalesceService(a);
+	CoalesceService(b);
+
+	CHECK(ServerTestPeer::Applied(*srv) == applied0 + 1);       // one reached the tick
+	CHECK(ServerTestPeer::Violations(*srv, a.id) == violations0); // the illegal one never did
+	CHECK(!a.gotCorrection);                                     // no rubber-band for it
+	CHECK(b.gotRemote);
+	CHECK(b.remoteX == QuantPos(100.5f));                        // relay carries the freshest
+
+	// negative control: the same illegal frame sent alone is still corrected, so
+	// the assertions above are about coalescing, not about the jump being legal
+	a.gotCorrection = false;
+	const int violations1 = ServerTestPeer::Violations(*srv, a.id);
+	CoalesceSend(a, CoalesceState(a.id, 140.0f, 0.0f, 0));
+	enet_host_flush(a.host);
+	for(int i = 0; i < 100 && ServerTestPeer::Staged(*srv) < staged0 + 3; i++) step(1);
+	ServerTestPeer::Tick(*srv);
+	for(int i = 0; i < 50 && !a.gotCorrection; i++) step(1);
+	CHECK(a.gotCorrection);
+	CHECK(a.correctionX == QuantPos(100.5f));
+	CHECK(ServerTestPeer::Violations(*srv, a.id) == violations1 + 1);
+
+	CoalesceClose(a);
+	CoalesceClose(b);
+}
+
 int main()
 {
 	std::printf("rnet unit tests\n");
@@ -1676,6 +2097,7 @@ int main()
 	TestVoiceCodec();
 	TestWelcomeLiveInfo();
 	TestHighPlayerCount();
+	TestRelayFastPath();
 	TestVehDespawnCodec();
 	TestFavoritesCodec();
 	TestMasterEntryLiveInfo();
@@ -1696,6 +2118,8 @@ int main()
 	TestProfileStore();
 	TestProfileAuth();
 	TestProfileLegacyMigration();
+	// last: it boots a real server and prints its join/spawn lines
+	TestServerStateCoalescing();
 	std::printf("%d checks, %d failures — %s\n", g_checks, g_fails, g_fails ? "FAIL" : "PASS");
 	return g_fails ? 1 : 0;
 }

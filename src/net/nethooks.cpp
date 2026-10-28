@@ -2807,6 +2807,14 @@ void NetGame_Frame(void)
 				s_pendingSpawn = ev.state;
 				s_havePendingSpawn = true;
 			}
+			// RCON login has to travel *behind* the handshake. The connect-time
+			// send above races MSG_HELLO: the server drops every message from a
+			// peer it has not welcomed yet (it has no player to attach the auth
+			// to), so the password was silently lost and the admin panel stayed
+			// on "not authenticated" for the whole session. Re-send it now that
+			// the server has spawned us — this is when it can accept it.
+			if(!s_rconAuthed && !s_rconPw.empty())
+				s_net.SendRconAuth(s_rconPw.c_str());
 			s_welcomeUntil = NowSec() + 6.0;
 			// push the first inventory snapshot right after spawning
 			s_invForce = true;

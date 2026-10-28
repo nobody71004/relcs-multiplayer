@@ -56,9 +56,12 @@ project "net-tests"
 	language "C++"
 	cppdialect "C++17"
 	targetname "net-tests"
-	files { "tests/main.cpp", "server/profiles.cpp", "server/profiles.h", "server/resource.cpp", "server/resource.h", "server/anticheat_config.h" }
-	includedirs { "server", "../vendor/sqlite" }
-	links { "sqlite" }
+	-- the coalescing test drives a real Server (pump + single tick), so the
+	-- suite links the server translation units; anticheat.cpp needs the EOS
+	-- headers at build time even though the SDK is dlopen()ed at runtime
+	files { "tests/main.cpp", "server/server.cpp", "server/server.h", "server/gamemode.cpp", "server/gamemode.h", "server/anticheat.cpp", "server/anticheat.h", "server/profiles.cpp", "server/profiles.h", "server/resource.cpp", "server/resource.h", "server/anticheat_config.h" }
+	includedirs { "server", "../vendor/sqlite", "../vendor/eos-sdk/include" }
+	links { "sqlite", "iphlpapi" }
 	netCommon()
 	netOpus()
 
