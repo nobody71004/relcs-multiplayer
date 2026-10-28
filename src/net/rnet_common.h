@@ -10,7 +10,9 @@ namespace rnet {
 // ---------------------------------------------------------------------------
 // Identity / ports
 // ---------------------------------------------------------------------------
-constexpr uint16_t PROTOCOL_VERSION   = 7;  // v7: MsgVehSpawn carries the owner (entering player) id
+constexpr uint16_t PROTOCOL_VERSION   = 9;  // v9: relayed states are delta-coded against the receiver
+// v8: 16-bit player ids (a server may host >255 players)
+// v7: MsgVehSpawn carries the owner (entering player) id
 // v5: server map + static vehicles + master favorites
 constexpr uint16_t DEFAULT_PORT       = 7777;  // ENet game traffic (UDP)
 constexpr uint16_t DISCOVERY_PORT     = 7778;  // raw-UDP LAN discovery
@@ -26,7 +28,17 @@ constexpr const char* DEFAULT_RCON_PASSWORD = "relcs-admin-2026";
 // ---------------------------------------------------------------------------
 // Limits / rates
 // ---------------------------------------------------------------------------
-constexpr int MAX_PLAYERS   = 200;
+// Player identity is 16-bit on the wire: ids are 1..MAX_PLAYERS-1, 0 is the
+// server console (chat/RCON origin) and 0xFFFF means "no player".
+using PlayerId = uint16_t;
+constexpr PlayerId PLAYER_ID_SERVER = 0;
+constexpr PlayerId PLAYER_ID_NONE   = 0xFFFF;
+
+// Hard slot capacity. `maxplayers` in a server config may not exceed
+// MAX_SERVER_PLAYERS (2000 — the 2k load-test target); the extra slots are
+// headroom so a peer can be admitted while another is being retired.
+constexpr int MAX_PLAYERS        = 2048;
+constexpr int MAX_SERVER_PLAYERS = 2000;
 constexpr int MAX_VEHICLES  = 200;
 constexpr int MAX_NAME_LEN  = 24;
 constexpr int MAX_CHAT_LEN  = 160;
@@ -72,6 +84,15 @@ enum MsgType : uint8_t {
 	MSG_PLAYER_QUIT     = 11,
 	MSG_PLAYER_STATE    = 12,
 	MSG_VEHICLE_STATE   = 13,
+	// One packet carrying several player states (server -> client). Every tick
+	// the server groups the states one client is in range of into a handful of
+	// these instead of one packet per (state, receiver) pair — the send path
+	// stays O(players) instead of O(players²) at 1000+ players.
+	MSG_STATE_BATCH     = 14,
+	// A batch of player identities (name/skin/last spawn) so a newcomer's
+	// roster costs a few packets rather than one MSG_PLAYER_JOIN + MSG_SPAWN
+	// per player, and a full server can refresh names/skins cheaply.
+	MSG_ROSTER          = 15,
 	// rpcs
 	MSG_CHAT            = 20,
 	MSG_SPAWN_REQ       = 21,
@@ -98,6 +119,14 @@ enum MsgType : uint8_t {
 	MSG_RES_LIST        = 45, // mod/resource inventory for the admin panel
 	MSG_VOICE           = 46, // proximity voice frame (client->server: [u8 unused][u8 len][len x Opus]; server->client: [u8 fromId][u8 len][len x Opus])
 	MSG_PLAYER_PING     = 47, // server->client ~1 Hz: top players with ping/score (scoreboard + player list)
+	// EOS Anti-Cheat relay (see MsgAcHello/MsgAcPayload). Additive and
+	// negotiated: a client that never sends MSG_AC_HELLO is simply not
+	// registered and the server relays nothing to it, so old builds keep
+	// joining the same server without a protocol bump.
+	MSG_AC_HELLO        = 60, // client -> server: register this peer with EOS AC (PUID + id token + platform)
+	MSG_AC_TO_CLIENT    = 61, // server -> client: opaque EOS_AntiCheatServer payload
+	MSG_AC_FROM_CLIENT  = 62, // client -> server: opaque EOS_AntiCheatClient payload
+	MSG_AC_STATUS       = 63, // server -> client: registration result
 	// admin
 	MSG_RCON_AUTH       = 50,
 	MSG_RCON_OK         = 51,
@@ -227,7 +256,7 @@ struct MsgHello {
 };
 
 struct MsgWelcome {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	uint16_t tickRate = TICK_RATE;
 	float    streamDistance = STREAM_DISTANCE;
 	uint8_t  hour = 12, minute = 0, weather = 0;
@@ -235,38 +264,69 @@ struct MsgWelcome {
 	char     hostname[MAX_HOSTNAME_LEN] = {};
 	// v5: live server info — the launcher's browser tooltip reads these
 	// straight off a probe handshake (no master round trip needed)
-	uint8_t  players = 0, maxPlayers = 0;
+	uint16_t players = 0, maxPlayers = 0;
 	char     mapName[MAX_MAP_LEN] = {};
 };
 
 struct MsgPlayerJoin {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	uint16_t skinModel = 0;
 	char     name[MAX_NAME_LEN] = {};
 };
 
 struct MsgChat {
-	uint8_t  fromId = 0;      // 0 = server console
+	PlayerId fromId = 0;      // PLAYER_ID_SERVER = server console
 	uint16_t len = 0;
 	char     text[MAX_CHAT_LEN] = {};
 };
 
 struct MsgSpawn {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	uint16_t skinModel = 0;
 	float    x = 0, y = 0, z = 0, heading = 0;
 	uint8_t  health = 100, armour = 0;
 };
 
+// How many records may arrive in one MSG_STATE_BATCH / MSG_ROSTER packet.
+// Batches are split at these sizes so a snapshot stays well under the path MTU
+// (~1.2 KB) instead of fragmenting: a lost fragment must never cost a whole
+// tick. A relayed state is ~11-14 bytes (rnet_protocol.h), so the record cap is
+// high and RELAY_PAYLOAD_BYTES is what actually bounds a state packet: one
+// datagram then carries a whole 2000-player AOI.
+constexpr int MAX_STATES_PER_PACKET = 128;
+constexpr int RELAY_PAYLOAD_BYTES   = 1200;
+constexpr int MAX_ROSTER_PER_PACKET = 16;
+
+// MsgRosterEntry.flags
+constexpr uint8_t ROSTER_SPAWNED = 1;   // the position/health below are valid
+constexpr uint8_t ROSTER_ALIVE   = 2;
+
+// MSG_ROSTER — a batch of player identities:
+//   [u16 count][count × entry]
+// entry: [u16 id][u16 skin][u8 flags][u8 health][u8 armour]
+//        [i32 xMm][i32 yMm][i32 zMm][i16 heading][u16 len][name]
+// The roster is how a newcomer learns who is already here (a few packets
+// instead of one JOIN+SPAWN pair per player) and how a busy server refreshes
+// names/skins when the per-join broadcast is suppressed.
+struct MsgRosterEntry {
+	PlayerId id = 0;
+	uint16_t skin = 0;
+	uint8_t  flags = 0;
+	uint8_t  health = 100, armour = 0;
+	int32_t  xMm = 0, yMm = 0, zMm = 0;
+	int16_t  heading = 0;
+	char     name[MAX_NAME_LEN] = {};
+};
+
 struct MsgDeath {
-	uint8_t victimId = 0;
-	uint8_t killerId = 0xFF;
+	PlayerId victimId = 0;
+	PlayerId killerId = PLAYER_ID_NONE;   // environment/suicide
 	uint8_t weaponId = 0;
 };
 
 struct MsgDamage {
-	uint8_t  targetId = 0;
-	uint8_t  attackerId = 0;
+	PlayerId targetId = 0;
+	PlayerId attackerId = 0;
 	uint8_t  weaponId = 0;
 	uint16_t damage = 0;
 };
@@ -281,6 +341,7 @@ enum JoinRefused : uint8_t {
 	REFUSE_NAME     = 4, // name rejected
 	REFUSE_AUTH     = 5, // name is claimed and the password was wrong/missing
 	REFUSE_PASSWORD = 6, // password rejected (e.g. too short to claim)
+	REFUSE_ANTICHEAT = 7, // this server requires a protected (EOS AC) client
 };
 
 struct MsgKick {
@@ -297,21 +358,21 @@ enum GiveKind : uint8_t {
 	GIVE_HEALTH = 4, // amount = hit points
 };
 struct MsgGive {
-	uint8_t  targetId = 0;
+	PlayerId targetId = 0;
 	uint8_t  kind = 0;
 	int32_t  amount = 0;
 	uint16_t arg = 0;
 };
 
 struct MsgVehEnter {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	uint16_t vehicleId = 0xFFFF; // 0xFFFF = server assigns new id
 	uint8_t  seat = 0;
 	uint16_t modelId = 0;
 };
 
 struct MsgVehExit {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	uint16_t vehicleId = 0;
 };
 
@@ -319,7 +380,7 @@ struct MsgVehSpawn {
 	uint16_t vehicleId = 0;
 	uint16_t modelId = 0;
 	float    x = 0, y = 0, z = 0, heading = 0;
-	uint8_t  ownerId = 0xFF; // player whose enter allocated it (0xFF = static/admin)
+	PlayerId ownerId = PLAYER_ID_NONE; // player whose enter allocated it (NONE = static/admin)
 };
 
 // MSG_VEH_DESPAWN — the server retired a vehicle (admin delcar, static spawn
@@ -358,7 +419,7 @@ struct MsgPickup {
 };
 
 struct ScoreEntry {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	int32_t  score = 0;
 	uint16_t kills = 0, deaths = 0;
 };
@@ -371,7 +432,7 @@ struct MsgScoreUpdate {
 
 // one row of the player list: ping is the ENet round trip in ms (0 for NPCs)
 struct PingEntry {
-	uint8_t  playerId = 0;
+	PlayerId playerId = 0;
 	uint16_t pingMs = 0;
 	int32_t  score = 0;
 	uint16_t kills = 0, deaths = 0;
@@ -393,10 +454,64 @@ enum : uint8_t {
 
 struct MsgGamemodeEvent {
 	uint8_t  type = 0;
-	uint8_t  arg1 = 0;   // killer / winner …
-	uint8_t  arg2 = 0;   // victim …
+	PlayerId arg1 = 0;   // killer / winner …
+	PlayerId arg2 = 0;   // victim …
 	uint16_t len = 0;
 	char     text[MAX_CHAT_LEN] = {};
+};
+
+// ---------------------------------------------------------------------------
+// EOS Anti-Cheat relay (MSG_AC_*)
+//
+// The game server owns a live EOS_AntiCheatServer session. Clients that have a
+// local EOS_AntiCheatClient session register here with their ProductUserId and
+// a Connect ID token; the server verifies the token, calls
+// EOS_AntiCheatServer_RegisterClient with the peer as the opaque client handle
+// and then relays kernel-driver traffic verbatim in both directions:
+//
+//   EOS_AntiCheatClient_OnMessageToServer   -> MSG_AC_FROM_CLIENT -> ReceiveMessageFromClient
+//   EOS_AntiCheatServer OnMessageToClient    -> MSG_AC_TO_CLIENT   -> ReceiveMessageFromServer
+//
+// Payloads are opaque to reLCS: never parsed, only bounded.
+constexpr int AC_PUID_LEN    = 40;   // EOS ProductUserId string (32 hex chars) + slack
+constexpr int AC_TOKEN_LEN   = 512;  // Connect ID token JWT
+constexpr int MAX_AC_PAYLOAD = 1200; // one EOS AC message; larger ones are dropped
+
+// EOS_EAntiCheatCommonClientPlatform, narrowed to what a reLCS client can be.
+enum AcPlatform : uint8_t {
+	AC_PLATFORM_UNKNOWN = 0,
+	AC_PLATFORM_WINDOWS = 1,
+	AC_PLATFORM_MAC     = 2,
+	AC_PLATFORM_LINUX   = 3,
+};
+
+// MSG_AC_STATUS result codes.
+enum AcRegisterResult : uint8_t {
+	AC_REG_OK           = 0, // registered: AC traffic may flow
+	AC_REG_DISABLED     = 1, // this server runs no AC session (eac=0 / SDK missing)
+	AC_REG_BAD_PLATFORM = 2, // platform byte not understood
+	AC_REG_BAD_PUID     = 3, // ProductUserId string could not be parsed
+	AC_REG_BAD_TOKEN    = 4, // Connect ID token missing or failed verification
+	AC_REG_REJECTED     = 5, // EOS_AntiCheatServer_RegisterClient refused
+	AC_REG_ALREADY      = 6, // already registered on this peer
+};
+
+struct MsgAcHello {
+	uint8_t  platform = AC_PLATFORM_UNKNOWN;
+	char     productUserId[AC_PUID_LEN] = {};
+	char     idToken[AC_TOKEN_LEN] = {};
+};
+
+struct MsgAcStatus {
+	uint8_t  status = AC_REG_DISABLED;
+	uint8_t  registered = 0;             // 1 = the server's AC session holds this peer
+	char     detail[MAX_REASON_LEN] = {};
+};
+
+// One opaque EOS AC message in either direction.
+struct MsgAcPayload {
+	uint16_t len = 0;
+	uint8_t  data[MAX_AC_PAYLOAD] = {};
 };
 
 // ---------------------------------------------------------------------------
@@ -404,7 +519,7 @@ struct MsgGamemodeEvent {
 // ---------------------------------------------------------------------------
 struct MsgMasterAnnounce {
 	uint16_t gamePort = DEFAULT_PORT;
-	uint8_t  players = 0, maxPlayers = 0;
+	uint16_t players = 0, maxPlayers = 0;
 	uint16_t protocolVersion = PROTOCOL_VERSION;
 	char     hostname[MAX_HOSTNAME_LEN] = {};
 	char     gameMode[32] = {};
@@ -418,7 +533,7 @@ struct MsgMasterAnnounce {
 struct MasterListEntry {
 	uint32_t ipv4 = 0;       // network byte order
 	uint16_t gamePort = DEFAULT_PORT;
-	uint8_t  players = 0, maxPlayers = 0;
+	uint16_t players = 0, maxPlayers = 0;
 	uint16_t pingMs = 0;
 	char     hostname[MAX_HOSTNAME_LEN] = {};
 	char     gameMode[32] = {};

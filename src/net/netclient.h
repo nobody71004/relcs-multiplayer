@@ -9,7 +9,7 @@
 #include <deque>
 
 struct NetChatLine {
-	uint8_t fromId = 0;
+	rnet::PlayerId fromId = 0;
 	std::string text;
 };
 
@@ -51,11 +51,12 @@ public:
 		EV_WORLD,          // server world clock/weather: kind=hour arg=minute amount=weather
 		EV_RES_LIST,       // mod/resource inventory updated (see resList)
 		EV_VOICE,          // voice frame: id = speaker, text = one Opus packet
+		EV_AC_STATUS,      // anti-cheat registration answer: kind = AcRegisterResult, text = detail
 	};
 
 	struct Event {
 		int type = EV_NONE;
-		uint8_t id = 0;
+		rnet::PlayerId id = 0;   // player this event is about (16-bit since v8)
 		uint8_t kind = 0;
 		int32_t amount = 0;
 		uint16_t arg = 0;
@@ -82,19 +83,27 @@ public:
 	void SendInventory(const rnet::MsgInventory& m); // reliable snapshot (profile sync)
 	void SendAppearance(const rnet::MsgAppearance& m); // reliable: "this is my look"
 
+	// --- EOS anti-cheat ---
+	// MSG_AC_HELLO (PUID + Connect ID token + platform) then the relay. The
+	// session itself lives in acclient; this only moves bytes over the peer.
+	void SendAcHello();
+	void SendAcPayload(const void* data, uint32_t len);
+	bool AcRegistered() const { return m_acStatus == rnet::AC_REG_OK; }
+	uint8_t AcStatus() const { return m_acStatus; }
+
 	bool Connected() const { return m_connected; }
 	bool Spawned() const { return m_spawned; }
-	uint8_t MyId() const { return m_myId; }
+	rnet::PlayerId MyId() const { return m_myId; }
 	const char* Hostname() const { return m_hostname.c_str(); }
 	const char* GameMode() const { return m_gameMode.c_str(); }
 	const char* MapName() const { return m_mapName.c_str(); }
-	uint8_t Players() const { return m_players; }
-	uint8_t MaxPlayers() const { return m_maxPlayers; }
+	uint16_t Players() const { return m_players; }
+	uint16_t MaxPlayers() const { return m_maxPlayers; }
 	const char* MyName() const { return m_nick.c_str(); }
 
 	bool PopEvent(Event& ev);
 
-	std::map<uint8_t, NetRemotePlayer> remotes;
+	std::map<rnet::PlayerId, NetRemotePlayer> remotes;
 	std::deque<NetChatLine> chat;   // ring; game layer draws it
 	rnet::PlayerState myState;
 	rnet::MsgResList resList;       // server mod/resource inventory (admin panel)
@@ -108,10 +117,14 @@ private:
 	bool m_connected = false;
 	bool m_welcomed = false;
 	bool m_spawned = false;
-	uint8_t m_myId = 0;
+	rnet::PlayerId m_myId = 0;
 	std::string m_nick;
 	std::string m_password;   // claim/restore the server-side profile (sent in MSG_HELLO)
 	std::string m_hostname, m_gameMode, m_mapName;
-	uint8_t m_players = 0, m_maxPlayers = 0;
+	uint16_t m_players = 0, m_maxPlayers = 0;
 	std::deque<Event> m_events;
+	bool m_acHelloSent = false;
+	uint8_t m_acStatus = 0xFF;      // 0xFF = no answer yet, else AcRegisterResult
+	double m_acRetryAt = 0.0;
+	int m_acAttempts = 0;
 };

@@ -65,10 +65,72 @@ With the credentials in place the launcher runs: SDK init → platform → devic
 ID → Connect login, and the Settings page shows each step live
 (`eos-bootstrap.log` has the same trail).
 
-## Server-side validation (next step, needs the same client credentials)
+## Server side — implemented
 
-The client is protected by EAC today. Full EOS anti-cheat also wants the game
-server to call `EOS_AntiCheatServer_BeginSession` and register each client with
-the Connect product-user id, relaying the `OnMessageToServer` traffic over the
-reLCS protocol. That work needs the Client ID/Secret plus the Linux EOS SDK from
-the same product zip; it is not wired into `net/server` yet.
+`net/server/anticheat.cpp` opens a **dedicated-server anti-cheat session** at boot:
+`EOS_Initialize` → `EOS_Platform_Create(bIsServer)` →
+`EOS_AntiCheatServer_BeginSession` (60 s register window by default), pumps
+`EOS_Platform_Tick` at 20 Hz, verifies each peer's Connect ID token, registers the
+peer with the *ENet peer pointer* as the EOS client handle, and relays the driver
+traffic in both directions over `MSG_AC_FROM_CLIENT` / `MSG_AC_TO_CLIENT`
+(≤ 1200 B per message). A verdict from EOS becomes a normal reLCS kick.
+
+### What the server host needs
+
+| Piece | Where |
+|---|---|
+| SDK library | Windows: `EOSSDK-Win64-Shipping.dll` beside `reLCS-server.exe`. Linux: `libEOSSDK-Linux-Shipping.so` beside `reLCS-server` (or set `eac_sdk_dir` / `RELCS_EOSSDK`). From the EOS SDK `SDK/Bin` for the matching platform. |
+| Credentials | `eos.ini` (`client_id`, `client_secret`) in the server's working directory — the same file the launcher uses. `eac_client_id` / `eac_client_secret` in `server.cfg` override it. |
+| Product data | Built into the binary **and** re-read from `EasyAntiCheat/Settings.json` when that file sits next to the server (`eac_settings` points elsewhere). |
+
+The library and `eos.ini` are **not** committed (`net/bin/` is ignored); a host
+that lacks either still serves players, logging `state=sdk-missing` or
+`state=not-configured` — `ac status` shows which.
+
+### Operating it
+
+```
+ac status                 # eac=on state=running clients=0 pending=0 lib=…
+ac list                   # PUID, platform, IP, nickname
+ac kick <id>              # remove a player and drop their AC slot
+ac restart                # rebuild the session after rotating eos.ini
+setr ac_kick 0            # log verdicts without kicking (soak mode)
+```
+
+A protected player shows up in `ac list` a few seconds after joining: `reLCS.exe`
+opens its own `EOS_AntiCheatClient` session (`src/net/acclient.cpp`), registers
+over `MSG_AC_HELLO` and relays the driver traffic. The launcher puts
+`EOSSDK-Win64-Shipping.dll` and `eos.ini` into the game folder on join; without
+them the client logs `[ac] sdk-missing` in `eos-ac.log` and plays unprotected.
+
+### Protected clients only
+
+`ac_require = 1` (default) removes a peer that has not registered inside
+`ac_grace` seconds; `ac_failopen = 1` (default) keeps the server playable when
+its own session cannot start. Set `ac_failopen = 0` for the strict deployment:
+with no live session the server then refuses joins up front.
+
+```
+ac status                 # require=1 enforced=1 grace=30s failOpen=1 registered=2 rejected=0
+```
+
+`enforced=0` with `SUSPENDED(server-side config)` means EOS refused every
+registration (the 403 below) and the policy turned itself off instead of
+emptying the server — fix the permissions and run `ac restart`.
+
+### Dev portal: grant the anti-cheat permissions
+
+`BeginSession` only creates the local session; the backend then authenticates it
+with the client credential, and a client without the anti-cheat permissions is
+refused:
+
+```
+403 errors.com.epicgames.common.policy_missing_action
+    Client <clientId> missing anticheat:authenticateForAnyUser,anticheat:authenticateForLocalUser
+```
+
+`ac status` surfaces that line as `lastError="…ServiceName=[AntiCheat]…"`, so a
+fleet host that starts but never authenticates is easy to spot. Fix: EOS portal →
+product → **Clients** → the client used in `eos.ini` → grant the anti-cheat
+permissions (and confirm **Anti-Cheat** is active for the deployment), then
+`ac restart` (or restart the server).

@@ -56,7 +56,7 @@ project "net-tests"
 	language "C++"
 	cppdialect "C++17"
 	targetname "net-tests"
-	files { "tests/main.cpp", "server/profiles.cpp", "server/profiles.h", "server/resource.cpp", "server/resource.h" }
+	files { "tests/main.cpp", "server/profiles.cpp", "server/profiles.h", "server/resource.cpp", "server/resource.h", "server/anticheat_config.h" }
 	includedirs { "server", "../vendor/sqlite" }
 	links { "sqlite" }
 	netCommon()
@@ -70,6 +70,10 @@ project "net-server"
 	files { "server/*.cpp", "server/*.h" }
 	includedirs { "../vendor/sqlite" }
 	links { "sqlite", "iphlpapi" }
+	-- EOS Anti-Cheat: the server binds EOSSDK at runtime (LoadLibrary), so the
+	-- headers are needed at build time but nothing is linked. A host without
+	-- EOSSDK-Win64-Shipping.dll still starts; it reports eac state=sdk-missing.
+	includedirs { "../vendor/eos-sdk/include" }
 	netCommon()
 
 project "net-bot"
@@ -80,6 +84,15 @@ project "net-bot"
 	files { "bot/*.cpp", "bot/*.h" }
 	netCommon()
 	netOpus()
+
+-- load generator: N simulated players from one host (2k-player load tests)
+project "net-loadgen"
+	kind "ConsoleApp"
+	language "C++"
+	cppdialect "C++17"
+	targetname "relcs-loadgen"
+	files { "loadgen/*.cpp", "loadgen/*.h" }
+	netCommon()
 
 project "net-master"
 	kind "ConsoleApp"

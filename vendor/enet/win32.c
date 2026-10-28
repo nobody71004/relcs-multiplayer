@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <ws2tcpip.h>
+#include <stdlib.h>
 
 static enet_uint32 timeBase = 0;
 
@@ -316,14 +317,247 @@ void
 enet_socket_destroy (ENetSocket socket)
 {
     if (socket != INVALID_SOCKET)
+    {
+      enet_socket_send_batch_flush (socket);
       closesocket (socket);
+    }
 }
 
-int
-enet_socket_send (ENetSocket socket,
-                  const ENetAddress * address,
-                  const ENetBuffer * buffers,
-                  size_t bufferCount)
+/*
+ * Batched datagram send.
+ *
+ * A 2000-player tick builds ~2000 state datagrams and every WSASendTo() is a
+ * kernel transition: measured at ~15 us here, that is ~30 ms of a 50 ms tick
+ * spent inside 2000 syscalls. enet_socket_send() queues the finished datagram
+ * instead (a memcpy of at most the path MTU) and
+ * enet_socket_send_batch_flush() drains the queue from a small set of sender
+ * threads. Windows has no sendmmsg(): a datagram send is one syscall no matter
+ * how it is issued, so the only way to shorten the tick is to issue several at
+ * once. UDP sends are independent, so this preserves per-datagram ordering
+ * requirements (ENet's sequencing lives inside the datagrams).
+ *
+ * The queue is drained inside the same enet_host_flush()/enet_host_service()
+ * call that queued the datagrams, so packet latency is unchanged.
+ */
+#define ENET_SENDQ_MAX 4096
+#define ENET_SENDQ_WORKERS 3
+#define ENET_SENDQ_PARALLEL_MIN 32
+
+typedef struct _ENetSendQueueEntry
+{
+    struct sockaddr_in address;
+    enet_uint32 offset;
+    enet_uint32 length;
+} ENetSendQueueEntry;
+
+static ENetSendQueueEntry enet_sendQueue [ENET_SENDQ_MAX];
+static int enet_sendQueueCount = 0;
+static SOCKET enet_sendQueueSocket = INVALID_SOCKET;
+static enet_uint8 * enet_sendQueueData = NULL;
+static enet_uint32 enet_sendQueueSize = 0;
+static enet_uint32 enet_sendQueueCapacity = 0;
+
+static HANDLE enet_sendQueueWake = NULL;
+static HANDLE enet_sendQueueDone = NULL;
+static HANDLE enet_sendQueueThreads [ENET_SENDQ_WORKERS];
+static volatile LONG enet_sendQueueNext = 0;
+static volatile LONG enet_sendQueueRemaining = 0;
+static SOCKET enet_sendQueueJobSocket = INVALID_SOCKET;
+static int enet_sendQueueJobCount = 0;
+static int enet_sendQueuePool = 0;   /* 0 untried, 1 running, -1 unavailable */
+
+static void
+enet_sendq_address (const ENetAddress * address, struct sockaddr_in * sin)
+{
+    memset (sin, 0, sizeof (struct sockaddr_in));
+    sin -> sin_family = AF_INET;
+    sin -> sin_port = ENET_HOST_TO_NET_16 (address -> port);
+    sin -> sin_addr.s_addr = address -> host;
+}
+
+/* pull datagrams off the queue until it is empty (shared by every sender) */
+static void
+enet_sendq_drain (SOCKET socket, int count)
+{
+    for (;;)
+    {
+        LONG index = InterlockedIncrement (& enet_sendQueueNext) - 1;
+
+        if (index >= count)
+          return;
+
+        sendto (socket,
+                (const char *) enet_sendQueueData + enet_sendQueue [index].offset,
+                (int) enet_sendQueue [index].length, 0,
+                (struct sockaddr *) & enet_sendQueue [index].address,
+                sizeof (struct sockaddr_in));
+    }
+}
+
+static DWORD WINAPI
+enet_sendq_worker (LPVOID unused)
+{
+    (void) unused;
+
+    for (;;)
+    {
+        WaitForSingleObject (enet_sendQueueWake, INFINITE);
+
+        enet_sendq_drain (enet_sendQueueJobSocket, enet_sendQueueJobCount);
+
+        if (InterlockedDecrement (& enet_sendQueueRemaining) == 0)
+          SetEvent (enet_sendQueueDone);
+    }
+
+    return 0;
+}
+
+static int
+enet_sendq_start_workers (void)
+{
+    int i;
+
+    if (enet_sendQueuePool != 0)
+      return enet_sendQueuePool > 0;
+
+    enet_sendQueueWake = CreateSemaphore (NULL, 0, 0x7fffffff, NULL);
+    enet_sendQueueDone = CreateEvent (NULL, FALSE, FALSE, NULL);
+
+    if (enet_sendQueueWake == NULL || enet_sendQueueDone == NULL)
+    {
+        enet_sendQueuePool = -1;
+        return 0;
+    }
+
+    for (i = 0; i < ENET_SENDQ_WORKERS; i ++)
+    {
+        enet_sendQueueThreads [i] = CreateThread (NULL, 0, enet_sendq_worker, NULL, 0, NULL);
+
+        if (enet_sendQueueThreads [i] == NULL)
+        {
+            enet_sendQueuePool = -1;
+            return 0;
+        }
+    }
+
+    enet_sendQueuePool = 1;
+
+    return 1;
+}
+
+/* returns the queued length, or -1 when the datagram has to be sent directly */
+static int
+enet_sendq_push (ENetSocket socket,
+                 const ENetAddress * address,
+                 const ENetBuffer * buffers,
+                 size_t bufferCount)
+{
+    size_t total = 0, i, at;
+    enet_uint8 * destination;
+
+    if (address == NULL || buffers == NULL || bufferCount == 0)
+      return -1;
+
+    for (i = 0; i < bufferCount; i ++)
+      total += buffers [i].dataLength;
+
+    if (total == 0)
+      return -1;
+
+    if (enet_sendQueueSocket != socket ||
+        enet_sendQueueCount >= ENET_SENDQ_MAX ||
+        enet_sendQueueSize + total > enet_sendQueueCapacity)
+      enet_socket_send_batch_flush (socket);
+
+    if (enet_sendQueueSize + total > enet_sendQueueCapacity)
+    {
+        enet_uint32 capacity = enet_sendQueueCapacity ? enet_sendQueueCapacity : (1u << 20);
+        enet_uint8 * grown;
+
+        while (capacity < enet_sendQueueSize + total)
+          capacity <<= 1;
+
+        grown = (enet_uint8 *) realloc (enet_sendQueueData, capacity);
+        if (grown == NULL)
+          return -1;
+
+        enet_sendQueueData = grown;
+        enet_sendQueueCapacity = capacity;
+    }
+
+    destination = enet_sendQueueData + enet_sendQueueSize;
+    at = 0;
+    for (i = 0; i < bufferCount; i ++)
+    {
+        if (buffers [i].dataLength > 0)
+          memcpy (destination + at, buffers [i].data, buffers [i].dataLength);
+
+        at += buffers [i].dataLength;
+    }
+
+    enet_sendq_address (address, & enet_sendQueue [enet_sendQueueCount].address);
+    enet_sendQueue [enet_sendQueueCount].offset = enet_sendQueueSize;
+    enet_sendQueue [enet_sendQueueCount].length = (enet_uint32) total;
+    enet_sendQueueSocket = socket;
+    enet_sendQueueSize += (enet_uint32) total;
+    enet_sendQueueCount ++;
+
+    return (int) total;
+}
+
+void
+enet_socket_send_batch_flush (ENetSocket socket)
+{
+    int i;
+
+    if (enet_sendQueueCount == 0)
+      return;
+
+    if (enet_sendQueueSocket != socket)
+    {
+        /* another socket queued in between: never send to the wrong one */
+        enet_sendQueueCount = 0;
+        enet_sendQueueSize = 0;
+        return;
+    }
+
+    if (enet_sendQueueCount >= ENET_SENDQ_PARALLEL_MIN && enet_sendq_start_workers ())
+    {
+        enet_sendQueueJobSocket = socket;
+        enet_sendQueueJobCount = enet_sendQueueCount;
+        enet_sendQueueNext = 0;
+        enet_sendQueueRemaining = ENET_SENDQ_WORKERS + 1;
+
+        for (i = 0; i < ENET_SENDQ_WORKERS; i ++)
+          ReleaseSemaphore (enet_sendQueueWake, 1, NULL);
+
+        /* the calling thread is the fourth sender */
+        enet_sendq_drain (socket, enet_sendQueueJobCount);
+
+        if (InterlockedDecrement (& enet_sendQueueRemaining) == 0)
+          SetEvent (enet_sendQueueDone);
+
+        WaitForSingleObject (enet_sendQueueDone, INFINITE);
+    }
+    else
+    {
+        for (i = 0; i < enet_sendQueueCount; i ++)
+          sendto (socket,
+                  (const char *) enet_sendQueueData + enet_sendQueue [i].offset,
+                  (int) enet_sendQueue [i].length, 0,
+                  (struct sockaddr *) & enet_sendQueue [i].address,
+                  sizeof (struct sockaddr_in));
+    }
+
+    enet_sendQueueCount = 0;
+    enet_sendQueueSize = 0;
+}
+
+static int
+enet_socket_send_direct (ENetSocket socket,
+                         const ENetAddress * address,
+                         const ENetBuffer * buffers,
+                         size_t bufferCount)
 {
     struct sockaddr_in sin;
     DWORD sentLength = 0;
@@ -354,6 +588,20 @@ enet_socket_send (ENetSocket socket,
     }
 
     return (int) sentLength;
+}
+
+int
+enet_socket_send (ENetSocket socket,
+                  const ENetAddress * address,
+                  const ENetBuffer * buffers,
+                  size_t bufferCount)
+{
+    int queued = enet_sendq_push (socket, address, buffers, bufferCount);
+
+    if (queued >= 0)
+      return queued;
+
+    return enet_socket_send_direct (socket, address, buffers, bufferCount);
 }
 
 int

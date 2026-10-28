@@ -1754,6 +1754,9 @@ enet_host_flush (ENetHost * host)
     host -> serviceTime = enet_time_get ();
 
     enet_protocol_send_outgoing_commands (host, NULL, 0);
+
+    /* the datagrams queued above leave here, batched (see unix.c/win32.c) */
+    enet_socket_send_batch_flush (host -> socket);
 }
 
 /** Checks for any queued events on the host and dispatches one if available.
@@ -1790,8 +1793,22 @@ enet_host_check_events (ENetHost * host, ENetEvent * event)
     @remarks enet_host_service should be called fairly regularly for adequate performance
     @ingroup host
 */
+static int enet_host_service_internal (ENetHost * host, ENetEvent * event, enet_uint32 timeout);
+
 int
 enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+{
+    int result = enet_host_service_internal (host, event, timeout);
+
+    /* service also queues ACKs/pings; send them before returning, whatever the
+       result was (a dispatched event returns early from the internal call) */
+    enet_socket_send_batch_flush (host -> socket);
+
+    return result;
+}
+
+static int
+enet_host_service_internal (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
 {
     enet_uint32 waitCondition;
 

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <fstream>
@@ -59,9 +60,31 @@ static void ApplyKeyVal(ServerConfig& cfg, const std::string& key, const std::st
 	else if(key == "minute") cfg.minute = (uint8_t)atoi(val.c_str());
 	else if(key == "weather") cfg.weather = (uint8_t)atoi(val.c_str());
 	else if(key == "netstats_interval") cfg.netstatsInterval = atoi(val.c_str());
+	else if(key == "log_file") cfg.logFile = val;
+	else if(key == "verbose_join") cfg.verboseJoin = (atoi(val.c_str()) != 0);
 	else if(key == "profiles") cfg.profilesDb = val;
 	else if(key == "resources") cfg.resourcesDir = val;
 	else if(key == "vehicles") cfg.vehiclesFile = val;
+	// EOS Anti-Cheat (net/server/anticheat.h)
+	else if(key == "eac") cfg.ac.enabled = (atoi(val.c_str()) != 0);
+	else if(key == "eac_server_name") cfg.ac.serverName = val;
+	else if(key == "eac_product_id") cfg.ac.productId = val;
+	else if(key == "eac_sandbox_id") cfg.ac.sandboxId = val;
+	else if(key == "eac_deployment_id") cfg.ac.deploymentId = val;
+	else if(key == "eac_client_id") cfg.ac.clientId = val;
+	else if(key == "eac_client_secret") cfg.ac.clientSecret = val;
+	else if(key == "eac_cache_dir") cfg.ac.cacheDir = val;
+	else if(key == "eac_sdk_dir") cfg.ac.sdkDir = val;
+	else if(key == "eac_settings") cfg.ac.settingsPath = val;
+	else if(key == "eac_ini") cfg.ac.iniPath = val;
+	else if(key == "eac_register_timeout") cfg.ac.registerTimeout = (uint32_t)atoi(val.c_str());
+	else if(key == "eac_gameplay_data") cfg.ac.enableGameplayData = (atoi(val.c_str()) != 0);
+	else if(key == "eac_kick") cfg.ac.kickOnViolation = (atoi(val.c_str()) != 0);
+	else if(key == "eac_require_token") cfg.ac.requireToken = (atoi(val.c_str()) != 0);
+	// "only protected clients are allowed" policy + its safety valve
+	else if(key == "ac_require") cfg.ac.requireProtected = (atoi(val.c_str()) != 0);
+	else if(key == "ac_failopen") cfg.ac.failOpen = (atoi(val.c_str()) != 0);
+	else if(key == "ac_grace") cfg.ac.graceSeconds = (uint32_t)atoi(val.c_str());
 }
 
 static bool LoadConfigFile(ServerConfig& cfg, const std::string& path)
@@ -109,15 +132,18 @@ int main(int argc, char** argv)
 	signal(SIGTERM, SignalHandler);
 #endif
 
-	Server server;
-	g_server = &server;
-	if(!server.Init(cfg))
+	// Heap, not stack: the player table alone is MAX_PLAYERS (2048) slots, so
+	// `Server server;` on the default 1 MB thread stack overflows before Init
+	// can log a single line (0xC00000FD with maxplayers raised for load tests).
+	auto server = std::make_unique<Server>();
+	g_server = server.get();
+	if(!server->Init(cfg))
 		return 1;
 
 	std::thread console(ConsoleThread);
 	console.detach();
 
-	server.Run();
+	server->Run();
 
 	g_server = nullptr;
 	enet_deinitialize();

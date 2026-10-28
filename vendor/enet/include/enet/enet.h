@@ -503,6 +503,10 @@ ENET_API int        enet_socket_listen (ENetSocket, int);
 ENET_API ENetSocket enet_socket_accept (ENetSocket, ENetAddress *);
 ENET_API int        enet_socket_connect (ENetSocket, const ENetAddress *);
 ENET_API int        enet_socket_send (ENetSocket, const ENetAddress *, const ENetBuffer *, size_t);
+/** Drains datagrams queued by enet_socket_send(): one sendmmsg() on Linux, a
+    small sender pool on Windows. Called by enet_host_flush()/enet_host_service()
+    before they return, so applications normally never need it. */
+ENET_API void       enet_socket_send_batch_flush (ENetSocket);
 ENET_API int        enet_socket_receive (ENetSocket, ENetAddress *, ENetBuffer *, size_t);
 ENET_API int        enet_socket_wait (ENetSocket, enet_uint32 *, enet_uint32);
 ENET_API int        enet_socket_set_option (ENetSocket, ENetSocketOption, int);

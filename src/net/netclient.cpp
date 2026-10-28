@@ -1,14 +1,30 @@
 // src/net/netclient.cpp — NetClient implementation (ENet).
 #include "netclient.h"
+#include "acclient.h"
 
 #include <enet/enet.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
 using namespace rnet;
 
 static bool s_enetReady = false;
+
+static double NowSeconds()
+{
+	using namespace std::chrono;
+	return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
+}
+
+// EOS hands AC traffic to a free function, but it has to leave through the one
+// live connection: the owning client is registered here.
+static NetClient* s_acOwner = nullptr;
+static void AcToServer(const void* data, uint32_t len)
+{
+	if(s_acOwner) s_acOwner->SendAcPayload(data, len);
+}
 
 bool NetClient::Connect(const char* host, uint16_t port, const char* nick, const char* password)
 {
@@ -40,6 +56,18 @@ bool NetClient::Connect(const char* host, uint16_t port, const char* nick, const
 	m_spawned = false;
 	m_nick = nick ? nick : "Player";
 	m_password = password ? password : "";
+	m_acHelloSent = false;
+	m_acStatus = 0xFF;
+	m_acRetryAt = 0.0;
+	m_acAttempts = 0;
+
+	// Start the anti-cheat session before the handshake so registration can
+	// follow the welcome within the server's grace window.
+	s_acOwner = this;
+	acclient::SetSendToServer(AcToServer);
+	if(!acclient::Init() && acclient::state() != acclient::State::LoggingIn)
+		fprintf(stderr, "[AC] anti-cheat unavailable: %s (%s)\n",
+		        acclient::StateName(), acclient::Detail());
 
 	fprintf(stderr, "[NET] connecting to %s:%u as %s\n", host, (unsigned)port, nick);
 	fflush(stderr);
@@ -65,6 +93,55 @@ void NetClient::Disconnect()
 	m_host = nullptr;
 	m_peer = nullptr;
 	m_connected = false;
+	m_acHelloSent = false;
+	m_acAttempts = 0;
+	m_acStatus = 0xFF;
+	m_acRetryAt = 0.0;
+	if(s_acOwner == this) s_acOwner = nullptr;
+	// EndSession belongs to the server we just left: keeping it open would hold
+	// the kernel driver attached, and the next server needs a fresh session.
+	acclient::Shutdown();
+}
+
+void NetClient::SendAcHello()
+{
+	if(!m_host || !m_peer || !m_connected) return;
+	MsgAcHello hello;
+	hello.platform = AC_PLATFORM_WINDOWS;
+	CopyStr(hello.productUserId, sizeof hello.productUserId, acclient::ProductUserId());
+	std::string token;
+	if(!acclient::CopyIdToken(token)){
+		// the login is still finishing (or the token expired): try again shortly
+		m_acRetryAt = 0.0;
+		return;
+	}
+	CopyStr(hello.idToken, sizeof hello.idToken, token.c_str());
+
+	BitWriter w;
+	BeginMsg(w, MSG_AC_HELLO);
+	WriteAcHello(w, hello);
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+	enet_peer_send((ENetPeer*)m_peer, CHAN_RELIABLE, pkt);
+	enet_host_flush((ENetHost*)m_host);
+	m_acHelloSent = true;
+	m_acAttempts++;
+	fprintf(stderr, "[AC] registering with the server as %s (attempt %d)\n",
+	        acclient::ProductUserId(), m_acAttempts);
+	fflush(stderr);
+}
+
+void NetClient::SendAcPayload(const void* data, uint32_t len)
+{
+	if(!m_host || !m_peer || !m_connected || !data || len == 0) return;
+	if(len > (uint32_t)MAX_AC_PAYLOAD) return;
+	MsgAcPayload m;
+	m.len = (uint16_t)len;
+	memcpy(m.data, data, len);
+	BitWriter w;
+	BeginMsg(w, MSG_AC_FROM_CLIENT);
+	if(!WriteAcPayload(w, m)) return;
+	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(), ENET_PACKET_FLAG_RELIABLE);
+	enet_peer_send((ENetPeer*)m_peer, CHAN_RELIABLE, pkt);
 }
 
 void NetClient::SendState(const PlayerState& s)
@@ -206,6 +283,10 @@ bool NetClient::PopEvent(Event& ev)
 
 void NetClient::Pump()
 {
+	// the AC session has to keep ticking even between servers: EOS work is
+	// what produces the messages that get relayed
+	acclient::Tick();
+
 	if(!m_host) return;
 
 	ENetEvent ev;
@@ -243,6 +324,13 @@ void NetClient::Pump()
 		default:
 			break;
 		}
+	}
+
+	// register with this server as soon as the AC session is live (the server
+	// only keeps protected clients when it is configured to require them)
+	if(m_connected && m_welcomed && !m_acHelloSent){
+		const double now = NowSeconds();
+		if(acclient::Ready() && now >= m_acRetryAt) SendAcHello();
 	}
 }
 
@@ -329,7 +417,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		break;
 	}
 	case MSG_VOICE:{
-		uint8_t from = 0;
+		PlayerId from = 0;
 		uint8_t packet[VOICE_MAX_PACKET];
 		uint8_t len = 0;
 		if(ReadVoice(r, from, packet, len) && r.BitsLeft() == 0 && from != m_myId){
@@ -338,6 +426,58 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			e.id = from;
 			e.text.assign((const char*)packet, len);
 			m_events.push_back(e);
+		}
+		break;
+	}
+	case MSG_STATE_BATCH:{
+		// v8: the server groups every state we are in range of into a handful of
+		// packets. Apply each record exactly like a single MSG_PLAYER_STATE, so
+		// the game layer cannot tell which form delivered a snapshot.
+		PlayerState states[MAX_STATES_PER_PACKET];
+		int n = ReadStateBatch(r, states, MAX_STATES_PER_PACKET);
+		if(n <= 0) break;
+		for(int i = 0; i < n; i++){
+			PlayerState& st = states[i];
+			if(st.playerId == m_myId) continue;
+			NetRemotePlayer& rp = remotes[st.playerId];
+			rp.state = st;
+			rp.spawned = true;
+			rp.lastUpdate = 0.0; // refreshed by Pump caller via wall clock if needed
+		}
+		break;
+	}
+	case MSG_ROSTER:{
+		// v8: batched identity of everyone already on the server. This replaces
+		// the one-JOIN-plus-one-SPAWN-per-player replay, so it is also where a
+		// late joiner's puppets get their names and first position.
+		MsgRosterEntry entries[MAX_ROSTER_PER_PACKET];
+		int n = ReadRoster(r, entries, MAX_ROSTER_PER_PACKET);
+		if(n <= 0) break;
+		for(int i = 0; i < n; i++){
+			const MsgRosterEntry& re = entries[i];
+			if(re.id == m_myId) continue;
+			NetRemotePlayer& rp = remotes[re.id];
+			rp.name = re.name;
+			if(!(re.flags & ROSTER_SPAWNED)) continue;
+
+			bool firstSpawn = !rp.spawned;
+			rp.spawned = true;
+			rp.state.playerId = re.id;
+			rp.state.xMm = re.xMm;
+			rp.state.yMm = re.yMm;
+			rp.state.zMm = re.zMm;
+			rp.state.heading = re.heading;
+			rp.state.health = re.health;
+			rp.state.armour = re.armour;
+			rp.lastUpdate = NowSeconds();
+			if(firstSpawn && (re.flags & ROSTER_ALIVE)){
+				Event e;
+				e.type = EV_REMOTE_SPAWN;
+				e.id = re.id;
+				e.model = re.skin;
+				e.state = rp.state;
+				m_events.push_back(e);
+			}
 		}
 		break;
 	}
@@ -362,7 +502,7 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 		break;
 	}
 	case MSG_PLAYER_QUIT:{
-		uint8_t id = r.ReadU8();
+		PlayerId id = r.ReadU16();
 		fprintf(stderr, "[NET] QUIT id=%d\n", (int)id);
 		fflush(stderr);
 		remotes.erase(id);
@@ -423,13 +563,13 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			// store it on the remote (own id still flows through so the game layer
 			// can confirm/apply its own restored look)
 			if(m.playerId != m_myId){
-				NetRemotePlayer& rp = remotes[(uint8_t)m.playerId];
+				NetRemotePlayer& rp = remotes[m.playerId];
 				rp.appearance = m;
 				rp.haveAppearance = true;
 			}
 			Event e;
 			e.type = EV_APPEARANCE;
-			e.id = (uint8_t)m.playerId;
+			e.id = m.playerId;
 			e.appearance = m;
 			m_events.push_back(e);
 		}
@@ -604,6 +744,30 @@ void NetClient::HandleMessage(const uint8_t* data, size_t size)
 			Event e;
 			e.type = EV_BANNER;
 			e.text = ev.text;
+			m_events.push_back(e);
+		}
+		break;
+	}
+	case MSG_AC_TO_CLIENT:{
+		// opaque EOS anti-cheat traffic: never parsed, only handed to the SDK
+		MsgAcPayload m;
+		if(ReadAcPayload(r, m)) acclient::OnServerMessage(m.data, m.len);
+		break;
+	}
+	case MSG_AC_STATUS:{
+		MsgAcStatus st;
+		if(ReadAcStatus(r, st)){
+			m_acStatus = st.status;
+			const char* why = st.detail[0] ? st.detail : "no detail";
+			fprintf(stderr, "[AC] %s: %s\n", st.registered ? "registered" : "not registered", why);
+			fflush(stderr);
+			// a refusal is worth one more try (token not ready, EOS still
+			// booting); the server's grace window bounds how long that lasts
+			if(!st.registered && m_acAttempts < 5) m_acRetryAt = NowSeconds() + 5.0;
+			Event e;
+			e.type = EV_AC_STATUS;
+			e.kind = st.status;
+			e.text = why;
 			m_events.push_back(e);
 		}
 		break;

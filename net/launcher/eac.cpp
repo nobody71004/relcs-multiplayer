@@ -221,6 +221,42 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	                       FileExists(acDir + "\\EasyAntiCheat_EOS_Setup.exe") &&
 	                       FileExists(gameDir + "\\start_protected_game.exe");
 
+	// The in-game anti-cheat client (src/net/acclient.cpp) loads the EOS SDK
+	// from the game folder: without it the client cannot open an AC session and
+	// a server that requires protection would refuse it. Same file the launcher
+	// uses, so a shipped launcher install carries it.
+	const char* sdkName = "EOSSDK-Win64-Shipping.dll";
+	std::string sdkDst = gameDir + "\\" + sdkName;
+	bool sdkOk = FileExists(sdkDst);
+	if(!sdkOk){
+		const std::string candidates[] = {
+			ExeDir() + "\\" + sdkName,
+			ExeDir() + "\\..\\..\\..\\vendor\\eos-sdk\\bin\\Win64\\" + sdkName,
+			payload + "\\..\\..\\vendor\\eos-sdk\\bin\\Win64\\" + sdkName,
+		};
+		for(const std::string& src : candidates){
+			if(!FileExists(src)) continue;
+			bool copied = false;
+			sdkOk = CopyIfNewer(src, sdkDst, copied);
+			anyCopied = anyCopied || copied;
+			if(sdkOk) break;
+		}
+	}
+	out.eosSdk = sdkOk;
+
+	// client credentials for the Connect device login. The launcher already has
+	// them on this machine; the game needs its own copy next to the SDK.
+	std::string iniSrc = ExeDir() + "\\eos.ini";
+	if(FileExists(iniSrc)){
+		std::string iniDst = gameDir + "\\eos.ini";
+		if(ReadFile(iniDst) != ReadFile(iniSrc)){
+			bool copied = false;
+			CopyIfNewer(iniSrc, iniDst, copied);
+			anyCopied = anyCopied || copied;
+		}
+	}
+	out.eosConfig = FileExists(gameDir + "\\eos.ini");
+
 	// EOS product config consumed by the bootstrapper
 	char settings[1024];
 	snprintf(settings, sizeof settings,
@@ -270,10 +306,12 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 
 	char summary[512];
 	snprintf(summary, sizeof summary,
-	         "runtime=%s config=%s integrity=%s%s%s",
+	         "runtime=%s config=%s integrity=%s eos-sdk=%s eos-ini=%s%s%s",
 	         out.runtimeInstalled ? "ok" : "missing",
 	         out.configWritten ? "ok" : "failed",
 	         out.integrityBuilt ? "signed" : "not-built",
+	         out.eosSdk ? "ok" : "missing",
+	         out.eosConfig ? "ok" : "missing",
 	         anyCopied ? " (files refreshed)" : "",
 	         runtimeOk && protOk ? "" : " (some files locked — close the game)");
 	out.log = summary;

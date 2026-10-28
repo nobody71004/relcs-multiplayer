@@ -32,7 +32,8 @@ static double NowSec()
 struct Entry {
 	uint32_t ip = 0;
 	uint16_t gamePort = 0;
-	uint8_t players = 0, maxPlayers = 0;
+	// v8: a server may host up to 2000 players, so the counts are 16-bit
+	uint16_t players = 0, maxPlayers = 0;
 	uint16_t protocolVersion = 0;
 	char hostname[MAX_HOSTNAME_LEN] = {};
 	char gameMode[32] = {};

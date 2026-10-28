@@ -25,6 +25,27 @@ static double NowSec()
 	return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Above this many players a join is no longer broadcast to everyone: at 2k
+// that is one reliable packet per existing player per join, i.e. millions of
+// sends across a join wave. The newcomer still gets the full roster below.
+static const int kRosterJoinBroadcastLimit = 64;
+
+// AOI grid extent: the world span the grid covers, centred on the origin.
+// Positions outside are clamped to a border cell (correct, just denser).
+static const float kAoiExtentM = 6400.0f;
+
+// Cell coordinate for a world position. The grid is rebuilt every tick, so a
+// lookup is arithmetic and a neighbour scan is the 3x3 block around the
+// receiver — cost grows with nearby players, not with the server population.
+static inline int AoiCellOf(int32_t xMm, int32_t yMm, float cellSize, int dim)
+{
+	int cx = (int)std::floor((xMm / 1000.0f + kAoiExtentM) / cellSize);
+	int cy = (int)std::floor((yMm / 1000.0f + kAoiExtentM) / cellSize);
+	if(cx < 0) cx = 0; else if(cx >= dim) cx = dim - 1;
+	if(cy < 0) cy = 0; else if(cy >= dim) cy = dim - 1;
+	return cy * dim + cx;
+}
+
 Server::~Server()
 {
 	Shutdown();
@@ -39,6 +60,24 @@ bool Server::Init(const ServerConfig& cfg)
 {
 	m_cfg = cfg;
 
+	// A config may ask for up to 2k players; anything outside 1..2000 is
+	// clamped rather than silently truncating the ENet peer table.
+	if(m_cfg.maxPlayers < 1) m_cfg.maxPlayers = 1;
+	if(m_cfg.maxPlayers > rnet::MAX_SERVER_PLAYERS){
+		std::printf("[WARN] maxplayers=%d exceeds the %d-player ceiling; clamping\n",
+		            m_cfg.maxPlayers, (int)rnet::MAX_SERVER_PLAYERS);
+		m_cfg.maxPlayers = rnet::MAX_SERVER_PLAYERS;
+	}
+	if(m_cfg.tickRate < 1) m_cfg.tickRate = 1;
+	if(m_cfg.tickRate > 200) m_cfg.tickRate = 200;
+
+	if(!m_cfg.logFile.empty()){
+		m_logFile.open(m_cfg.logFile.c_str(), std::ios::out | std::ios::app);
+		if(!m_logFile)
+			std::printf("[WARN] cannot open log file '%s'; logging to stdout only\n",
+			            m_cfg.logFile.c_str());
+	}
+
 	if(enet_initialize() != 0){
 		std::printf("[ERR] enet_initialize failed\n");
 		return false;
@@ -47,12 +86,18 @@ bool Server::Init(const ServerConfig& cfg)
 	ENetAddress address;
 	address.host = ENET_HOST_ANY;
 	address.port = m_cfg.port;
+	// one peer slot per player plus headroom for joins racing a disconnect
 	m_host = enet_host_create(&address, m_cfg.maxPlayers + 16, 2, 0, 0);
 	if(!m_host){
 		std::printf("[ERR] cannot bind UDP port %u\n", (unsigned)m_cfg.port);
 		return false;
 	}
 	m_host->maximumPacketSize = 32 * 1024;
+	// At 2000 players the relay bursts thousands of state batches in a few
+	// milliseconds once per tick; a default 64 KB socket buffer drops them and
+	// the loss shows up as client-side stutter that looks like a server stall.
+	enet_socket_set_option(m_host->socket, ENET_SOCKOPT_RCVBUF, 4 * 1024 * 1024);
+	enet_socket_set_option(m_host->socket, ENET_SOCKOPT_SNDBUF, 8 * 1024 * 1024);
 
 	if(m_cfg.announce){
 		m_masterClient = enet_host_create(nullptr, 1, 2, 0, 0);
@@ -78,6 +123,15 @@ bool Server::Init(const ServerConfig& cfg)
 	}
 
 	// mod/resource pipeline: scan packs, run their start hooks
+	// AOI grid: one cell per stream distance, so "within range" is always the
+	// 3x3 block around the receiver's cell.
+	m_aoiCell = m_cfg.streamDistance > 1.0f ? m_cfg.streamDistance : 1.0f;
+	m_aoiDim = (int)std::ceil((2.0f * kAoiExtentM) / m_aoiCell);
+	if(m_aoiDim < 1) m_aoiDim = 1;
+	if(m_aoiDim > 512) m_aoiDim = 512;
+	m_aoiHead.assign((size_t)m_aoiDim * (size_t)m_aoiDim, -1);
+	m_aoiNext.assign((size_t)rnet::MAX_PLAYERS, -1);
+
 	if(!m_cfg.resourcesDir.empty()){
 		m_resources.Configure(m_cfg.resourcesDir,
 		    [this](const std::string& line, int respondTo){ HandleCommand(line, respondTo); },
@@ -93,16 +147,31 @@ bool Server::Init(const ServerConfig& cfg)
 	// a parked showcase car) instead of only existing while somebody drives it
 	LoadVehicleSpawns(m_cfg.vehiclesFile);
 
-	Log("reLCS server '%s' listening on UDP %u | mode=%s | maxplayers=%d",
-	    m_cfg.hostname.c_str(), (unsigned)m_cfg.port, m_gamemode->Name(), m_cfg.maxPlayers);
+	// EOS Anti-Cheat: a failure here never stops the server — state() says why
+	InitAntiCheat();
+
+	Log("reLCS server '%s' listening on UDP %u | mode=%s | maxplayers=%d | protocol=v%u slots=%d",
+	    m_cfg.hostname.c_str(), (unsigned)m_cfg.port, m_gamemode->Name(), m_cfg.maxPlayers,
+	    (unsigned)rnet::PROTOCOL_VERSION, rnet::MAX_PLAYERS);
+	if(m_cfg.netstatsInterval <= 0)
+		Log("netstats: per-second telemetry on (netstats_interval=1)");
+	m_cfg.netstatsInterval = m_cfg.netstatsInterval > 0 ? m_cfg.netstatsInterval : 1;
+	m_statsWindowStart = Now();
 	return true;
 }
 
 void Server::Run()
 {
 	m_running = true;
+	using clock = std::chrono::steady_clock;
 	while(m_running){
+	{
+		auto p0 = clock::now();
 		PumpNetwork();
+		double pms = std::chrono::duration<double, std::milli>(clock::now() - p0).count();
+		m_statsPumpMsSum += pms;
+		if(pms > m_statsPumpMsMax) m_statsPumpMsMax = pms;
+	}
 		PumpDiscovery();
 
 		// console command queue
@@ -120,7 +189,12 @@ void Server::Run()
 		double t = Now();
 		double tickDt = 1.0 / std::max(1, m_cfg.tickRate);
 		if(t - m_lastTick >= tickDt){
+			auto tickStart = clock::now();
 			Tick();
+			double ms = std::chrono::duration<double, std::milli>(clock::now() - tickStart).count();
+			m_statsTicks++;
+			m_statsTickMsSum += ms;
+			if(ms > m_statsTickMsMax) m_statsTickMsMax = ms;
 			m_lastTick = t;
 		}
 
@@ -131,23 +205,15 @@ void Server::Run()
 			FlushProfiles();
 		}
 
-		if(m_cfg.netstatsInterval > 0 && t - m_lastNetStats >= m_cfg.netstatsInterval){
+		if(t - m_statsWindowStart >= (double)std::max(1, m_cfg.netstatsInterval)){
 			m_lastNetStats = t;
-			Log("netstats: sent=%u KB recv=%u KB",
-			    (unsigned)(m_host->totalSentData / 1024),
-			    (unsigned)(m_host->totalReceivedData / 1024));
-			for(int i = 0; i < MAX_PLAYERS; i++){
-				ServerPlayer& p = m_players[i];
-				if(!p.active || !p.peer) continue;
-				Log("netstats: #%d %s rtt=%ums loss=%.1f%%",
-				    p.id, p.name.c_str(), (unsigned)p.peer->roundTripTime,
-				    p.peer->packetLoss * 100.0f / (float)ENET_PEER_PACKET_LOSS_SCALE);
-			}
+			LogNetStats(t);
 		}
 
 		Sleep(1);
 
 	}
+	m_ac.Stop();
 	FlushProfiles();
 	Log("server shutting down");
 }
@@ -183,25 +249,36 @@ double Server::Now() const
 }
 
 // ---------------------------------------------------------------------------
+// NOTE: sends are queued, never flushed here. ENet dispatches the queue on the
+// next enet_host_service (the run loop pumps every ~1 ms) and once at the end
+// of Tick. The old per-packet enet_host_flush made a 2k-player tick cost one
+// syscall per (state, receiver) pair, which is exactly what a load test
+// measures itself against.
 void Server::SendTo(ENetPeer* peer, const BitWriter& w, uint8_t channel, bool reliable)
 {
 	if(!peer) return;
 	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(),
 	                                     reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
 	enet_peer_send(peer, channel, pkt);
-	enet_host_flush(m_host);
+	m_statsStatePackets++;
 }
 
-void Server::Broadcast(const BitWriter& w, uint8_t channel, bool reliable, uint8_t exceptId)
+void Server::Broadcast(const BitWriter& w, uint8_t channel, bool reliable, rnet::PlayerId exceptId)
 {
 	ENetPacket* pkt = enet_packet_create(w.Data(), w.ByteSize(),
 	                                     reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
+	bool sent = false;
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& p = m_players[i];
-		if(p.active && p.id != exceptId && p.peer)
+		if(p.active && p.id != exceptId && p.peer){
 			enet_peer_send(p.peer, channel, pkt);
+			sent = true;
+			m_statsStatePackets++;
+		}
 	}
-	enet_host_flush(m_host);
+	// ENet refcounts packets per peer; with no recipient nothing took a
+	// reference and the packet has to be released here.
+	if(!sent) enet_packet_destroy(pkt);
 }
 
 void Server::Log(const char* fmt, ...)
@@ -212,15 +289,34 @@ void Server::Log(const char* fmt, ...)
 	vsnprintf(buf, sizeof buf, fmt, ap);
 	va_end(ap);
 
-	time_t raw = time(nullptr);
+	// millisecond wall clock: at 20 Hz several lines share a second, and a
+	// capture that cannot order them is not usable for tick analysis
+	using namespace std::chrono;
+	auto now = system_clock::now();
+	time_t raw = system_clock::to_time_t(now);
+	int ms = (int)(duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000);
 	struct tm tmv;
 	localtime_s(&tmv, &raw);
-	std::printf("[%02d:%02d:%02d] %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, buf);
+
+	char line[1200];
+	int n = snprintf(line, sizeof line, "[%02d:%02d:%02d.%03d] %s\n",
+	                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms, buf);
+	if(n < 0) return;
+	if(n > (int)sizeof line - 1) n = (int)sizeof line - 1;
+
+	std::lock_guard<std::mutex> lock(m_logMutex);
+	std::fwrite(line, 1, (size_t)n, stdout);
 	std::fflush(stdout);
+	if(m_logFile){
+		m_logFile.write(line, n);
+		// buffered on purpose: a 2k-player capture writes thousands of lines a
+		// second and an fsync per line would shape the result it measures. The
+		// stream is flushed once a second (LogNetStats) and on shutdown.
+	}
 }
 
 // ---------------------------------------------------------------------------
-ServerPlayer* Server::FindPlayer(uint8_t id)
+ServerPlayer* Server::FindPlayer(rnet::PlayerId id)
 {
 	if(id < 1 || id > MAX_PLAYERS) return nullptr;
 	ServerPlayer& p = m_players[id - 1];
@@ -279,18 +375,25 @@ void Server::OnDisconnect(ENetPeer* peer)
 	ServerPlayer* p = (ServerPlayer*)peer->data;
 	if(!p) return;
 
+	// drop the EOS anti-cheat slot before the peer pointer becomes stale
+	m_ac.UnregisterClient(peer);
+
 	// leave any vehicle (broadcasts MSG_VEH_EXIT so clients unseat the puppet)
 	ClearPlayerVehicles(p, true);
 
 	SaveProfile(p);
-	Log("[LEAVE] id=%d name=%s", p->id, p->name.c_str());
 	m_resources.OnPlayerLeave(p->id, p->name);
 	if(m_gamemode) m_gamemode->OnPlayerDisconnect(*this, p->id);
 
 	BitWriter w;
 	BeginMsg(w, MSG_PLAYER_QUIT);
-	w.WriteU8(p->id);
+	w.WriteU16(p->id);
 	Broadcast(w, CHAN_RELIABLE, true);
+
+	if(p->joinTime > 0.0)
+		Log("[LEAVE] id=%u name=%s session=%.1fs states=%d violations=%d",
+		    (unsigned)p->id, p->name.c_str(), Now() - p->joinTime, p->statesReceived, p->violations);
+	m_statsLeaves++;
 
 	peer->data = nullptr;
 	*p = ServerPlayer();
@@ -336,6 +439,8 @@ void Server::OnReceive(ENetPeer* peer, ENetPacket* packet, uint8_t channel)
 	case MSG_APPEARANCE:  if(p) HandleAppearance(p, r); break;
 	case MSG_RCON_AUTH:   if(p) HandleRcon(p, r, true); break;
 	case MSG_RCON_CMD:    if(p) HandleRcon(p, r, false); break;
+	case MSG_AC_HELLO:    if(p) HandleAcHello(p, r); break;
+	case MSG_AC_FROM_CLIENT: if(p) HandleAcPayload(p, r); break;
 	case MSG_PING: {
 		if(!p) break;
 		uint32_t stamp = r.ReadU32();
@@ -374,6 +479,17 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		}
 	}
 
+	// Protected clients only: in strict mode a server whose own AC session is
+	// not running has nothing that could verify a client, so every join would
+	// become an unprotected one. Refuse it up front instead of letting players
+	// in and kicking them a grace period later.
+	if(m_cfg.ac.requireProtected && !m_cfg.ac.failOpen && !m_ac.Ready()){
+		Log("[EAC] refused %s: anti-cheat required but the session is %s",
+		    hello.name, m_ac.StatusLine().c_str());
+		SendRefusal(peer, REFUSE_ANTICHEAT, "this server requires EOS anti-cheat");
+		return;
+	}
+
 	// latency probe: answer and allocate nothing
 	if(hello.flags & HELLO_PROBE){
 		BitWriter w;
@@ -386,8 +502,8 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		CopyStr(wel.gameMode, sizeof wel.gameMode, m_gamemode->Name());
 		CopyStr(wel.hostname, sizeof wel.hostname, m_cfg.hostname.c_str());
 		// live info for the launcher's browser tooltip
-		wel.players = (uint8_t)ActivePlayerCount();
-		wel.maxPlayers = (uint8_t)m_cfg.maxPlayers;
+		wel.players = (uint16_t)ActivePlayerCount();
+		wel.maxPlayers = (uint16_t)m_cfg.maxPlayers;
 		CopyStr(wel.mapName, sizeof wel.mapName, m_cfg.mapName.c_str());
 		WriteWelcome(w, wel);
 		SendTo(peer, w, CHAN_RELIABLE, true);
@@ -433,7 +549,8 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	ServerPlayer& np = m_players[idx];
 	np = ServerPlayer();
 	np.active = true;
-	np.id = (uint8_t)(idx + 1);
+	np.id = (rnet::PlayerId)(idx + 1);
+	np.joinTime = Now();
 	np.peer = peer;
 	np.ip = peer->address.host;
 	np.port = peer->address.port;
@@ -493,7 +610,12 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	np.profileStranger = !ownsProfile && np.hasProfile;
 	peer->data = &np;
 
-	Log("[JOIN] id=%d name=%s", np.id, np.name.c_str());
+	m_statsJoins++;
+	Log("[JOIN] id=%u name=%s addr=%u.%u.%u.%u:%u players=%d/%d", (unsigned)np.id,
+	    np.name.c_str(),
+	    (unsigned)(np.ip & 0xFF), (unsigned)((np.ip >> 8) & 0xFF),
+	    (unsigned)((np.ip >> 16) & 0xFF), (unsigned)((np.ip >> 24) & 0xFF),
+	    (unsigned)np.port, ActivePlayerCount(), m_cfg.maxPlayers);
 	m_resources.OnPlayerJoin(np.id, np.name);   // resource @on join hooks
 
 	// welcome
@@ -506,14 +628,22 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 	wel.hour = m_cfg.hour; wel.minute = m_cfg.minute; wel.weather = m_cfg.weather;
 	CopyStr(wel.gameMode, sizeof wel.gameMode, m_gamemode->Name());
 	CopyStr(wel.hostname, sizeof wel.hostname, m_cfg.hostname.c_str());
-	wel.players = (uint8_t)ActivePlayerCount();
-	wel.maxPlayers = (uint8_t)m_cfg.maxPlayers;
+	wel.players = (uint16_t)ActivePlayerCount();
+	wel.maxPlayers = (uint16_t)m_cfg.maxPlayers;
 	CopyStr(wel.mapName, sizeof wel.mapName, m_cfg.mapName.c_str());
 	WriteWelcome(w, wel);
 	SendTo(peer, w, CHAN_RELIABLE, true);
 
 	// let the admin panel see the mod/resource inventory
 	SendResList(peer);
+
+	// start the registration clock: the client opens its AC session and sends
+	// MSG_AC_HELLO on its own; a peer that never does is removed in Tick
+	if(AcEnforced()){
+		np.acDeadline = Now() + (double)m_cfg.ac.graceSeconds;
+		Log("[EAC] %s has %us to prove it is protected", np.name.c_str(),
+		    (unsigned)m_cfg.ac.graceSeconds);
+	}
 
 	// restore the persisted profile NOW (hello-time): it is queued on the
 	// reliable channel before the client can possibly report its inventory,
@@ -524,46 +654,25 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		SendInventory(&np);
 	}
 
-	// tell the newcomer about everyone already here
-	for(int i = 0; i < MAX_PLAYERS; i++){
-		ServerPlayer& other = m_players[i];
-		if(other.active && other.id != np.id){
-			BitWriter w2;
-			BeginMsg(w2, MSG_PLAYER_JOIN);
-			MsgPlayerJoin j;
-			j.playerId = other.id;
-			j.skinModel = other.skin;
-			CopyStr(j.name, sizeof j.name, other.name.c_str());
-			WritePlayerJoin(w2, j);
-			SendTo(peer, w2, CHAN_RELIABLE, true);
-			// already in the world: the newcomer missed their MSG_SPAWN, so
-			// replay it from the last accepted state (ahead of the vehicle
-			// snapshot below, so occupants have a body to seat)
-			if(other.spawned && other.alive){
-				BitWriter ws;
-				BeginMsg(ws, MSG_SPAWN);
-				MsgSpawn sp;
-				sp.playerId = other.id; sp.skinModel = other.skin;
-				sp.x = DequantPos(other.state.xMm);
-				sp.y = DequantPos(other.state.yMm);
-				sp.z = DequantPos(other.state.zMm);
-				sp.heading = DequantAngle(other.state.heading);
-				sp.health = other.health; sp.armour = other.armour;
-				WriteSpawn(ws, sp);
-				SendTo(peer, ws, CHAN_RELIABLE, true);
-			}
-		}
-	}
+	// tell the newcomer about everyone already here. Batched (MSG_ROSTER):
+	// the old code sent one reliable JOIN + SPAWN per existing player, so the
+	// 2000th join alone cost 4000 packets.
+	SendRoster(peer, np.id);
 
-	// announce to everyone else
-	BitWriter w3;
-	BeginMsg(w3, MSG_PLAYER_JOIN);
-	MsgPlayerJoin j;
-	j.playerId = np.id;
-	j.skinModel = np.skin;
-	CopyStr(j.name, sizeof j.name, np.name.c_str());
-	WritePlayerJoin(w3, j);
-	Broadcast(w3, CHAN_RELIABLE, true, np.id);
+	// announce to everyone else. On a large server the per-join broadcast is
+	// skipped: every existing player already receives the newcomer's state in
+	// the next MSG_STATE_BATCH, and one reliable packet per player per join is
+	// what turns a 2k join wave into millions of sends.
+	if(ActivePlayerCount() <= kRosterJoinBroadcastLimit){
+		BitWriter w3;
+		BeginMsg(w3, MSG_PLAYER_JOIN);
+		MsgPlayerJoin j;
+		j.playerId = np.id;
+		j.skinModel = np.skin;
+		CopyStr(j.name, sizeof j.name, np.name.c_str());
+		WritePlayerJoin(w3, j);
+		Broadcast(w3, CHAN_RELIABLE, true, np.id);
+	}
 
 	// vehicle snapshot: live vehicles + occupants + last driver state, so a
 	// late joiner sees the same traffic as everyone else
@@ -584,7 +693,7 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 		SendTo(peer, wv, CHAN_RELIABLE, true);
 
 		for(int s = 0; s < 8; s++){
-			if(v.occupants[s] == 0xFF) continue;
+			if(v.occupants[s] == PLAYER_ID_NONE) continue;
 			BitWriter we;
 			BeginMsg(we, MSG_VEH_ENTER);
 			MsgVehEnter ve;
@@ -610,12 +719,49 @@ void Server::HandleHello(ServerPlayer* p, BitReader& r, ENetPeer* peer, uint8_t)
 			if(!m_vehicles[i].active) continue;
 			live++;
 			for(int s = 0; s < 8; s++)
-				if(m_vehicles[i].occupants[s] != 0xFF) seated++;
+				if(m_vehicles[i].occupants[s] != PLAYER_ID_NONE) seated++;
 		}
-		Log("[VEHSYNC] join snapshot to player %d: %d vehicles, %d occupied seats",
-		    (int)np.id, live, seated);
+		Log("[VEHSYNC] join snapshot to player %u: %d vehicles, %d occupied seats",
+		    (unsigned)np.id, live, seated);
 	}
 	if(m_gamemode) m_gamemode->OnPlayerConnect(*this, np.id);
+}
+
+// Batched identity snapshot: MSG_ROSTER chunks of MAX_ROSTER_PER_PACKET.
+void Server::SendRoster(ENetPeer* peer, rnet::PlayerId skipId)
+{
+	if(!peer) return;
+	MsgRosterEntry batch[MAX_ROSTER_PER_PACKET];
+	int n = 0;
+	auto flushBatch = [&](){
+		if(n == 0) return;
+		BitWriter w;
+		BeginMsg(w, MSG_ROSTER);
+		WriteRoster(w, batch, n);
+		SendTo(peer, w, CHAN_RELIABLE, true);
+		n = 0;
+	};
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active || p.id == skipId) continue;
+		MsgRosterEntry& e = batch[n];
+		e = MsgRosterEntry();
+		e.id = p.id;
+		e.skin = p.skin;
+		e.health = p.health;
+		e.armour = p.armour;
+		if(p.spawned){
+			e.flags |= ROSTER_SPAWNED;
+			if(p.alive) e.flags |= ROSTER_ALIVE;
+			e.xMm = p.state.xMm;
+			e.yMm = p.state.yMm;
+			e.zMm = p.state.zMm;
+			e.heading = p.state.heading;
+		}
+		CopyStr(e.name, sizeof e.name, p.name.c_str());
+		if(++n == MAX_ROSTER_PER_PACKET) flushBatch();
+	}
+	flushBatch();
 }
 
 // ---------------------------------------------------------------------------
@@ -684,10 +830,15 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 	// client-flagged teleports (game-side respawns/warps) are trusted
 	// relocations: log them and rate-limit floods, never anti-cheat kick
 	if((st.moveFlags & MOVEFLAG_TELEPORT) && p->lastStateTime > 0.0){
-		Log("[teleport] %s (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)",
-		    p->name.c_str(),
-		    p->state.xMm/1000.0f, p->state.yMm/1000.0f, p->state.zMm/1000.0f,
-		    st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f);
+		// a client may repeat the flag until its warp is acknowledged; a flag
+		// that does not actually move the player is a resync, not a teleport,
+		// and logging it at 20 Hz per client would bury the capture
+		if(DistMm(p->state.xMm, p->state.yMm, p->state.zMm,
+		          st.xMm, st.yMm, st.zMm) > 1.0f)
+			Log("[teleport] %s (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)",
+			    p->name.c_str(),
+			    p->state.xMm/1000.0f, p->state.yMm/1000.0f, p->state.zMm/1000.0f,
+			    st.xMm/1000.0f, st.yMm/1000.0f, st.zMm/1000.0f);
 		if((float)(t - p->teleportWindowStart) > TELEPORT_WINDOW_SEC){
 			p->teleportWindowStart = t;
 			p->teleportBurst = 0;
@@ -761,6 +912,7 @@ void Server::HandlePlayerState(ServerPlayer* p, BitReader& r)
 		st.seat = p->state.seat;
 		p->state = st;
 		p->lastStateTime = t;
+		p->statesReceived++;
 	}
 }
 
@@ -813,7 +965,8 @@ void Server::HandleVoice(ServerPlayer* p, BitReader& r)
 	if(!p->spawned) return;
 	if(!p->voiceRate.Allow(Now())) return;
 	// the packet length is on the wire: a bad length or trailing bytes is malformed
-	uint8_t ignoredId = 0, len = 0;
+	rnet::PlayerId ignoredId = 0;
+	uint8_t len = 0;
 	uint8_t packet[VOICE_MAX_PACKET];
 	if(!ReadVoice(r, ignoredId, packet, len) || r.BitsLeft() != 0) return;
 
@@ -1076,13 +1229,13 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 
 	// seat assignment: honour the request when free, otherwise the lowest free
 	// seat; a full vehicle rejects the enter
-	uint8_t seat = 0xFF;
-	if(m.seat < 8 && v->occupants[m.seat] == 0xFF)
-		seat = m.seat;
+	int seat = -1;
+	if(m.seat < 8 && v->occupants[m.seat] == PLAYER_ID_NONE)
+		seat = (int)m.seat;
 	else
 		for(int s = 0; s < 8; s++)
-			if(v->occupants[s] == 0xFF){ seat = (uint8_t)s; break; }
-	if(seat == 0xFF){
+			if(v->occupants[s] == PLAYER_ID_NONE){ seat = s; break; }
+	if(seat < 0){
 		Log("[VEHSYNC] enter DENIED player=%d: vehicle id=%d has no free seat", (int)p->id, (int)vid);
 		return;
 	}
@@ -1090,7 +1243,7 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	v->occupants[seat] = p->id;
 	if(seat == 0) v->driverId = p->id;
 	p->state.vehicleId = vid;
-	p->state.seat = seat;
+	p->state.seat = (uint8_t)seat;
 	Log("[VEHSYNC] enter OK player=%d veh=%d seat=%d (asked %d) model=%d owner=%d driver=%d",
 	    (int)p->id, (int)vid, (int)seat, (int)m.seat, (int)v->modelId,
 	    (int)v->ownerId, (int)v->driverId);
@@ -1100,7 +1253,7 @@ void Server::HandleVehEnter(ServerPlayer* p, BitReader& r)
 	MsgVehEnter out;
 	out.playerId = p->id;
 	out.vehicleId = vid;
-	out.seat = seat;   // the ASSIGNED seat (may differ from the request)
+	out.seat = (uint8_t)seat;   // the ASSIGNED seat (may differ from the request)
 	out.modelId = v->modelId;
 	WriteVehEnter(w, out);
 	Broadcast(w, CHAN_RELIABLE, true);
@@ -1115,8 +1268,8 @@ void Server::ClearPlayerVehicles(ServerPlayer* p, bool broadcast)
 		if(!v.active) continue;
 		bool held = false;
 		for(int s = 0; s < 8; s++)
-			if(v.occupants[s] == p->id){ v.occupants[s] = 0xFF; held = true; }
-		if(v.driverId == p->id){ v.driverId = 0xFF; held = true; }
+			if(v.occupants[s] == p->id){ v.occupants[s] = PLAYER_ID_NONE; held = true; }
+		if(v.driverId == p->id){ v.driverId = PLAYER_ID_NONE; held = true; }
 		if(held)
 			Log("[VEHSYNC] clear player=%d veh=%d (broadcast=%d)", (int)p->id, (int)v.id, (int)broadcast);
 		if(held && broadcast){
@@ -1159,8 +1312,8 @@ void Server::HandleVehExit(ServerPlayer* p, BitReader& r)
 	}
 	Log("[VEHSYNC] exit OK player=%d veh=%d", (int)p->id, (int)v->id);
 	for(int s = 0; s < 8; s++)
-		if(v->occupants[s] == p->id) v->occupants[s] = 0xFF;
-	if(v->driverId == p->id) v->driverId = 0xFF;
+		if(v->occupants[s] == p->id) v->occupants[s] = rnet::PLAYER_ID_NONE;
+	if(v->driverId == p->id) v->driverId = rnet::PLAYER_ID_NONE;
 	p->state.vehicleId = VEHICLE_NONE;
 	p->state.seat = 0xFF;
 
@@ -1211,10 +1364,199 @@ void Server::HandleRcon(ServerPlayer* p, BitReader& r, bool auth)
 }
 
 // ---------------------------------------------------------------------------
+// EOS Anti-Cheat bridge
+// ---------------------------------------------------------------------------
+static const char* AcResultText(int rc)
+{
+	switch(rc){
+	case AC_REG_OK:           return "registered";
+	case AC_REG_DISABLED:     return "no anti-cheat session on this server";
+	case AC_REG_BAD_PLATFORM: return "unknown client platform";
+	case AC_REG_BAD_PUID:     return "bad ProductUserId";
+	case AC_REG_BAD_TOKEN:    return "missing or invalid Connect ID token";
+	case AC_REG_REJECTED:     return "EOS refused the registration";
+	case AC_REG_ALREADY:      return "already registered";
+	}
+	return "unknown";
+}
+
+bool Server::AcEnforced() const
+{
+	return m_cfg.ac.requireProtected && m_ac.Ready() && !m_acSuspend;
+}
+
+void Server::DropAcDeadlines()
+{
+	for(int i = 0; i < MAX_PLAYERS; i++) m_players[i].acDeadline = 0.0;
+}
+
+void Server::InitAntiCheat()
+{
+	m_acRegistered = m_acRejected = 0;
+	m_acSuspend = false;
+	m_ac.SetLog([this](const std::string& line){ Log("%s", line.c_str()); });
+	m_ac.SetCallbacks(
+	    [this](void* handle, const void* data, uint32_t len){ OnAcMessageToClient(handle, data, len); },
+	    [this](void* handle, int action, const char* reason){ OnAcActionRequired(handle, action, reason); },
+	    [this](void* handle){ return PlayerForHandle(handle) != nullptr; },
+	    [this](void* handle, int status, const std::string& detail){ OnAcRegisterResult(handle, status, detail); });
+
+	bool up = m_ac.Start(m_cfg.ac);
+	Log("[EAC] %s — %s", up ? "session live" : "inactive", m_ac.StatusLine().c_str());
+}
+
+ServerPlayer* Server::PlayerForHandle(void* handle)
+{
+	if(!handle) return nullptr;
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(p.active && p.peer == handle) return &p;
+	}
+	return nullptr;
+}
+
+void Server::SendAcStatus(ServerPlayer* p, uint8_t status, const std::string& detail)
+{
+	if(!p || !p->peer) return;
+	if(status == AC_REG_OK) p->acDeadline = 0.0;   // protected: stop the clock
+	MsgAcStatus st;
+	st.status = status;
+	st.registered = (status == AC_REG_OK) ? 1 : 0;
+	CopyStr(st.detail, sizeof st.detail, detail.c_str());
+	BitWriter w;
+	BeginMsg(w, MSG_AC_STATUS);
+	WriteAcStatus(w, st);
+	SendTo(p->peer, w, CHAN_RELIABLE, true);
+	p->acState = st.registered ? 2 : 0;
+}
+
+void Server::OnAcMessageToClient(void* handle, const void* data, uint32_t len)
+{
+	ServerPlayer* p = PlayerForHandle(handle);
+	if(!p || !p->peer){
+		// the peer left between RegisterClient and the first message
+		m_ac.UnregisterClient(handle);
+		return;
+	}
+	if(!data || len == 0 || len > (uint32_t)MAX_AC_PAYLOAD) return;
+
+	MsgAcPayload m;
+	m.len = (uint16_t)len;
+	memcpy(m.data, data, len);
+	BitWriter w;
+	BeginMsg(w, MSG_AC_TO_CLIENT);
+	if(!WriteAcPayload(w, m)) return;
+	SendTo(p->peer, w, CHAN_RELIABLE, true);
+}
+
+void Server::OnAcActionRequired(void* handle, int action, const char* reason)
+{
+	ServerPlayer* p = PlayerForHandle(handle);
+	if(!p) return;
+	const char* why = (reason && *reason) ? reason : "EOS anti-cheat removed this client";
+
+	if(!m_cfg.ac.kickOnViolation){
+		Log("[EAC] %s flagged (action=%d): %s [kicks disabled]", p->name.c_str(), action, why);
+		SendChatTo(p->id, "[EAC] anti-cheat flagged this client");
+		return;
+	}
+	// deferred: Tick applies it after EOS_Platform_Tick has returned
+	p->acKick = true;
+	p->acKickReason = std::string("EOS anti-cheat: ") + why;
+}
+
+void Server::OnAcRegisterResult(void* handle, int status, const std::string& detail)
+{
+	ServerPlayer* p = PlayerForHandle(handle);
+	if(!p) return;
+	SendAcStatus(p, (uint8_t)status, detail.empty() ? AcResultText(status) : detail);
+	if(status == AC_REG_OK){
+		m_acRegistered++;
+		Log("[EAC] %s registered (%d client(s) in the session)", p->name.c_str(), m_ac.ClientCount());
+		return;
+	}
+	Log("[EAC] %s not registered: %s", p->name.c_str(), AcResultText(status));
+
+	// EOS refusing RegisterClient is a *server* integration problem (usually the
+	// dev-portal client is missing the anti-cheat permissions), not a cheat: if
+	// nobody at all can register, enforcement would empty the server. Suspend the
+	// policy loudly instead, and let `ac restart` re-arm it after the fix.
+	if(status == AC_REG_REJECTED && ++m_acRejected >= 2 && m_acRegistered == 0 && !m_acSuspend){
+		m_acSuspend = true;
+		DropAcDeadlines();
+		Log("[EAC] EOS refused every registration — server-side anti-cheat config is incomplete");
+		Log("[EAC] protected-clients-only enforcement SUSPENDED (fix the client permissions, then `ac restart`)");
+	}
+}
+
+void Server::HandleAcHello(ServerPlayer* p, BitReader& r)
+{
+	MsgAcHello hello;
+	if(!ReadAcHello(r, hello)) return;
+
+	if(!m_ac.Ready()){
+		SendAcStatus(p, AC_REG_DISABLED, m_ac.detail().empty() ? "no anti-cheat session" : m_ac.detail());
+		return;
+	}
+
+	char ipstr[32] = {};
+	ENetAddress a; a.host = p->ip; a.port = p->port;
+	enet_address_get_host_ip(&a, ipstr, sizeof ipstr);
+
+	int rc = m_ac.RegisterClient(p->peer, hello.productUserId, hello.idToken, hello.platform, ipstr);
+	if(rc == AC_REG_OK){
+		// verification is async: MSG_AC_STATUS follows from OnAcRegisterResult
+		p->acState = 1;
+		Log("[EAC] %s (%s, %s) requested registration — verifying Connect ID token",
+		    p->name.c_str(), ac::PlatformName(hello.platform), ipstr);
+		return;
+	}
+	SendAcStatus(p, (uint8_t)rc, AcResultText(rc));
+}
+
+void Server::HandleAcPayload(ServerPlayer* p, BitReader& r)
+{
+	MsgAcPayload m;
+	if(!ReadAcPayload(r, m)){
+		Log("[EAC] %s sent a malformed AC payload (dropped)", p->name.c_str());
+		return;
+	}
+	if(!m_ac.IsRegistered(p->peer)) return;   // unregistered peers cannot feed the session
+	m_ac.ReceiveFromClient(p->peer, m.data, m.len);
+}
+
+// ---------------------------------------------------------------------------
 void Server::Tick()
 {
 	float dt = (float)(1.0 / std::max(1, m_cfg.tickRate));
 	double t = Now();
+
+	// EOS work (ID-token callbacks, session heartbeat) runs before anything
+	// that can kick, so a removal decided inside a callback is applied below.
+	if(m_ac.TickDue(t)) m_ac.Tick(t);
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active || !p.acKick) continue;
+		p.acKick = false;
+		std::string why = p.acKickReason.empty() ? std::string("anti-cheat") : p.acKickReason;
+		p.acKickReason.clear();
+		Log("[EAC] removing %s: %s", p.name.c_str(), why.c_str());
+		KickPlayer(p.id, why.c_str());
+	}
+
+	// protected clients only: a peer that never opened an AC session is removed
+	if(AcEnforced()){
+		for(int i = 0; i < MAX_PLAYERS; i++){
+			ServerPlayer& p = m_players[i];
+			if(!p.active || p.acDeadline <= 0.0) continue;
+			if(p.acState == 2){ p.acDeadline = 0.0; continue; }
+			if(t < p.acDeadline) continue;
+			p.acDeadline = 0.0;
+			Log("[EAC] removing %s: no anti-cheat session after %us", p.name.c_str(),
+			    (unsigned)m_cfg.ac.graceSeconds);
+			KickPlayer(p.id, "EOS anti-cheat required — this client is not protected");
+		}
+	}
 
 	// respawns
 	for(int i = 0; i < MAX_PLAYERS; i++){
@@ -1227,38 +1569,38 @@ void Server::Tick()
 
 	if(m_gamemode) m_gamemode->OnTick(*this, dt);
 
-	// relay player states within AOI
-	for(int i = 0; i < MAX_PLAYERS; i++){
-		ServerPlayer& p = m_players[i];
-		if(!p.active || !p.spawned || p.lastStateTime <= 0.0) continue;
-
-		for(int j = 0; j < MAX_PLAYERS; j++){
-			if(i == j) continue;
-			ServerPlayer& q = m_players[j];
-			if(!q.active || !q.spawned || !q.peer) continue;
-
-			float dist = DistMm(p.state.xMm, p.state.yMm, p.state.zMm,
-			                    q.state.xMm, q.state.yMm, q.state.zMm);
-			if(dist > m_cfg.streamDistance) continue;
-
-			BitWriter w;
-			BeginMsg(w, MSG_PLAYER_STATE);
-			WritePlayerState(w, p.state);
-			SendTo(q.peer, w, CHAN_STATE, false);
-		}
+	// relay player states within AOI: one MSG_STATE_BATCH per receiver per tick
+	// instead of one packet per (state, receiver) pair
+	{
+		auto r0 = std::chrono::steady_clock::now();
+		RelayStates();
+		double rms = std::chrono::duration<double, std::milli>(
+		    std::chrono::steady_clock::now() - r0).count();
+		m_statsRelayMsSum += rms;
+		if(rms > m_statsRelayMsMax) m_statsRelayMsMax = rms;
 	}
 
 	// (vehicle states are relayed directly in HandleVehicleState — driver-paced
 	//  at 20 Hz)
 
-	// reconciliation heartbeat, 1 Hz: what the in-range 20 Hz streams never
-	// deliver. Players beyond the stream distance still get a slow position
-	// (no ghost frozen where it left range), and every vehicle's last state
-	// reaches everyone but its driver (a parked car that moved while a client
-	// was out of range or not yet connected ends up in the same place for all).
-	if(t - m_lastReconcile >= 1.0){
-		m_lastReconcile = t;
-		for(int i = 0; i < MAX_PLAYERS; i++){
+	// reconciliation heartbeat: what the in-range 20 Hz streams never deliver.
+	// A player just outside the stream distance keeps getting a slow position
+	// (no ghost frozen where they left range), and every vehicle's last state
+	// reaches everyone in the same band but its driver.
+	//
+	// This used to be one 1 Hz sweep of the full M x M matrix, i.e. ~1,000,000
+	// packets in a single tick at 1000 players: a measured 700 ms stall once a
+	// second, which then showed up as client loss and movement-validator kicks.
+	// It is now (a) spread over tickRate ticks and (b) limited to a 2x stream
+	// radius, so the work per tick stays proportional to nearby players.
+	{
+		int stride = std::max(1, m_cfg.tickRate);
+		int perTick = (MAX_PLAYERS + stride - 1) / stride;
+		int start = m_reconcileCursor;
+		m_reconcileCursor = (start + perTick) % MAX_PLAYERS;
+		float band = m_cfg.streamDistance * 2.0f;
+		for(int k = 0; k < perTick; k++){
+			int i = (start + k) % MAX_PLAYERS;
 			ServerPlayer& p = m_players[i];
 			if(!p.active || !p.spawned || p.lastStateTime <= 0.0) continue;
 			BitWriter w;
@@ -1268,12 +1610,17 @@ void Server::Tick()
 				if(i == j) continue;
 				ServerPlayer& q = m_players[j];
 				if(!q.active || !q.spawned || !q.peer) continue;
-				if(DistMm(p.state.xMm, p.state.yMm, p.state.zMm,
-				          q.state.xMm, q.state.yMm, q.state.zMm) <= m_cfg.streamDistance)
-					continue;   // already streamed at tick rate above
+				float d = DistMm(p.state.xMm, p.state.yMm, p.state.zMm,
+				                 q.state.xMm, q.state.yMm, q.state.zMm);
+				if(d <= m_cfg.streamDistance || d > band)
+					continue;   // streamed at tick rate, or too far to render
 				SendTo(q.peer, w, CHAN_STATE, false);
 			}
 		}
+	}
+	if(t - m_lastReconcile >= 1.0){
+		m_lastReconcile = t;
+		float band = m_cfg.streamDistance * 2.0f;
 		for(int i = 0; i < MAX_VEHICLES; i++){
 			ServerVehicle& v = m_vehicles[i];
 			if(!v.active) continue;
@@ -1283,6 +1630,9 @@ void Server::Tick()
 			for(int j = 0; j < MAX_PLAYERS; j++){
 				ServerPlayer& q = m_players[j];
 				if(!q.active || !q.spawned || !q.peer || q.id == v.driverId) continue;
+				if(DistMm(v.state.xMm, v.state.yMm, v.state.zMm,
+				          q.state.xMm, q.state.yMm, q.state.zMm) > band)
+					continue;   // not rendered anyway
 				SendTo(q.peer, w, CHAN_STATE, false);
 			}
 		}
@@ -1304,6 +1654,187 @@ void Server::Tick()
 
 	// resource @on interval hooks
 	m_resources.Tick(t);
+
+	// one flush per tick: everything queued above leaves in a single send pass
+	if(m_host){
+		auto f0 = std::chrono::steady_clock::now();
+		enet_host_flush(m_host);
+		double fms = std::chrono::duration<double, std::milli>(
+		    std::chrono::steady_clock::now() - f0).count();
+		m_statsFlushMsSum += fms;
+		if(fms > m_statsFlushMsMax) m_statsFlushMsMax = fms;
+	}
+}
+
+// Group every state a receiver can see into MSG_STATE_BATCH packets. The grid
+// is rebuilt first so a receiver only visits the 3x3 cell block around it: at
+// 2000 players a full pairwise scan is 4M distance checks per tick (80M/s at
+// 20 Hz), which is the cost this exists to avoid.
+void Server::RelayStates()
+{
+	if(m_aoiHead.empty() || !m_host) return;
+
+	std::fill(m_aoiHead.begin(), m_aoiHead.end(), -1);
+	std::fill(m_aoiNext.begin(), m_aoiNext.end(), -1);
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active || !p.spawned) continue;
+		int c = AoiCellOf(p.state.xMm, p.state.yMm, m_aoiCell, m_aoiDim);
+		m_aoiNext[(size_t)i] = m_aoiHead[(size_t)c];
+		m_aoiHead[(size_t)c] = i;
+	}
+
+	PlayerState batch[MAX_STATES_PER_PACKET];
+	int n = 0;
+	int batchBits = RELAY_ANCHOR_BITS;          // count + anchor already counted
+	const int budgetBits = RELAY_PAYLOAD_BYTES * 8;
+	// Compare squared distances: the neighbour scan is the hot loop (every
+	// receiver x every candidate in its 3x3 block, 60 Hz worth of sqrt at 2k),
+	// and the sqrt buys nothing when only a radius test is needed.
+	const float stream2 = m_cfg.streamDistance * m_cfg.streamDistance;
+	// Two rate tiers: players inside the near ring are relayed every tick
+	// (aiming and collisions need 20 Hz), the rest of the AOI every other tick
+	// (10 Hz is enough for bodies moving in the distance). The client
+	// interpolates between updates either way; this halves the relay volume in
+	// a crowd, which is what keeps a 2000-player tick inside its 50 ms budget.
+	const float kNearRelayM = 64.0f;
+	const float near2 = kNearRelayM * kNearRelayM;
+	const bool farSweep = (m_relayPhase++ & 1) == 0;
+	for(int qi = 0; qi < MAX_PLAYERS; qi++){
+		ServerPlayer& q = m_players[qi];
+		if(!q.active || !q.spawned || !q.peer) continue;
+		const int32_t qxMm = q.state.xMm, qyMm = q.state.yMm, qzMm = q.state.zMm;
+
+		int qcell = AoiCellOf(q.state.xMm, q.state.yMm, m_aoiCell, m_aoiDim);
+		int qx = qcell % m_aoiDim, qy = qcell / m_aoiDim;
+		n = 0;
+		auto flushQ = [&](){
+			if(n == 0) return;
+			BitWriter w;
+			BeginMsg(w, MSG_STATE_BATCH);
+			// positions ride as deltas from the receiver, so a 200 m AOI fits
+			// 16-bit centimetre offsets and a whole update fits one datagram
+			WriteStateBatch(w, batch, n, qxMm, qyMm, qzMm);
+			SendTo(q.peer, w, CHAN_STATE, false);
+			m_statsRelayStates += (uint64_t)n;
+			m_statsRelayBatches++;
+			n = 0;
+			batchBits = RELAY_ANCHOR_BITS;
+		};
+
+		for(int dy = -1; dy <= 1; dy++){
+			int y = qy + dy;
+			if(y < 0 || y >= m_aoiDim) continue;
+			for(int dx = -1; dx <= 1; dx++){
+				int x = qx + dx;
+				if(x < 0 || x >= m_aoiDim) continue;
+				for(int pi = m_aoiHead[(size_t)(y * m_aoiDim + x)]; pi >= 0;
+				    pi = m_aoiNext[(size_t)pi]){
+					if(pi == qi) continue;
+					ServerPlayer& p = m_players[pi];
+					if(p.lastStateTime <= 0.0) continue;
+					float dx = (p.state.xMm - qxMm) * 0.001f;
+					float dy = (p.state.yMm - qyMm) * 0.001f;
+					float dz = (p.state.zMm - qzMm) * 0.001f;
+					float d2 = dx * dx + dy * dy + dz * dz;
+					if(d2 > stream2) continue;
+					if(!farSweep && d2 > near2) continue;   // far tier is due next tick
+					int entryBits = RelayEntryBits(p.state, qxMm, qyMm, qzMm);
+					// split on encoded size as well as record count: a record can
+					// be wider than its neighbours (absolute position, in a
+					// vehicle) and the packet must never cross the payload budget
+					if(n > 0 && (n == MAX_STATES_PER_PACKET ||
+					   batchBits + entryBits > budgetBits)) flushQ();
+					batch[n++] = p.state;
+					batchBits += entryBits;
+				}
+			}
+		}
+		flushQ();
+	}
+}
+
+// 1 Hz capture line: one row with everything needed to see whether the server
+// is keeping up. Per-player RTT lines are gone — at 2k they buried the log.
+void Server::LogNetStats(double t)
+{
+	double elapsed = t - m_statsWindowStart;
+	if(elapsed <= 0.0) elapsed = 1.0;
+
+	uint64_t sentNow = m_host ? m_host->totalSentData : 0;
+	uint64_t recvNow = m_host ? m_host->totalReceivedData : 0;
+	uint64_t pkSent = m_host ? m_host->totalSentPackets : 0;
+	uint64_t pkRecv = m_host ? m_host->totalReceivedPackets : 0;
+	double outRate = (double)(sentNow - m_totalBytesOut) / elapsed;
+	double inRate = (double)(recvNow - m_totalBytesIn) / elapsed;
+	uint64_t pkOut = pkSent - m_totalPacketsOut;
+	uint64_t pkIn = pkRecv - m_totalPacketsIn;
+
+	int active = 0, spawned = 0, peers = 0;
+	uint32_t rttSum = 0, rttMax = 0, rttN = 0;
+	float lossMax = 0.0f;
+	for(int i = 0; i < MAX_PLAYERS; i++){
+		ServerPlayer& p = m_players[i];
+		if(!p.active) continue;
+		active++;
+		if(p.spawned) spawned++;
+		if(!p.peer) continue;
+		peers++;
+		rttSum += p.peer->roundTripTime;
+		if(p.peer->roundTripTime > rttMax) rttMax = p.peer->roundTripTime;
+		if(p.peer->packetLoss > lossMax) lossMax = p.peer->packetLoss;
+		rttN++;
+	}
+
+	double avgTick = m_statsTicks ? (m_statsTickMsSum / (double)m_statsTicks) : 0.0;
+	double budget = 1000.0 / (double)m_cfg.tickRate;
+	double nTicks = m_statsTicks ? (double)m_statsTicks : 1.0;
+	Log("netstats: players=%d/%d spawned=%d peers=%d tick_ms avg=%.2f max=%.2f budget=%.1f "
+	    "pump_ms %.2f/%.2f relay_ms %.2f/%.2f flush_ms %.2f/%.2f "
+	    "relay_states/s=%llu relay_batches/s=%llu pkts_out/s=%llu pkts_in/s=%llu "
+	    "in=%.1fKB/s out=%.1fKB/s "
+	    "rtt_avg=%ums rtt_max=%ums loss_max=%.1f%% joins=%llu leaves=%llu kicks=%llu",
+	    active, m_cfg.maxPlayers, spawned, peers,
+	    avgTick, m_statsTickMsMax, budget,
+	    m_statsPumpMsSum / nTicks, m_statsPumpMsMax,
+	    m_statsRelayMsSum / nTicks, m_statsRelayMsMax,
+	    m_statsFlushMsSum / nTicks, m_statsFlushMsMax,
+	    (unsigned long long)m_statsRelayStates,
+	    (unsigned long long)m_statsRelayBatches,
+	    (unsigned long long)pkOut, (unsigned long long)pkIn,
+	    inRate / 1024.0, outRate / 1024.0,
+	    (unsigned)(rttN ? rttSum / rttN : 0), (unsigned)rttMax,
+	    lossMax * 100.0f / (float)ENET_PEER_PACKET_LOSS_SCALE,
+	    (unsigned long long)m_statsJoins, (unsigned long long)m_statsLeaves,
+	    (unsigned long long)m_statsKicks);
+
+	if(m_logFile){
+		m_logFile.flush();
+	}
+
+	m_totalBytesIn = recvNow;
+	m_totalBytesOut = sentNow;
+	m_totalPacketsIn = pkRecv;
+	m_totalPacketsOut = pkSent;
+	ResetTickStats();
+	m_statsWindowStart = t;
+}
+
+void Server::ResetTickStats()
+{
+	m_statsTicks = 0;
+	m_statsStates = 0;
+	m_statsStatePackets = 0;
+	m_statsTickMsSum = 0.0;
+	m_statsTickMsMax = 0.0;
+	m_statsPumpMsSum = 0.0;
+	m_statsPumpMsMax = 0.0;
+	m_statsRelayMsSum = 0.0;
+	m_statsRelayMsMax = 0.0;
+	m_statsFlushMsSum = 0.0;
+	m_statsFlushMsMax = 0.0;
+	m_statsRelayStates = 0;
+	m_statsRelayBatches = 0;
 }
 
 void Server::BroadcastWorld(void)
@@ -1343,7 +1874,7 @@ void Server::BroadcastResList(void)
 }
 
 // ---------------------------------------------------------------------------
-void Server::BroadcastChat(const char* text, uint8_t fromId)
+void Server::BroadcastChat(const char* text, rnet::PlayerId fromId)
 {
 	BitWriter w;
 	BeginMsg(w, MSG_CHAT);
@@ -1354,7 +1885,7 @@ void Server::BroadcastChat(const char* text, uint8_t fromId)
 	Broadcast(w, CHAN_RELIABLE, true);
 }
 
-void Server::SendChatTo(uint8_t playerId, const char* text, uint8_t fromId)
+void Server::SendChatTo(rnet::PlayerId playerId, const char* text, rnet::PlayerId fromId)
 {
 	ServerPlayer* p = FindPlayer(playerId);
 	if(!p || !p->peer) return;
@@ -1367,7 +1898,7 @@ void Server::SendChatTo(uint8_t playerId, const char* text, uint8_t fromId)
 	SendTo(p->peer, w, CHAN_RELIABLE, true);
 }
 
-void Server::BroadcastEvent(uint8_t type, uint8_t arg1, uint8_t arg2, const char* text)
+void Server::BroadcastEvent(uint8_t type, rnet::PlayerId arg1, rnet::PlayerId arg2, const char* text)
 {
 	BitWriter w;
 	BeginMsg(w, MSG_GAMEMODE_EVENT);
@@ -1379,7 +1910,7 @@ void Server::BroadcastEvent(uint8_t type, uint8_t arg1, uint8_t arg2, const char
 	Log("[GMEV] type=%d %d %d %s", (int)type, (int)arg1, (int)arg2, text ? text : "");
 }
 
-void Server::SpawnPlayer(uint8_t playerId, float x, float y, float z, float heading,
+void Server::SpawnPlayer(rnet::PlayerId playerId, float x, float y, float z, float heading,
                          uint16_t skin, uint8_t health, uint8_t armour)
 {
 	ServerPlayer* p = FindPlayer(playerId);
@@ -1429,7 +1960,7 @@ void Server::SpawnPlayer(uint8_t playerId, float x, float y, float z, float head
 	Log("[SPAWN] id=%d at (%.1f, %.1f, %.1f)", playerId, x, y, z);
 }
 
-void Server::KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId)
+void Server::KillPlayer(rnet::PlayerId victimId, rnet::PlayerId killerId, uint8_t weaponId)
 {
 	ServerPlayer* victim = FindPlayer(victimId);
 	if(!victim || !victim->alive) return;
@@ -1466,7 +1997,7 @@ void Server::KillPlayer(uint8_t victimId, uint8_t killerId, uint8_t weaponId)
 #include <windows.h>
 #endif
 
-void Server::SendGive(uint8_t targetId, uint8_t kind, int32_t amount, uint16_t arg)
+void Server::SendGive(rnet::PlayerId targetId, uint8_t kind, int32_t amount, uint16_t arg)
 {
 	ServerPlayer* p = FindPlayer(targetId);
 	if(!p || !p->peer) return;
@@ -1502,7 +2033,7 @@ void Server::SendGive(uint8_t targetId, uint8_t kind, int32_t amount, uint16_t a
 	SendTo(p->peer, w, CHAN_RELIABLE, true);
 }
 
-void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float heading)
+void Server::TeleportPlayer(rnet::PlayerId playerId, float x, float y, float z, float heading)
 {
 	ServerPlayer* p = FindPlayer(playerId);
 	if(!p) return;
@@ -1524,7 +2055,7 @@ void Server::TeleportPlayer(uint8_t playerId, float x, float y, float z, float h
 // after its driver walks away, exactly like a car parked on the street.
 // ---------------------------------------------------------------------------
 ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
-                                    float heading, bool permanent, uint8_t ownerId)
+                                    float heading, bool permanent, rnet::PlayerId ownerId)
 {
 	if(modelId == 0){
 		Log("[VEH] refusing model 0");
@@ -1544,10 +2075,10 @@ ServerVehicle* Server::SpawnVehicle(uint16_t modelId, float x, float y, float z,
 	v->permanent = permanent;
 	v->id = (uint16_t)(slot + 1);
 	v->modelId = modelId;
-	v->driverId = 0xFF;
+	v->driverId = rnet::PLAYER_ID_NONE;
 	v->ownerId = ownerId;
 	v->teleportDrops = 0;
-	for(int s = 0; s < 8; s++) v->occupants[s] = 0xFF;
+	for(int s = 0; s < 8; s++) v->occupants[s] = rnet::PLAYER_ID_NONE;
 	v->state = VehicleState();
 	v->state.vehicleId = v->id;
 	v->state.modelId = modelId;
@@ -1579,7 +2110,7 @@ void Server::RemoveVehicle(uint16_t vehicleId)
 
 	// unseat anyone inside first: clients unseat the puppet, then drop it
 	for(int s = 0; s < 8; s++){
-		if(v->occupants[s] == 0xFF) continue;
+		if(v->occupants[s] == rnet::PLAYER_ID_NONE) continue;
 		BitWriter we;
 		BeginMsg(we, MSG_VEH_EXIT);
 		MsgVehExit ex;
@@ -1589,9 +2120,9 @@ void Server::RemoveVehicle(uint16_t vehicleId)
 		Broadcast(we, CHAN_RELIABLE, true);
 		ServerPlayer* occ = FindPlayer(v->occupants[s]);
 		if(occ){ occ->state.vehicleId = VEHICLE_NONE; occ->state.seat = 0xFF; }
-		v->occupants[s] = 0xFF;
+		v->occupants[s] = rnet::PLAYER_ID_NONE;
 	}
-	v->driverId = 0xFF;
+	v->driverId = rnet::PLAYER_ID_NONE;
 
 	BitWriter w;
 	BeginMsg(w, MSG_VEH_DESPAWN);
@@ -1638,7 +2169,7 @@ void Server::LoadVehicleSpawns(const std::string& path)
 	    bad ? " (bad lines skipped)" : "");
 }
 
-void Server::SetPlayerVitals(uint8_t playerId, uint8_t health, uint8_t armour)
+void Server::SetPlayerVitals(rnet::PlayerId playerId, uint8_t health, uint8_t armour)
 {
 	ServerPlayer* p = FindPlayer(playerId);
 	if(!p) return;
@@ -1651,7 +2182,7 @@ void Server::BroadcastScores()
 	MsgScoreUpdate su;
 	su.count = 0;
 	// simple selection: up to 32 players, sorted by score desc
-	struct { uint8_t id; int32_t score; uint16_t kills, deaths; } tmp[MAX_PLAYERS];
+	struct { rnet::PlayerId id; int32_t score; uint16_t kills, deaths; } tmp[MAX_PLAYERS];
 	int n = 0;
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& p = m_players[i];
@@ -1675,7 +2206,7 @@ void Server::BroadcastScores()
 
 void Server::BroadcastPlayerPing()
 {
-	struct Row { uint8_t id; uint16_t ping; int32_t score; uint16_t kills, deaths; };
+	struct Row { rnet::PlayerId id; uint16_t ping; int32_t score; uint16_t kills, deaths; };
 	std::vector<Row> rows;
 	for(int i = 0; i < MAX_PLAYERS; i++){
 		ServerPlayer& p = m_players[i];
@@ -1699,8 +2230,13 @@ void Server::BroadcastPlayerPing()
 	Broadcast(w, CHAN_STATE, false);
 }
 
-void Server::KickPlayer(uint8_t playerId, const char* reason)
+void Server::KickPlayer(rnet::PlayerId playerId, const char* reason)
 {
+	// keep the EOS session in step with the reLCS roster
+	if(ServerPlayer* kp = FindPlayer(playerId)){
+		m_ac.UnregisterClient(kp->peer);
+		kp->acState = 0;
+	}
 	ServerPlayer* p = FindPlayer(playerId);
 	if(!p) return;
 
@@ -1744,6 +2280,7 @@ void Server::SetServerVar(const std::string& key, const std::string& value)
 	else if(key == "weather") m_cfg.weather = (uint8_t)atoi(value.c_str());
 	else if(key == "hour") m_cfg.hour = (uint8_t)atoi(value.c_str());
 	else if(key == "minute") m_cfg.minute = (uint8_t)atoi(value.c_str());
+	else if(key == "ac_kick") m_cfg.ac.kickOnViolation = (atoi(value.c_str()) != 0);
 	else if(key == "lcs_scorelimit" && m_gamemode){
 		auto* lcs = AsSurvivor(m_gamemode);
 		if(lcs) lcs->scoreLimit = atoi(value.c_str());
@@ -1777,7 +2314,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 			std::printf("%s\n", buf);
 			std::fflush(stdout);
 		}else{
-			ServerPlayer* rp = FindPlayer((uint8_t)respondTo);
+			ServerPlayer* rp = FindPlayer((rnet::PlayerId)respondTo);
 			if(rp && rp->peer){
 				BitWriter w;
 				BeginMsg(w, MSG_RCON_RESP);
@@ -1788,14 +2325,62 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 	};
 
 	if(cmd == "help"){
-		respond("commands: help status players say kick ban banip unban setr getr settime setweather res gmx loadmode respawn teleport spawncar delcar cars exec uptime version netstats quit");
+		respond("commands: help status players say kick ban banip unban setr getr settime setweather res ac gmx loadmode respawn teleport spawncar delcar cars exec uptime version netstats quit");
 		respond("res: list info enable disable reload run install uninstall log");
+		respond("ac: status list kick <id> restart");
 		return true;
 	}
 	if(cmd == "status"){
 		respond("hostname=%s players=%d/%d mode=%s map=%s uptime=%.0fs tick=%d",
 		        m_cfg.hostname.c_str(), ActivePlayerCount(), m_cfg.maxPlayers,
 		        m_gamemode ? m_gamemode->Name() : "?", m_cfg.mapName.c_str(), Now(), m_cfg.tickRate);
+		respond("%s", m_ac.StatusLine().c_str());
+		return true;
+	}
+	if(cmd == "ac"){
+		// EOS Anti-Cheat administration
+		char sub[24] = {};
+		int id = 0;
+		int n = sscanf(rest.c_str(), "%23s %d", sub, &id);
+		std::string s = (n >= 1) ? std::string(sub) : std::string("status");
+
+		if(s == "status"){
+			respond("%s", m_ac.StatusLine().c_str());
+			respond("ac: require=%d enforced=%d grace=%us failOpen=%d registered=%d rejected=%d%s",
+			        m_cfg.ac.requireProtected ? 1 : 0, AcEnforced() ? 1 : 0,
+			        (unsigned)m_cfg.ac.graceSeconds, m_cfg.ac.failOpen ? 1 : 0,
+			        m_acRegistered, m_acRejected,
+			        m_acSuspend ? " SUSPENDED(server-side config)" : "");
+			respond("ac: serverName=\"%s\" product=%s registerTimeout=%us requireToken=%d kick=%d",
+			        m_ac.config().serverName.c_str(), m_ac.config().productId.c_str(),
+			        (unsigned)m_ac.config().registerTimeout, m_ac.config().requireToken ? 1 : 0,
+			        m_ac.config().kickOnViolation ? 1 : 0);
+			return true;
+		}
+		if(s == "list"){
+			auto clients = m_ac.Clients();
+			respond("ac: %d registered, %d tracked", m_ac.ClientCount(), (int)clients.size());
+			for(const auto& c : clients){
+				ServerPlayer* pl = PlayerForHandle(c.handle);
+				respond("  %s %s %s %s%s", c.productUserId.c_str(), ac::PlatformName(c.platform),
+				        c.ip.c_str(), pl ? pl->name.c_str() : "<gone>",
+				        c.registered ? "" : " (pending)");
+			}
+			return true;
+		}
+		if(s == "kick"){
+			ServerPlayer* pl = FindPlayer((rnet::PlayerId)id);
+			if(!pl){ respond("ac: no such player"); return true; }
+			KickPlayer(pl->id, "anti-cheat: removed by admin");
+			respond("ac: kicked #%d", id);
+			return true;
+		}
+		if(s == "restart"){
+			InitAntiCheat();
+			respond("ac: %s", m_ac.StatusLine().c_str());
+			return true;
+		}
+		respond("usage: ac status|list|kick <id>|restart");
 		return true;
 	}
 	if(cmd == "players"){
@@ -1822,7 +2407,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 		std::string reason = "kicked by admin";
 		size_t sp2 = rest.find(' ');
 		if(sp2 != std::string::npos) reason = rest.substr(sp2 + 1);
-		KickPlayer((uint8_t)id, reason.c_str());
+		KickPlayer((rnet::PlayerId)id, reason.c_str());
 		respond("kicked #%d", id);
 		return true;
 	}
@@ -1830,10 +2415,10 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 		uint32_t ip = 0;
 		if(cmd == "ban"){
 			int id = atoi(rest.c_str());
-			ServerPlayer* p = FindPlayer((uint8_t)id);
+			ServerPlayer* p = FindPlayer((rnet::PlayerId)id);
 			if(!p){ respond("no such player"); return true; }
 			ip = p->ip;
-			KickPlayer((uint8_t)id, "banned");
+			KickPlayer((rnet::PlayerId)id, "banned");
 		}else{
 			ENetAddress a;
 			if(enet_address_set_host(&a, rest.c_str()) < 0){ respond("bad ip"); return true; }
@@ -1981,13 +2566,13 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 	}
 	if(cmd == "respawn"){
 		int id = atoi(rest.c_str());
-		if(m_gamemode) m_gamemode->OnPlayerSpawnRequest(*this, (uint8_t)id);
+		if(m_gamemode) m_gamemode->OnPlayerSpawnRequest(*this, (rnet::PlayerId)id);
 		return true;
 	}
 	if(cmd == "teleport"){
 		int id = 0; float x = 0, y = 0, z = 0;
 		if(sscanf(rest.c_str(), "%d %f %f %f", &id, &x, &y, &z) == 4)
-			TeleportPlayer((uint8_t)id, x, y, z, 0.0f);
+			TeleportPlayer((rnet::PlayerId)id, x, y, z, 0.0f);
 		else
 			respond("usage: teleport <id> <x> <y> <z>");
 		return true;
@@ -2044,7 +2629,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 			n = 4;
 		}
 		if(n < 3){ respond("usage: give <id|name> money|weapon|god|health <value> [ammo]"); return true; }
-		ServerPlayer* tp = FindPlayer((uint8_t)atoi(who));
+		ServerPlayer* tp = FindPlayer((rnet::PlayerId)atoi(who));
 		if(!tp || !tp->active){
 			tp = nullptr;
 			for(int i = 0; i < MAX_PLAYERS; i++)
@@ -2129,7 +2714,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 		if(got >= 4){
 			x = a1; y = a2; z = a3; heading = a4; havePos = true;
 		}else if(got == 2){
-			ServerPlayer* tgt = FindPlayer((uint8_t)atoi(rest.c_str() + rest.find(' ')));
+			ServerPlayer* tgt = FindPlayer((rnet::PlayerId)atoi(rest.c_str() + rest.find(' ')));
 			if(!tgt){ respond("no player id %d", (int)a1); return true; }
 			x = DequantPos(tgt->state.xMm); y = DequantPos(tgt->state.yMm); z = DequantPos(tgt->state.zMm);
 			heading = DequantAngle(tgt->state.heading);
@@ -2185,11 +2770,11 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 			ServerVehicle& v = m_vehicles[i];
 			if(!v.active) continue;
 			int seats = 0;
-			for(int s = 0; s < 8; s++) if(v.occupants[s] != 0xFF) seats++;
+			for(int s = 0; s < 8; s++) if(v.occupants[s] != rnet::PLAYER_ID_NONE) seats++;
 			respond("#%d model=%d%s pos=(%.1f, %.1f, %.1f) driver=%s passengers=%d",
 			        (int)v.id, (int)v.modelId, v.permanent ? " [static]" : "",
 			        DequantPos(v.state.xMm), DequantPos(v.state.yMm), DequantPos(v.state.zMm),
-			        v.driverId == 0xFF ? "-" : std::to_string((int)v.driverId).c_str(),
+			        v.driverId == rnet::PLAYER_ID_NONE ? "-" : std::to_string((int)v.driverId).c_str(),
 			        seats ? seats - 1 : 0);
 			n++;
 		}
@@ -2220,7 +2805,7 @@ bool Server::HandleCommand(const std::string& line, int respondTo)
 	if(cmd == "inventory" || cmd == "inv"){
 		char who[40] = {};
 		sscanf(rest.c_str(), "%39s", who);
-		ServerPlayer* tp = FindPlayer((uint8_t)atoi(who));
+		ServerPlayer* tp = FindPlayer((rnet::PlayerId)atoi(who));
 		if(!tp || !tp->active){
 			tp = nullptr;
 			for(int i = 0; i < MAX_PLAYERS; i++)
@@ -2286,8 +2871,8 @@ void Server::UpdateMasterAnnounce()
 		BeginMsg(w, MSG_MASTER_ANNOUNCE);
 		MsgMasterAnnounce a;
 		a.gamePort = m_cfg.port;
-		a.players = (uint8_t)ActivePlayerCount();
-		a.maxPlayers = (uint8_t)m_cfg.maxPlayers;
+		a.players = (uint16_t)ActivePlayerCount();
+		a.maxPlayers = (uint16_t)m_cfg.maxPlayers;
 		a.protocolVersion = PROTOCOL_VERSION;
 		a.advertisedIp = LanIPv4();
 		if(!m_cfg.publicIp.empty()){

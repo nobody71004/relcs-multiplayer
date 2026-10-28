@@ -8,7 +8,9 @@ CC=${CC:-gcc}
 CXX=${CXX:-g++}
 mkdir -p obj bin
 
-FLAGS="-O2 -DNOMINMAX -DENET_STATIC -D_GNU_SOURCE -I../src/net -I../vendor/enet/include -I../vendor/sqlite"
+# EOS headers are only needed to compile net/server/anticheat.cpp: the SDK
+# itself is dlopen()ed at runtime (a host without libEOSSDK still serves).
+FLAGS="-O2 -DNOMINMAX -DENET_STATIC -D_GNU_SOURCE -I../src/net -I../vendor/enet/include -I../vendor/sqlite -I../vendor/eos-sdk/include"
 CXXFLAGS="$FLAGS -std=c++17"
 # Link the C++ runtime statically: the build host's libstdc++ is often much
 # newer than the deploy target's (a g++ 15 build needs GLIBCXX_3.4.34, Ubuntu
@@ -34,9 +36,10 @@ echo "== net-server =="
 $CXX $CXXFLAGS -c server/server.cpp   -o obj/server.o
 $CXX $CXXFLAGS -c server/gamemode.cpp -o obj/gamemode.o
 $CXX $CXXFLAGS -c server/profiles.cpp -o obj/profiles.o
-$CXX $CXXFLAGS -c server/resource.cpp -o obj/resource.o
+$CXX $CXXFLAGS -c server/resource.cpp  -o obj/resource.o
+$CXX $CXXFLAGS -c server/anticheat.cpp -o obj/anticheat.o
 $CXX $CXXFLAGS -c server/main.cpp     -o obj/server_main.o
-$CXX -o bin/reLCS-server obj/server.o obj/gamemode.o obj/profiles.o obj/resource.o obj/server_main.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS
+$CXX -o bin/reLCS-server obj/server.o obj/gamemode.o obj/profiles.o obj/resource.o obj/anticheat.o obj/server_main.o obj/enet_*.o obj/sqlite3.o -lpthread -ldl $LDFLAGS
 
 echo "== net-master =="
 $CXX $CXXFLAGS -c master/main.cpp      -o obj/master_main.o
@@ -47,6 +50,10 @@ echo "== net-bot =="
 $CXX $CXXFLAGS $OPUS_CFLAGS -c bot/main.cpp -o obj/bot_main.o
 $CXX -o bin/relcs-netbot obj/bot_main.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS $OPUS_LIBS
 
+echo "== net-loadgen =="
+$CXX $CXXFLAGS -c loadgen/main.cpp -o obj/loadgen_main.o
+$CXX -o bin/relcs-loadgen obj/loadgen_main.o obj/enet_*.o -lpthread $LDFLAGS
+
 echo "== net-tests =="
 # tests/main.cpp lives in tests/ but includes "profiles.h"/"resource.h" from
 # server/ (the VS target has includedirs { "server" } for the same reason).
@@ -54,4 +61,4 @@ $CXX $CXXFLAGS $OPUS_CFLAGS -Iserver -c tests/main.cpp -o obj/tests_main.o
 $CXX -o bin/relcs-net-tests obj/tests_main.o obj/profiles.o obj/resource.o obj/enet_*.o obj/sqlite3.o -lpthread $LDFLAGS $OPUS_LIBS
 
 echo "built:"
-ls -la bin/reLCS-server bin/reLCS-master bin/relcs-netbot bin/relcs-net-tests
+ls -la bin/reLCS-server bin/reLCS-master bin/relcs-netbot bin/relcs-loadgen bin/relcs-net-tests

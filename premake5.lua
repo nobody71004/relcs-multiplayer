@@ -299,6 +299,9 @@ project "reLCS"
 	files { addSrcFiles("src/extras") }
 	files { addSrcFiles("src/net") }
 	includedirs { "vendor/enet/include" }
+	-- src/net/acclient.cpp binds the EOS anti-cheat client at runtime; only the
+	-- headers are needed here (no link, so a game folder without the SDK starts)
+	includedirs { "vendor/eos-sdk/include" }
 	defines { "ENET_STATIC" }
 	dependson "enet"
 	filter "system:windows"

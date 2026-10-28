@@ -4,6 +4,12 @@
 */
 #ifndef _WIN32
 
+/* sendmmsg() is only declared with _GNU_SOURCE; the batch send below needs it */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -433,14 +439,199 @@ void
 enet_socket_destroy (ENetSocket socket)
 {
     if (socket != -1)
+    {
+      enet_socket_send_batch_flush (socket);
       close (socket);
+    }
 }
 
-int
-enet_socket_send (ENetSocket socket,
-                  const ENetAddress * address,
-                  const ENetBuffer * buffers,
-                  size_t bufferCount)
+/*
+ * Batched datagram send.
+ *
+ * A 2000-player tick builds ~2000 state datagrams, and every sendmsg() is a
+ * syscall: measured at ~7 us each that is 14 ms of pure syscall time per tick
+ * on Linux, more on Windows. enet_socket_send() therefore queues the finished
+ * datagram (a memcpy of at most the path MTU) and
+ * enet_socket_send_batch_flush() hands the whole queue to sendmmsg(), which
+ * sends many datagrams per syscall. The queue is drained inside the same
+ * enet_host_flush()/enet_host_service() call that queued the datagrams, so
+ * latency is unchanged; only the number of syscalls drops.
+ *
+ * The queue is process-global but drained before another socket is queued, so
+ * it is safe for the single-host-per-thread programs this library is used by
+ * (client, server, master, bot).
+ */
+#define ENET_SENDQ_MAX 4096
+
+typedef struct _ENetSendQueueEntry
+{
+    struct sockaddr_in address;
+    enet_uint32 offset;
+    enet_uint32 length;
+} ENetSendQueueEntry;
+
+static ENetSendQueueEntry enet_sendQueue [ENET_SENDQ_MAX];
+static int enet_sendQueueCount = 0;
+static ENetSocket enet_sendQueueSocket = -1;
+static enet_uint8 * enet_sendQueueData = NULL;
+static enet_uint32 enet_sendQueueSize = 0;
+static enet_uint32 enet_sendQueueCapacity = 0;
+
+static void
+enet_sendq_address (const ENetAddress * address, struct sockaddr_in * sin)
+{
+    memset (sin, 0, sizeof (struct sockaddr_in));
+    sin -> sin_family = AF_INET;
+    sin -> sin_port = ENET_HOST_TO_NET_16 (address -> port);
+    sin -> sin_addr.s_addr = address -> host;
+}
+
+/* returns the queued length, or -1 when the datagram has to be sent directly */
+static int
+enet_sendq_push (ENetSocket socket,
+                 const ENetAddress * address,
+                 const ENetBuffer * buffers,
+                 size_t bufferCount)
+{
+    size_t total = 0, i, at;
+    enet_uint8 * destination;
+
+    if (address == NULL || buffers == NULL || bufferCount == 0)
+      return -1;
+
+    for (i = 0; i < bufferCount; i ++)
+      total += buffers [i].dataLength;
+
+    if (total == 0)
+      return -1;
+
+    if (enet_sendQueueSocket != socket ||
+        enet_sendQueueCount >= ENET_SENDQ_MAX ||
+        enet_sendQueueSize + total > enet_sendQueueCapacity)
+      enet_socket_send_batch_flush (socket);
+
+    if (enet_sendQueueSize + total > enet_sendQueueCapacity)
+    {
+        enet_uint32 capacity = enet_sendQueueCapacity ? enet_sendQueueCapacity : (1u << 20);
+        enet_uint8 * grown;
+
+        while (capacity < enet_sendQueueSize + total)
+          capacity <<= 1;
+
+        grown = (enet_uint8 *) realloc (enet_sendQueueData, capacity);
+        if (grown == NULL)
+          return -1;
+
+        enet_sendQueueData = grown;
+        enet_sendQueueCapacity = capacity;
+    }
+
+    destination = enet_sendQueueData + enet_sendQueueSize;
+    at = 0;
+    for (i = 0; i < bufferCount; i ++)
+    {
+        if (buffers [i].dataLength > 0)
+          memcpy (destination + at, buffers [i].data, buffers [i].dataLength);
+
+        at += buffers [i].dataLength;
+    }
+
+    enet_sendq_address (address, & enet_sendQueue [enet_sendQueueCount].address);
+    enet_sendQueue [enet_sendQueueCount].offset = enet_sendQueueSize;
+    enet_sendQueue [enet_sendQueueCount].length = (enet_uint32) total;
+    enet_sendQueueSocket = socket;
+    enet_sendQueueSize += (enet_uint32) total;
+    enet_sendQueueCount ++;
+
+    return (int) total;
+}
+
+void
+enet_socket_send_batch_flush (ENetSocket socket)
+{
+    int i;
+
+    if (enet_sendQueueCount == 0)
+      return;
+
+    if (enet_sendQueueSocket != socket)
+    {
+        /* another socket queued in between: never send to the wrong one */
+        enet_sendQueueCount = 0;
+        enet_sendQueueSize = 0;
+        return;
+    }
+
+#if defined(__linux__)
+    {
+        static struct mmsghdr * messages = NULL;
+        static struct iovec * vectors = NULL;
+        static int allocated = 0;
+
+        if (allocated < enet_sendQueueCount)
+        {
+            struct mmsghdr * grownMessages = (struct mmsghdr *) realloc (messages, (size_t) enet_sendQueueCount * sizeof (struct mmsghdr));
+            struct iovec * grownVectors = (struct iovec *) realloc (vectors, (size_t) enet_sendQueueCount * sizeof (struct iovec));
+
+            if (grownMessages != NULL && grownVectors != NULL)
+            {
+                messages = grownMessages;
+                vectors = grownVectors;
+                allocated = enet_sendQueueCount;
+            }
+        }
+
+        if (allocated >= enet_sendQueueCount)
+        {
+            int sent = 0;
+
+            for (i = 0; i < enet_sendQueueCount; i ++)
+            {
+                vectors [i].iov_base = enet_sendQueueData + enet_sendQueue [i].offset;
+                vectors [i].iov_len = enet_sendQueue [i].length;
+
+                memset (& messages [i], 0, sizeof (struct mmsghdr));
+                messages [i].msg_hdr.msg_name = & enet_sendQueue [i].address;
+                messages [i].msg_hdr.msg_namelen = sizeof (struct sockaddr_in);
+                messages [i].msg_hdr.msg_iov = & vectors [i];
+                messages [i].msg_hdr.msg_iovlen = 1;
+            }
+
+            /* sendmmsg() reports how many datagrams it took, not bytes */
+            while (sent < enet_sendQueueCount)
+            {
+                int sentNow = sendmmsg (socket, messages + sent,
+                                        (unsigned int) (enet_sendQueueCount - sent), MSG_NOSIGNAL);
+
+                if (sentNow <= 0)
+                  break;
+
+                sent += sentNow;
+            }
+
+            enet_sendQueueCount = 0;
+            enet_sendQueueSize = 0;
+
+            return;
+        }
+    }
+#endif
+
+    /* non-Linux hosts, or the mmsghdr allocation failed */
+    for (i = 0; i < enet_sendQueueCount; i ++)
+      sendto (socket, enet_sendQueueData + enet_sendQueue [i].offset, enet_sendQueue [i].length,
+              MSG_NOSIGNAL, (struct sockaddr *) & enet_sendQueue [i].address,
+              sizeof (struct sockaddr_in));
+
+    enet_sendQueueCount = 0;
+    enet_sendQueueSize = 0;
+}
+
+static int
+enet_socket_send_direct (ENetSocket socket,
+                         const ENetAddress * address,
+                         const ENetBuffer * buffers,
+                         size_t bufferCount)
 {
     struct msghdr msgHdr;
     struct sockaddr_in sin;
@@ -474,6 +665,20 @@ enet_socket_send (ENetSocket socket,
     }
 
     return sentLength;
+}
+
+int
+enet_socket_send (ENetSocket socket,
+                  const ENetAddress * address,
+                  const ENetBuffer * buffers,
+                  size_t bufferCount)
+{
+    int queued = enet_sendq_push (socket, address, buffers, bufferCount);
+
+    if (queued >= 0)
+      return queued;
+
+    return enet_socket_send_direct (socket, address, buffers, bufferCount);
 }
 
 int
