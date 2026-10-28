@@ -454,7 +454,12 @@ bool Init()
 
 	if(!BindSdk()) return false;
 	if(!CreatePlatform()){
-		g.sdk.Shutdown();
+		// Release through our own path, not raw EOS_Shutdown: when the platform
+		// was created but has no anti-cheat interface, the platform handle is
+		// still live and Tick() must stop seeing it. Leaving it set made the
+		// next Tick() call EOS_Platform_Tick on a destroyed platform (crash
+		// inside EOSSDK as soon as the client connects).
+		Shutdown();
 		return false;
 	}
 	g.state = State::LoggingIn;
