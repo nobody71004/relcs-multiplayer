@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -37,6 +38,85 @@ bool DirExists(const std::string& p)
 {
 	DWORD a = GetFileAttributesA(p.c_str());
 	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool WriteTime(const std::string& p, FILETIME& out)
+{
+	HANDLE h = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                       nullptr, OPEN_EXISTING, 0, nullptr);
+	if(h == INVALID_HANDLE_VALUE) return false;
+	bool ok = GetFileTime(h, nullptr, nullptr, &out) != 0;
+	CloseHandle(h);
+	return ok;
+}
+
+// The integrity catalogue hashes every file under the game folder except the
+// paths/extensions listed in net/eac/integrity.cfg. It is only valid while it
+// is newer than the newest of those files: replacing cefui.dll (or any game
+// file) after signing makes EAC treat the module as tampered, and the game then
+// cannot load it — the CEF HUD silently falls back to native and EOSSDK fails.
+// Windows paths and the integrity tool are case-insensitive; the game writes
+// e.g. userfiles/SCRDBG.LOG, which must match the "log" exclusion in
+// integrity.cfg or every launch would look stale and re-sign the catalogue.
+static std::string Lower(std::string s)
+{
+	for(char& c : s) c = (char)tolower((unsigned char)c);
+	return s;
+}
+
+static bool ExcludedDir(const std::string& name)
+{
+	std::string n = Lower(name);
+	return n == "logs" || n == "screenshots" || n == "eos-cache" ||
+	       n == "licenses" || n == "localization" || n == "certificates";
+}
+
+static bool ExcludedExt(const std::string& name)
+{
+	static const char* kExt[] = {
+		".bak", ".bat", ".bmp", ".cfg", ".db", ".eac", ".ico", ".inf", ".ini",
+		".jpg", ".last", ".log", ".manifest", ".mdb", ".pdb", ".png", ".pubkey",
+		".tmp", ".txt", ".vdf", ".xml", ".zip"
+	};
+	size_t dot = name.find_last_of('.');
+	if(dot == std::string::npos) return false;   // no extension: catalogued
+	std::string ext = Lower(name.substr(dot));
+	for(const char* e : kExt) if(ext == e) return true;
+	return false;
+}
+
+static bool NewestCataloguedFile(const std::string& dir, FILETIME& newest, int depth,
+                                 std::string* newestPath = nullptr, int* scanned = nullptr)
+{
+	if(depth > 8) return false;
+	bool any = false;
+	WIN32_FIND_DATAA fd;
+	std::string pattern = dir + "\\*";
+	HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+	if(h == INVALID_HANDLE_VALUE) return false;
+	do{
+		std::string name = fd.cFileName;
+		if(name == "." || name == "..") continue;
+		std::string full = dir + "\\" + name;
+		if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY){
+			if(ExcludedDir(name)) continue;
+			if(NewestCataloguedFile(full, newest, depth + 1, newestPath, scanned)) any = true;
+			continue;
+		}
+		if(ExcludedExt(name)) continue;
+		if(scanned) (*scanned)++;
+		// Compare against the running maximum, never against this directory's
+		// own "first file": recursion means newest is shared with the parent,
+		// and resetting it per directory let an old backup folder hide a file
+		// the launcher had just refreshed.
+		if(CompareFileTime(&fd.ftLastWriteTime, &newest) > 0){
+			newest = fd.ftLastWriteTime;
+			if(newestPath) *newestPath = full;
+		}
+		any = true;
+	}while(FindNextFileA(h, &fd));
+	FindClose(h);
+	return any;
 }
 
 bool CopyTree(const std::string& from, const std::string& to)
@@ -290,6 +370,28 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	out.configWritten = settingsOk && cfgOk;
 	out.integrityBuilt = FileExists(acDir + "\\Certificates\\base.bin");
 
+	// A catalogue signed before a game file changed is the most common
+	// protected-launch failure: EAC hashes the game files, the hash no longer
+	// matches what base.bin recorded, and it refuses the launch (210: Unrecognized
+	// game client) or silently refuses to load the changed module. Comparing only
+	// the executable missed exactly that case: the launcher refreshed cefui.dll
+	// after the last signing, so the protected game could not load its HUD.
+	// Compare against every file the catalogue covers, not just the exe.
+	if(out.integrityBuilt){
+		FILETIME binT{}, newest{};
+		std::string newestPath;
+		if(WriteTime(acDir + "\\Certificates\\base.bin", binT) &&
+		   NewestCataloguedFile(gameDir, newest, 0, &newestPath) &&
+		   CompareFileTime(&newest, &binT) > 0){
+			out.staleIntegrity = true;
+			out.lastError = "integrity catalogue is stale: " + newestPath +
+			                " is newer than EasyAntiCheat/Certificates/base.bin, so Easy "
+			                "Anti-Cheat refuses to load it (cefui.dll then falls back to the "
+			                "native HUD) — re-sign it with: reLCS-launcher.exe -game " +
+			                gameDir + "\\" + gameExeName + " -eacintegrity";
+		}
+	}
+
 	{
 		std::string ver = ReadFile(acDir + "\\EasyAntiCheat_EOS_Setup.exe");
 		(void)ver;
@@ -309,7 +411,7 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	         "runtime=%s config=%s integrity=%s eos-sdk=%s eos-ini=%s%s%s",
 	         out.runtimeInstalled ? "ok" : "missing",
 	         out.configWritten ? "ok" : "failed",
-	         out.integrityBuilt ? "signed" : "not-built",
+	         out.integrityBuilt ? (out.staleIntegrity ? "stale" : "signed") : "not-built",
 	         out.eosSdk ? "ok" : "missing",
 	         out.eosConfig ? "ok" : "missing",
 	         anyCopied ? " (files refreshed)" : "",
@@ -346,8 +448,18 @@ bool BuildIntegrity(const std::string& gameDir, const std::string& gameExeName, 
 	std::string cfg = payload + "\\integrity.cfg";
 	std::string key = payload + "\\keys\\base_private.key";
 	std::string cert = payload + "\\keys\\base_public.cer";
-	if(!FileExists(tool) || !FileExists(key) || !FileExists(cert) || !FileExists(cfg)){
-		out.lastError = "integrity tooling missing under " + payload;
+	if(!FileExists(tool) || !FileExists(cfg)){
+		out.lastError = "integrity tool missing under " + payload +
+		                " (the release package must ship eac/devtools)";
+		return false;
+	}
+	if(!FileExists(key) || !FileExists(cert)){
+		// By design: package-release.ps1 strips the private key so a shipped
+		// launcher can never re-sign. Say that, instead of reporting the whole
+		// toolchain as missing.
+		out.lastError = "signing key not shipped (eac/keys/base_private.key is build-machine "
+		                "only) — sign the catalogue on the build host with -eacintegrity, "
+		                "then ship EasyAntiCheat/Certificates";
 		return false;
 	}
 	if(!FileExists(gameDir + "\\" + gameExeName)){
@@ -374,15 +486,25 @@ bool BuildIntegrity(const std::string& gameDir, const std::string& gameExeName, 
 		out.lastError = "integrity catalogue was not signed (see integrity.log)";
 		return false;
 	}
+	// freshly signed: Prepare() may have flagged the previous catalogue as
+	// stale, and that warning no longer applies.
+	out.lastError.clear();
+	out.staleIntegrity = false;
 	return true;
 }
 
 bool Launch(const std::string& gameDir, const std::string& gameExeName,
-            const std::string& args, std::string& error, bool& protectedLaunch)
+            const std::string& args, std::string& error, bool& protectedLaunch,
+            bool allowProtected)
 {
 	std::string protectedExe = gameDir + "\\start_protected_game.exe";
 	std::string plainExe = gameDir + "\\" + gameExeName;
-	bool useProtected = FileExists(protectedExe);
+	// The protected bootstrapper starts the game in an anti-cheat sandbox that
+	// refuses the game's own runtime DLLs: cefui.dll then reports "not found"
+	// (native HUD instead of the Chromium overlay) and EOSSDK does not load, so
+	// the EOS session — the thing EAC is meant to protect — never comes up.
+	// Protection stays opt-in until the bootstrapper accepts those modules.
+	bool useProtected = allowProtected && FileExists(protectedExe);
 	std::string exe = useProtected ? protectedExe : plainExe;
 	if(!FileExists(exe)){
 		error = "game executable not found: " + exe;

@@ -64,10 +64,19 @@ static std::string g_nick = "Player";
 // fresh install can open the admin panel without editing launcher.ini
 static std::string g_rconPw = DEFAULT_RCON_PASSWORD;
 static std::string g_pass;   // profile password (claims/restores the name in-game)
-// public staging master (VPS) — the Internet tab lists its servers by default.
-// launcher.ini `master = host:port` overrides it; the LAN tab (broadcast) is
-// independent of this and keeps finding local servers.
-static std::string g_masterHost = "88.214.59.166";
+// EAC-protected launch is on by default. The bootstrapper only accepts game
+// files covered by a fresh integrity catalogue; `eac = off` in launcher.ini is
+// the escape hatch for an install whose catalogue cannot be refreshed.
+static bool g_eacProtected = true;
+// public master, reached through the relay edge (104.251.218.227:7800 DNATs to
+// the home master). launcher.ini `master = host:port` overrides it; the LAN tab
+// (broadcast) is independent of this and keeps finding local servers.
+static const char* MASTER_DEFAULT_HOST = "104.251.218.227";
+// v0.3.7 and earlier defaulted to the old VPS and saved it into launcher.ini on
+// first run. The package never overwrites that file, so a rebuilt exe alone would
+// leave every existing install pointed at a host that no longer exists.
+static const char* MASTER_RETIRED_HOST = "88.214.59.166";
+static std::string g_masterHost = MASTER_DEFAULT_HOST;
 static uint16_t g_masterPort = DEFAULT_MASTER_PORT;
 static std::vector<std::string> g_profiles;   // saved usernames (usernames.ini)
 
@@ -712,10 +721,12 @@ static bool RememberUser(const std::string& u)
 // ---------------------------------------------------------------------------
 // config
 // ---------------------------------------------------------------------------
+static void SaveConfig();
 static void LoadConfig()
 {
 	std::ifstream f("launcher.ini");
 	std::string line;
+	bool masterMigrated = false;
 	auto trim = [](std::string& s){
 		while(!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
 		size_t p = s.find_first_not_of(" \t");
@@ -739,12 +750,23 @@ static void LoadConfig()
 		else if(key == "nick") g_nick = val;
 		else if(key == "rcon") g_rconPw = val.empty() ? std::string(DEFAULT_RCON_PASSWORD) : val;
 		else if(key == "pass") g_pass = val;
+		else if(key == "eac") g_eacProtected = !(val == "off" || val == "0" || val == "false" || val == "no");
 		else if(key == "master"){
 			size_t c = val.find(':');
-			g_masterHost = val.substr(0, c);
+			std::string host = val.substr(0, c);
+			// Move only the retired default forward; any other value is a master
+			// the player chose and must survive the upgrade.
+			if(host == MASTER_RETIRED_HOST){
+				host = MASTER_DEFAULT_HOST;
+				masterMigrated = true;
+			}
+			g_masterHost = host;
 			if(c != std::string::npos) g_masterPort = (uint16_t)atoi(val.c_str() + c + 1);
 		}
 	}
+	f.close();
+	// rewrite the file so the corrected master sticks even if nothing else saves
+	if(masterMigrated) SaveConfig();
 }
 
 static void SaveConfig()
@@ -756,6 +778,8 @@ static void SaveConfig()
 	f << "rcon = " << g_rconPw << "\n";
 	// profile password, plaintext in the local config (same trust level as rcon)
 	f << "pass = " << g_pass << "\n";
+	// opt-in Easy Anti-Cheat bootstrapper; off keeps cefui.dll/EOSSDK loading
+	f << "eac = " << (g_eacProtected ? "protected" : "off") << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,15 +1304,37 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 	Log("[EAC] %s", ac.log.empty() ? "prepare skipped" : ac.log.c_str());
 	if(!ac.lastError.empty()) Log("[EAC] %s", ac.lastError.c_str());
 
+	// A catalogue signed before a game file changed makes the bootstrapper refuse
+	// to load that file: cefui.dll then silently falls back to the native HUD and
+	// EOSSDK never initialises. Re-sign it when this launcher carries the signing
+	// key; a shipped package intentionally does not, so there fall back to the
+	// bare executable — a working HUD and EOS session beat a broken "protected" one.
+	bool allowProtected = g_eacProtected;
+	if(allowProtected && ac.staleIntegrity){
+		Log("[EAC] integrity catalogue is stale — re-signing before the protected launch");
+		if(!eac::BuildIntegrity(exeDir, exeName, ac)){
+			Log("[EAC] cannot refresh the catalogue (%s)", ac.lastError.c_str());
+			Log("[EAC] launching unprotected so cefui.dll and EOSSDK load");
+			allowProtected = false;
+		}
+	}
+
 	std::string launchErr;
 	bool protectedLaunch = false;
 	Log("[JOIN] args %s  (cwd=%s)", gameArgs.c_str(), exeDir.c_str());
-	if(!eac::Launch(exeDir, exeName, gameArgs, launchErr, protectedLaunch)){
+	if(!eac::Launch(exeDir, exeName, gameArgs, launchErr, protectedLaunch, allowProtected)){
 		g_lastJoinError = launchErr;
 		Log("[JOIN] %s for %s", launchErr.c_str(), exe.c_str());
 		return false;
 	}
-	Log("[JOIN] started %s", protectedLaunch ? "EAC-protected build (start_protected_game.exe)" : "bare game (EAC bootstrapper missing)");
+	if(protectedLaunch)
+		Log("[JOIN] started EAC-protected build (start_protected_game.exe)");
+	else if(!g_eacProtected)
+		Log("[JOIN] started bare game (EAC protection off in launcher.ini)");
+	else if(!allowProtected)
+		Log("[JOIN] started bare game (integrity catalogue could not be refreshed)");
+	else
+		Log("[JOIN] started bare game (EAC bootstrapper missing)");
 	return true;
 }
 
@@ -1990,12 +2036,26 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 
 	// Epic Online Services bootstrap: start before any CLI path so -eostest can
 	// observe it; the UI polls eosboot::Json() for the step list.
+	//
+	// The EAC maintenance commands are the exception: they need no EOS session,
+	// and starting one only to return from main a few lines later races the
+	// detached EOS worker against CRT teardown — which showed up as the process
+	// dying with SIGSEGV instead of exiting 1 when signing failed.
+	bool headlessEac = false;
+	for(int i = 1; i < __argc; i++){
+		std::string a = __argv[i];
+		if(a == "-eacinstall" || a == "-eacintegrity") headlessEac = true;
+	}
 	std::string eosClientId, eosClientSecret;
-	ReadEosCredentials(eosClientId, eosClientSecret);
-	eosboot::Start(rnet::EOS_PRODUCT_ID, rnet::EOS_SANDBOX_ID, rnet::EOS_DEPLOYMENT_ID,
-	               eosClientId, eosClientSecret);
-	Log("[EOS] bootstrap started (product=%s, client credentials %s)", rnet::EOS_PRODUCT_ID,
-	    eosClientId.empty() ? "MISSING (see eos.ini.example)" : "loaded");
+	if(!headlessEac){
+		ReadEosCredentials(eosClientId, eosClientSecret);
+		eosboot::Start(rnet::EOS_PRODUCT_ID, rnet::EOS_SANDBOX_ID, rnet::EOS_DEPLOYMENT_ID,
+		               eosClientId, eosClientSecret);
+		Log("[EOS] bootstrap started (product=%s, client credentials %s)", rnet::EOS_PRODUCT_ID,
+		    eosClientId.empty() ? "MISSING (see eos.ini.example)" : "loaded");
+	}else{
+		Log("[EOS] bootstrap skipped for headless anti-cheat maintenance");
+	}
 
 	LoadConfig();
 	LoadProfiles();

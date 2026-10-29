@@ -161,7 +161,12 @@ $eacFiles = @(
   "runtime\start_protected_game.exe",
   "runtime\EasyAntiCheat\EasyAntiCheat_EOS_Setup.exe",
   "runtime\EasyAntiCheat\Settings.json",
-  "runtime\EasyAntiCheat\SplashScreen.png"
+  "runtime\EasyAntiCheat\SplashScreen.png",
+  # The signing *tool* is public; only base_private.key is build-machine only.
+  # Shipping the tool lets a package report "signing key not shipped" instead
+  # of claiming the whole toolchain is absent.
+  "devtools\anticheat_integritytool.exe",
+  "devtools\anticheat_integritytool.cfg"
 )
 foreach ($rel in $eacFiles) {
   $src = Join-Path $EacDir $rel
@@ -233,9 +238,16 @@ Still provided by the game install
   eos.ini (optional)           EOS product client id/secret for Connect login
 
 Easy Anti-Cheat
-  The signing key is never shipped. If you replace reLCS.exe or game data, re-sign the
-  integrity catalogue so the protected launch accepts the folder:
+  The signing key (eac\keys\base_private.key) is never shipped: signing happens on the
+  build machine. A launcher installed from this package can install the service and read
+  the status, but it cannot re-sign the catalogue:
     reLCS-launcher.exe -game "C:\path\reLCS\reLCS.exe" -eacintegrity
+  fails with "signing key not shipped" instead of silently producing a stale catalogue.
+
+  The catalogue records a hash of the game files, so it goes stale whenever reLCS.exe or
+  the game data changes. A stale catalogue makes start_protected_game.exe abort with
+  "210, Unrecognized game client": re-sign on the build machine and ship the resulting
+  EasyAntiCheat\Certificates folder with the build.
 
 Staging size: $totalMb MB in $($files.Count) files
 "@
