@@ -982,6 +982,15 @@ window.onCefReply = function (json) {
     case "join":
       setStatus(msg.ok ? "launched: " + msg.address : "join failed: " + (msg.error || ""),
                 msg.ok ? "ok" : "err");
+      if (msg.mode) {
+        const protectedLaunch = /^EAC protected/.test(msg.mode);
+        $("eacState").textContent = "Anti-cheat: " + msg.mode;
+        $("eacState").className = "notice " + (protectedLaunch ? "ok" : "warn");
+        $("eacHint").textContent = protectedLaunch
+          ? "The game is running under the Easy Anti-Cheat bootstrapper."
+          : "The game started without Easy Anti-Cheat: " + (msg.error || msg.mode) +
+            ". Re-sign the catalogue (Integrity) or install the service, then join again.";
+      }
       break;
     case "saveuser":
       renderProfiles(msg.profiles);

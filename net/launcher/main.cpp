@@ -786,6 +786,7 @@ static void SaveConfig()
 // join flow
 // ---------------------------------------------------------------------------
 static std::string g_lastJoinError;
+static std::string g_lastLaunchMode;   // how the last Join started the game
 
 // ---------------------------------------------------------------------------
 // game install auto-detection
@@ -1263,6 +1264,7 @@ static std::string ResolveGameExe()
 static bool JoinServer(const std::string& address, const std::string& nickIn)
 {
 	g_lastJoinError.clear();
+	g_lastLaunchMode.clear();
 	std::string nick = nickIn.empty() ? g_nick : nickIn;
 	if(!ValidUsername(nick)){
 		Log("[JOIN] rejected username \"%s\" (3-20 chars: letters, digits, _)", nick.c_str());
@@ -1313,9 +1315,11 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 	if(allowProtected && ac.staleIntegrity){
 		Log("[EAC] integrity catalogue is stale — re-signing before the protected launch");
 		if(!eac::BuildIntegrity(exeDir, exeName, ac)){
-			Log("[EAC] cannot refresh the catalogue (%s)", ac.lastError.c_str());
-			Log("[EAC] launching unprotected so cefui.dll and EOSSDK load");
-			allowProtected = false;
+			// A shipped package has no signing key. Do not disable protection
+			// here: try the bootstrapper anyway and only fall back to the bare
+			// executable if it really refuses to start the game.
+			Log("[EAC] cannot refresh the catalogue (%s) — trying the bootstrapper anyway",
+			    ac.lastError.c_str());
 		}
 	}
 
@@ -1327,14 +1331,17 @@ static bool JoinServer(const std::string& address, const std::string& nickIn)
 		Log("[JOIN] %s for %s", launchErr.c_str(), exe.c_str());
 		return false;
 	}
-	if(protectedLaunch)
+	if(protectedLaunch){
+		g_lastLaunchMode = "EAC protected (start_protected_game.exe)";
 		Log("[JOIN] started EAC-protected build (start_protected_game.exe)");
-	else if(!g_eacProtected)
+	}else if(!g_eacProtected){
+		g_lastLaunchMode = "unprotected (EAC protection off in launcher.ini)";
 		Log("[JOIN] started bare game (EAC protection off in launcher.ini)");
-	else if(!allowProtected)
-		Log("[JOIN] started bare game (integrity catalogue could not be refreshed)");
-	else
-		Log("[JOIN] started bare game (EAC bootstrapper missing)");
+	}else{
+		g_lastLaunchMode = "unprotected — EAC refused to start the game";
+		Log("[JOIN] started bare game (%s)",
+		    launchErr.empty() ? "EAC bootstrapper missing" : launchErr.c_str());
+	}
 	return true;
 }
 
@@ -1617,7 +1624,8 @@ static void HandleQuery(const char* request, void*)
 		bool ok = !address.empty() && JoinServer(address, nick);
 		if(address.empty()) g_lastJoinError = "no server address";
 		Reply(std::string("{\"reply\":\"join\",\"ok\":") + (ok ? "true" : "false") +
-		      ",\"address\":\"" + Jesc(address) + "\",\"error\":\"" + Jesc(g_lastJoinError) + "\"}");
+		      ",\"address\":\"" + Jesc(address) + "\",\"mode\":\"" + Jesc(g_lastLaunchMode) +
+		      "\",\"error\":\"" + Jesc(g_lastJoinError) + "\"}");
 	}else if(cmd == "addfav"){
 		// legacy local-only add (kept for older pages / offline use)
 		std::string address = arg("address"), name = arg("name");

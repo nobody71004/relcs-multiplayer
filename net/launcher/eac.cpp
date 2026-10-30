@@ -2,6 +2,7 @@
 #include "eac.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <cctype>
 #include <cstdio>
@@ -297,6 +298,18 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 		anyCopied = anyCopied || copied;
 	}
 
+	// A signed catalogue is what lets the bootstrapper start the game at all.
+	// The package carries one signed on the build host; install it into a game
+	// folder that has none, but never replace a catalogue signed locally for a
+	// different build.
+	std::string certSrc = runtimeSrc + "\\EasyAntiCheat\\Certificates";
+	std::string certDst = acDir + "\\Certificates";
+	if(DirExists(certSrc) && !FileExists(certDst + "\\base.bin")){
+		if(!DirExists(certDst)) CreateDirectoryA(certDst.c_str(), nullptr);
+		CopyTree(certSrc, certDst);
+		anyCopied = true;
+	}
+
 	out.runtimeInstalled = runtimeOk && protOk &&
 	                       FileExists(acDir + "\\EasyAntiCheat_EOS_Setup.exe") &&
 	                       FileExists(gameDir + "\\start_protected_game.exe");
@@ -493,44 +506,111 @@ bool BuildIntegrity(const std::string& gameDir, const std::string& gameExeName, 
 	return true;
 }
 
+// True when the bootstrapper has actually spawned the game. EAC keeps its
+// splash/error UI alive for a while after a refusal, so the bootstrapper's exit
+// code alone cannot be trusted: look for a game process created after the
+// launch. The parent check covers the normal case; the creation time covers
+// EAC starting the game through its service.
+static bool GameStarted(const std::string& exeName, DWORD parentPid, const FILETIME& launchedAt)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if(snap == INVALID_HANDLE_VALUE) return false;
+	// the current SDK only exposes the wide toolhelp API
+	wchar_t want[MAX_PATH] = {};
+	MultiByteToWideChar(CP_ACP, 0, exeName.c_str(), -1, want, MAX_PATH);
+	PROCESSENTRY32W pe;
+	pe.dwSize = sizeof pe;
+	bool found = false;
+	if(Process32FirstW(snap, &pe)){
+		do{
+			if(_wcsicmp(pe.szExeFile, want) != 0) continue;
+			if(pe.th32ParentProcessID == parentPid){ found = true; break; }
+			HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+			if(h){
+				FILETIME created{}, exited{}, kernel{}, user{};
+				if(GetProcessTimes(h, &created, &exited, &kernel, &user) &&
+				   CompareFileTime(&created, &launchedAt) >= 0)
+					found = true;
+				CloseHandle(h);
+			}
+			if(found) break;
+		}while(Process32NextW(snap, &pe));
+	}
+	CloseHandle(snap);
+	return found;
+}
+
 bool Launch(const std::string& gameDir, const std::string& gameExeName,
             const std::string& args, std::string& error, bool& protectedLaunch,
             bool allowProtected)
 {
 	std::string protectedExe = gameDir + "\\start_protected_game.exe";
 	std::string plainExe = gameDir + "\\" + gameExeName;
-	// The protected bootstrapper starts the game in an anti-cheat sandbox that
-	// refuses the game's own runtime DLLs: cefui.dll then reports "not found"
-	// (native HUD instead of the Chromium overlay) and EOSSDK does not load, so
-	// the EOS session — the thing EAC is meant to protect — never comes up.
-	// Protection stays opt-in until the bootstrapper accepts those modules.
 	bool useProtected = allowProtected && FileExists(protectedExe);
-	std::string exe = useProtected ? protectedExe : plainExe;
-	if(!FileExists(exe)){
-		error = "game executable not found: " + exe;
+	if(!FileExists(useProtected ? protectedExe : plainExe)){
+		error = "game executable not found: " + (useProtected ? protectedExe : plainExe);
 		return false;
 	}
 
-	std::string cmd = Quote(exe);
-	if(!args.empty()) cmd += " " + args;
+	// Always try the protected bootstrapper first. A stale catalogue or a
+	// missing EasyAntiCheat service makes it refuse (and show its own error
+	// dialog) instead of starting the game; only then start the game directly so
+	// the player still gets in — with the EAC state reported by the caller.
+	for(int attempt = 0; attempt < 2; attempt++){
+		bool asProtected = useProtected && attempt == 0;
+		std::string exe = asProtected ? protectedExe : plainExe;
+		std::string cmd = Quote(exe);
+		if(!args.empty()) cmd += " " + args;
 
-	STARTUPINFOA si;
-	PROCESS_INFORMATION pi;
-	memset(&si, 0, sizeof si);
-	memset(&pi, 0, sizeof pi);
-	si.cb = sizeof si;
-	BOOL ok = CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE, 0,
-	                         nullptr, gameDir.c_str(), &si, &pi);
-	if(!ok){
-		char buf[128];
-		snprintf(buf, sizeof buf, "CreateProcess failed (error %lu)", GetLastError());
-		error = buf;
-		return false;
+		STARTUPINFOA si;
+		PROCESS_INFORMATION pi;
+		memset(&si, 0, sizeof si);
+		memset(&pi, 0, sizeof pi);
+		si.cb = sizeof si;
+		FILETIME launchedAt;
+		GetSystemTimeAsFileTime(&launchedAt);
+		BOOL ok = CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE, 0,
+		                         nullptr, gameDir.c_str(), &si, &pi);
+		if(!ok){
+			char buf[128];
+			snprintf(buf, sizeof buf, "CreateProcess failed (error %lu)", GetLastError());
+			error = buf;
+			return false;
+		}
+
+		if(!asProtected){
+			CloseHandle(pi.hProcess);
+			CloseHandle(pi.hThread);
+			protectedLaunch = false;
+			return true;
+		}
+
+		// EAC's splash + service start can take a few seconds
+		bool started = false;
+		DWORD exitCode = STILL_ACTIVE;
+		ULONGLONG t0 = GetTickCount64();
+		while(GetTickCount64() - t0 < 20000){
+			if(GameStarted(gameExeName, pi.dwProcessId, launchedAt)){ started = true; break; }
+			if(GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) break;
+			Sleep(150);
+		}
+
+		if(started){
+			CloseHandle(pi.hProcess);
+			CloseHandle(pi.hThread);
+			protectedLaunch = true;
+			return true;
+		}
+
+		// refused: stop the bootstrapper so its error dialog does not linger
+		TerminateProcess(pi.hProcess, 1);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+		error = "the Easy Anti-Cheat bootstrapper did not start the game";
+		protectedLaunch = false;
 	}
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
-	protectedLaunch = useProtected;
-	return true;
+
+	return false;
 }
 
 } // namespace eac
