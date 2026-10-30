@@ -5371,6 +5371,15 @@ CPed::SetLanding(void)
 		DMAudio.PlayOneShot(m_audioEntityId, SOUND_FALL_LAND, 1.0f);
 	}
 
+	// A landing is a one-shot. ANIM_STD_FALL_COLLAPSE is flagged
+	// ASSOC_REPEAT in the animation table, and a repeating association never
+	// reaches its end, so PedLandCB never fired: bIsLanding stayed set and a
+	// ped that landed from a long fall (by then ANIM_STD_FALL exists, which
+	// selects the collapse) never left PED_JUMP — frozen in the landing pose
+	// with its move speed zeroed, i.e. stuck falling in place.  Clear the
+	// repeat flag for this association so the collapse ends and the callback
+	// restores the previous state.
+	landAssoc->flags &= ~ASSOC_REPEAT;
 	landAssoc->SetFinishCallback(PedLandCB, this);
 	bIsInTheAir = false;
 	bIsLanding = true;
