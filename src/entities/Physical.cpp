@@ -2298,6 +2298,52 @@ CPhysical::ProcessShift(void)
 float HIGHSPEED_ELASTICITY_MULT_PED = 2.0f;
 float HIGHSPEED_ELASTICITY_MULT_COPCAR = 2.0f;
 
+// A driven car must never end a frame on the far side of a building wall.
+// Volume collision normally separates it, but an awkward col model (a thin
+// shell, or a deep push after a long fall) can let the position creep through
+// while the impulses are cancelled. Sweeping the four corners of the body over
+// exactly the distance the car is about to move stops it at any wall it would
+// cross, whatever the col shape is.
+static bool
+VehicleCrossedBuildingWall(const CMatrix &from, const CMatrix &to, CPhysical *veh, CVector &wallNormal)
+{
+	CColModel *cm = veh->GetColModel();
+	if(cm == nil)
+		return false;
+
+	CVector size = cm->boundingBox.GetSize();
+	float midZ = (cm->boundingBox.min.z + cm->boundingBox.max.z) * 0.5f;
+	CVector corners[4] = {
+		CVector(-size.x*0.5f, -size.y*0.5f, midZ),
+		CVector( size.x*0.5f, -size.y*0.5f, midZ),
+		CVector(-size.x*0.5f,  size.y*0.5f, midZ),
+		CVector( size.x*0.5f,  size.y*0.5f, midZ),
+	};
+
+	for(int i = 0; i < 4; i++){
+		CVector a = from * corners[i];
+		CVector b = to * corners[i];
+		CVector move = b - a;
+		if(move.MagnitudeSqr() < 0.0001f)
+			continue;
+		CColPoint cp;
+		CEntity *ent = nil;
+		if(!CWorld::ProcessLineOfSight(a, b, cp, ent, true, false, false, false, false, false, false, false))
+			continue;
+		if(ent == nil || !ent->IsBuilding())
+			continue;
+		if(Abs(cp.normal.z) > 0.6f)
+			continue;	// road, ramp or roof, not a wall
+		if(DotProduct(move, cp.normal) >= -0.001f)
+			continue;	// already moving away from the surface
+		if((cp.point - a).MagnitudeSqr() < 0.0001f)
+			continue;	// resting against it, not crossing it
+		wallNormal = cp.normal;
+		return true;
+	}
+	return false;
+}
+
 void
 CPhysical::ProcessCollision(void)
 {
@@ -2486,6 +2532,18 @@ CPhysical::ProcessCollision(void)
 	   IsPed() && ped->IsPlayer()){
 		if(IsVehicle())
 			((CVehicle*)this)->bVehicleColProcessed = true;
+		// a solid wall must win over the collision response, even when the
+		// volume test cannot separate the car from an awkward col model
+		CVector buildingNormal;
+		if(IsVehicle() && GetStatus() == STATUS_PLAYER && !bIsFrozen &&
+		   VehicleCrossedBuildingWall(savedMatrix, GetMatrix(), this, buildingNormal)){
+			GetMatrix().GetPosition() = savedMatrix.GetPosition();
+			float normalSpeed = DotProduct(m_vecMoveSpeed, buildingNormal);
+			if(normalSpeed < 0.0f)
+				m_vecMoveSpeed -= buildingNormal * normalSpeed;
+			m_fElasticity = savedElasticity;
+			return;
+		}
 		if(CheckCollision()){
 			GetMatrix() = savedMatrix;
 			m_fElasticity = savedElasticity;
