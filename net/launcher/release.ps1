@@ -13,6 +13,8 @@
 #   6. run the packaged launcher's -selftest (CEF, LAN, master, favorites,
 #      game detection) and refuse to report success unless it says PASS
 #   7. copy out/reLCS-client-v<Version>-win64.exe
+#   8. with -Publish, create the GitHub release for the tag, once 5-7 passed
+#      and HEAD is pushed (a notes file is required)
 #
 # The selftest needs the master and a LAN server to answer, so -SkipSelftest
 # exists for an offline build host; a release cut with it has not been smoke
@@ -36,7 +38,14 @@ param(
 
   [switch]$SkipClientBuild,
   [switch]$SkipLauncherBuild,
-  [switch]$SkipSelftest
+  [switch]$SkipSelftest,
+
+  # Publish is opt-in: it creates a public GitHub release. Never implied by the
+  # build. It is refused with -SkipSelftest, because publishing a package that
+  # has not been smoke tested defeats the point of the gate.
+  [switch]$Publish,
+  [string]$NotesFile = "",
+  [string]$Title = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +59,19 @@ function Fail([string]$message) {
 
 Write-Host "== reLCS release v$Version"
 Write-Host "   repo : $repo"
+
+$repoSlug = "nobody71004/relcs-multiplayer"
+if ($Publish) {
+  if ($SkipSelftest) {
+    Fail "-Publish cannot be combined with -SkipSelftest: refusing to publish a package that was not smoke tested"
+  }
+  if (-not $NotesFile) { $NotesFile = Join-Path $repo "_scratch\release-notes-$Version.md" }
+  if (-not (Test-Path -LiteralPath $NotesFile)) {
+    Fail "release notes not found: $NotesFile (write them, or pass -NotesFile)"
+  }
+  $NotesFile = (Resolve-Path -LiteralPath $NotesFile).Path
+}
+if (-not $Title) { $Title = "reLCS launcher v$Version" }
 
 # --- 1. toolchain ---------------------------------------------------------------
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
@@ -202,8 +224,30 @@ Write-Host "== release artifacts"
 Get-FileHash -LiteralPath $zip, $clientAsset -Algorithm SHA256 |
   ForEach-Object { Write-Host ("   {0}  {1}" -f $_.Hash, $_.Path) }
 
-Write-Host ""
-Write-Host "Publish with:"
-Write-Host "   gh release create v$Version --repo nobody71004/relcs-multiplayer --target port/multiplayer \"
-Write-Host "     --notes-file _scratch/release-notes-$Version.md \"
-Write-Host "     `"$zip`" `"$clientAsset`""
+if ($Publish) {
+  # Publishing targets the pushed branch tip, so the tag and the package agree.
+  # A local build from unpushed commits would otherwise tag the old remote tip.
+  Write-Host ""
+  Write-Host "== publish v$Version"
+  $branch = (& git -C $repo rev-parse --abbrev-ref HEAD).Trim()
+  if ($branch -eq "HEAD") { Fail "detached HEAD: check out the release branch before -Publish" }
+
+  $head = (& git -C $repo rev-parse HEAD).Trim()
+  $remote = (& git -C $repo ls-remote "https://github.com/$repoSlug.git" "refs/heads/$branch") -split "\s+" | Select-Object -First 1
+  if (-not $remote) { Fail "branch $branch does not exist on $repoSlug; push it before -Publish" }
+  if ($remote -ne $head) {
+    Fail "HEAD $head is not pushed to $branch ($remote on GitHub); push before -Publish"
+  }
+
+  & gh release create "v$Version" --repo $repoSlug --target $branch `
+       --title $Title --notes-file $NotesFile $zip $clientAsset
+  if ($LASTEXITCODE -ne 0) { Fail "gh release create failed (exit $LASTEXITCODE)" }
+  Write-Host "   https://github.com/$repoSlug/releases/tag/v$Version"
+} else {
+  Write-Host ""
+  Write-Host "Publish with:"
+  Write-Host "   gh release create v$Version --repo $repoSlug --target port/multiplayer \"
+  Write-Host "     --notes-file _scratch/release-notes-$Version.md \"
+  Write-Host "     `"$zip`" `"$clientAsset`""
+  Write-Host "   (or rerun this script with -Publish to do the same after the checks)"
+}
