@@ -372,7 +372,8 @@ void EOS_CALL OnClientActionRequired(const EOS_AntiCheatCommon_OnClientActionReq
 	g_impl->Log("[EAC] action required: action=%d reason=%d (%s)",
 	            (int)info->ClientAction, (int)info->ActionReasonCode, reason);
 	if(g_impl->actionRequiredFn)
-		g_impl->actionRequiredFn(info->ClientHandle, (int)info->ClientAction, reason);
+		g_impl->actionRequiredFn(info->ClientHandle, (int)info->ClientAction,
+		                         (int)info->ActionReasonCode, reason);
 }
 
 void EOS_CALL OnClientAuthStatusChanged(const EOS_AntiCheatCommon_OnClientAuthStatusChangedCallbackInfo* info)
@@ -417,8 +418,11 @@ void EOS_CALL OnVerifyIdToken(const EOS_Connect_VerifyIdTokenCallbackInfo* info)
 	if(info->ProductUserId && impl->ProductUserId_ToString){
 		char buf[64] = {};
 		int32_t len = (int32_t)sizeof buf;
-		impl->ProductUserId_ToString(info->ProductUserId, buf, &len);
-		if(len > 0) verified.assign(buf, (size_t)len);
+		EOS_EResult rc = impl->ProductUserId_ToString(info->ProductUserId, buf, &len);
+		// EOS reports the buffer length *including* the terminating NUL (33 for a
+		// 32-char PUID). Slicing by that length kept the NUL in the string, so the
+		// hex check below rejected every valid token with "carried no ProductUserId".
+		if(rc == EOS_EResult::EOS_Success && buf[0]) verified.assign(buf);
 	}
 	if(!IsProductUserId(verified)){
 		impl->RegistrationDone(handle, 3 /* AC_REG_BAD_PUID */, "token verified but carried no ProductUserId");

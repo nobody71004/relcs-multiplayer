@@ -38,7 +38,13 @@ struct Config {
 	// playable when the session cannot start at all (no SDK / no credentials /
 	// EOS refusing every registration because the product is misconfigured)
 	// instead of locking every player out of it.
-	bool requireProtected = true;
+	//
+	// Off by default: Epic refuses device-ID identities for anti-cheat
+	// ("DeviceID is not supported for anti-cheat since it requires a stable
+	// account identity"), and the shipped client logs in with a device ID. A
+	// server that enforced registration would therefore remove every player.
+	// Turn it on once clients authenticate with a real Epic/Steam account.
+	bool requireProtected = false;
 	bool failOpen = true;
 	uint32_t graceSeconds = 30;
 };
