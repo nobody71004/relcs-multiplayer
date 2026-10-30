@@ -246,10 +246,14 @@ if ($Publish) {
               "--title", $Title, "--notes-file", $NotesFile)
   if ($Draft) { $ghArgs += "--draft" }
   $ghArgs += @($zip, $clientAsset)
-  & gh @ghArgs
+  $ghOut = & gh @ghArgs
   if ($LASTEXITCODE -ne 0) { Fail "gh release create failed (exit $LASTEXITCODE)" }
+  # gh prints the real URL. A draft has no tag yet, so its URL is
+  # /releases/tag/untagged-... and cannot be constructed from the version.
+  $url = @($ghOut) | Where-Object { $_ -match '^https?://' } | Select-Object -Last 1
+  if (-not $url) { $url = "https://github.com/$repoSlug/releases/tag/v$Version" }
   $kind = if ($Draft) { "draft release (not public)" } else { "release" }
-  Write-Host "   ${kind}: https://github.com/$repoSlug/releases/tag/v$Version"
+  Write-Host "   ${kind}: $url"
   if ($Draft) { Write-Host "   publish it with: gh release edit v$Version --repo $repoSlug --draft=false" }
 } else {
   Write-Host ""
