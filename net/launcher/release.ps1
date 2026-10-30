@@ -14,7 +14,8 @@
 #      game detection) and refuse to report success unless it says PASS
 #   7. copy out/reLCS-client-v<Version>-win64.exe
 #   8. with -Publish, create the GitHub release for the tag, once 5-7 passed
-#      and HEAD is pushed (a notes file is required)
+#      and HEAD is pushed (a notes file is required); -Draft keeps it
+#      unpublished, so the publish path can be rehearsed without going live
 #
 # The selftest needs the master and a LAN server to answer, so -SkipSelftest
 # exists for an offline build host; a release cut with it has not been smoke
@@ -44,6 +45,7 @@ param(
   # build. It is refused with -SkipSelftest, because publishing a package that
   # has not been smoke tested defeats the point of the gate.
   [switch]$Publish,
+  [switch]$Draft,
   [string]$NotesFile = "",
   [string]$Title = ""
 )
@@ -61,6 +63,7 @@ Write-Host "== reLCS release v$Version"
 Write-Host "   repo : $repo"
 
 $repoSlug = "nobody71004/relcs-multiplayer"
+if ($Draft -and -not $Publish) { Fail "-Draft only applies to -Publish" }
 if ($Publish) {
   if ($SkipSelftest) {
     Fail "-Publish cannot be combined with -SkipSelftest: refusing to publish a package that was not smoke tested"
@@ -239,10 +242,19 @@ if ($Publish) {
     Fail "HEAD $head is not pushed to $branch ($remote on GitHub); push before -Publish"
   }
 
-  & gh release create "v$Version" --repo $repoSlug --target $branch `
-       --title $Title --notes-file $NotesFile $zip $clientAsset
+  $ghArgs = @("release", "create", "v$Version", "--repo", $repoSlug, "--target", $branch,
+              "--title", $Title, "--notes-file", $NotesFile)
+  if ($Draft) { $ghArgs += "--draft" }
+  $ghArgs += @($zip, $clientAsset)
+  $ghOut = & gh @ghArgs
   if ($LASTEXITCODE -ne 0) { Fail "gh release create failed (exit $LASTEXITCODE)" }
-  Write-Host "   https://github.com/$repoSlug/releases/tag/v$Version"
+  # gh prints the real URL. A draft has no tag yet, so its URL is
+  # /releases/tag/untagged-... and cannot be constructed from the version.
+  $url = @($ghOut) | Where-Object { $_ -match '^https?://' } | Select-Object -Last 1
+  if (-not $url) { $url = "https://github.com/$repoSlug/releases/tag/v$Version" }
+  $kind = if ($Draft) { "draft release (not public)" } else { "release" }
+  Write-Host "   ${kind}: $url"
+  if ($Draft) { Write-Host "   publish it with: gh release edit v$Version --repo $repoSlug --draft=false" }
 } else {
   Write-Host ""
   Write-Host "Publish with:"
