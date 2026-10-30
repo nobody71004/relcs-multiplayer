@@ -918,6 +918,7 @@ static double s_bannerUntil = 0.0;
 static int s_worldHour = 12, s_worldMinute = 0;   // server-synced world clock
 static int s_worldWeather = -1;
 static int s_fpsCap = 30;
+static float s_hudFps = 0.0f;
 static bool s_panelOpen = false;
 static int s_panelRow = 0;
 static int s_panelWeapon = 0;
@@ -932,6 +933,45 @@ static char s_lastRcon[96] = {};
 static const int kFpsPresets[] = { 30, 60, 120, 240, 360, 0 }; // 0 = unlimited
 static const char* kFpsNames[] = { "30", "60", "120", "240", "360", "UNLIMITED" };
 static const int kNumFps = 6;
+
+// Real rendered frames per second, smoothed over half a second. The HUD used
+// to print s_fpsCap (and that stayed at its 30 default when the cap was changed
+// from the graphics menu), so the readout was the limit, not the frame rate.
+static void MeasureHudFps(void)
+{
+	static LARGE_INTEGER freq;
+	static LARGE_INTEGER last;
+	static bool init = false;
+	static double accum = 0.0;
+	static int frames = 0;
+
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	if (!init) {
+		QueryPerformanceFrequency(&freq);
+		last = now;
+		init = true;
+		return;
+	}
+	double dt = (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)freq.QuadPart;
+	last = now;
+	if (dt <= 0.0 || dt > 1000.0)
+		return;
+	accum += dt;
+	frames++;
+	if (accum >= 500.0) {
+		float inst = (float)(frames * 1000.0 / accum);
+		s_hudFps = s_hudFps > 0.0f ? s_hudFps * 0.6f + inst * 0.4f : inst;
+		accum = 0.0;
+		frames = 0;
+	}
+
+	// keep the HUD's cap in sync when the cap is changed from the graphics
+	// menu (ApplyFpsCap only writes RsGlobal.maxFPS, not our copy)
+	int engineCap = (int)RsGlobal.maxFPS;
+	if (engineCap >= 1000000) engineCap = 0;
+	s_fpsCap = engineCap;
+}
 
 static const eWeaponType kGiveWeapons[] = {
 	WEAPONTYPE_COLT45, WEAPONTYPE_SHOTGUN, WEAPONTYPE_TEC9, WEAPONTYPE_RUGER,
@@ -1737,7 +1777,7 @@ static void CefPushState(void)
 	}
 	compsJson += "]";
 	snprintf(buf, sizeof buf,
-	         "{\"server\":\"%s\",\"players\":%zu,\"fps\":\"%s\",\"mode\":\"%s\","
+	         "{\"server\":\"%s\",\"players\":%zu,\"fps\":%.0f,\"fpsCap\":%d,\"mode\":\"%s\","
 	         "\"money\":%d,\"hp\":%d,\"armour\":%d,\"welcome\":%d,\"banner\":%s,"
 	         "\"wtime\":\"%s\",\"wweather\":%d,"
 	         "\"weapons\":%s,\"chat\":%s,\"console\":%s,\"resources\":%s,"
@@ -1746,7 +1786,7 @@ static void CefPushState(void)
 	         "\"creator\":{\"model\":%d,\"comps\":%s,\"first\":%s},\"peds\":%s}",
 	         jesc(s_net.Hostname()).c_str(),
 	         s_net.remotes.size() + (s_net.Spawned() ? 1 : 0),
-	         fpsName, modeBuf,
+	         s_hudFps > 0.0f ? s_hudFps : (float)s_fpsCap, s_fpsCap, modeBuf,
 	         CWorld::Players[CWorld::PlayerInFocus].m_nMoney,
 	         me ? (int)me->m_fHealth : 0, me ? (int)me->m_fArmour : 0,
 	         (int)(NowSec() < s_welcomeUntil), banner.c_str(),
@@ -2778,6 +2818,7 @@ static void VoiceTick(void)
 
 void NetGame_Frame(void)
 {
+	MeasureHudFps();
 	NetGame_DoorChimeTick();
 
 	// chromium overlay: init on first frame, pump + push state every frame

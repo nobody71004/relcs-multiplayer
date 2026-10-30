@@ -146,7 +146,7 @@
   <div id="topbar">
     <span class="name" id="serverName">LIBERTY CITY STORIES ONLINE</span>
     <span class="stat">players online: <b id="playerCount">0</b></span>
-    <span class="stat">fps: <b id="fps">30</b></span>
+    <span class="stat">fps: <b id="fps">--</b></span>
     <span class="badge" id="mode"></span>
   </div>
 
@@ -487,7 +487,7 @@ function renderCreator() {
 
 // ---- state -------------------------------------------------------------
 let state = {
-  server: "", players: 0, fps: 30, mode: "",
+  server: "", players: 0, fps: 0, fpsCap: 30, mode: "",
   money: 0, hp: 100, armour: 0,
   weapons: [], chat: [], console: [],
   board: [], showBoard: false
@@ -496,7 +496,7 @@ let state = {
 function renderTop() {
   $("serverName").textContent = (state.server || "LCS ONLINE").toUpperCase();
   $("playerCount").textContent = state.players;
-  $("fps").textContent = state.fps;
+  $("fps").textContent = Math.round(state.fps) || 0;
   $("mode").textContent = state.mode || "";
 }
 
@@ -551,6 +551,12 @@ function renderAdmin() {
   $("admGod").classList.toggle("on", god);
   $("admNoclip").textContent = "NoClip: " + (nc ? "ON" : "OFF");
   $("admNoclip").classList.toggle("on", nc);
+
+  // reflect the cap the engine is really running (menu changes included),
+  // without fighting the user while the select is being changed
+  const fpsSel = $("admFps");
+  if (fpsSel && document.activeElement !== fpsSel)
+    fpsSel.value = String(state.fpsCap | 0);
 
   // rcon state: 0 = no password, 1 = password set but not accepted, 2 = authed.
   // The server-only buttons (broadcast/give/bot/prop/time/weather) are refused
