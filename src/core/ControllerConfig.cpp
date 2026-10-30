@@ -24,6 +24,9 @@ CControllerConfigManager::CControllerConfigManager()
 	m_bFirstCapture    = false;
 	m_bMouseAssociated = false;
 
+	for (int32 i = 0; i < ARRAY_SIZE(m_aButtonStates); i++)
+		m_aButtonStates[i] = false;
+
 	MakeControllerActionsBlank();
 	InitDefaultControlConfiguration();
 	InitialiseControllerActionNameArray();
@@ -137,7 +140,8 @@ void CControllerConfigManager::LoadSettings(int32 file)
 
 	if (file)
 	{
-		char buff[29];
+		// a short read would otherwise leave this partially uninitialised for strncmp
+		char buff[29] = { 0 };
 		CFileMgr::Read(file, buff, sizeof(buff));
 
 		if (!strncmp(buff, TopLineEmptyFile, sizeof(TopLineEmptyFile)-1))

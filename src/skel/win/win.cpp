@@ -2036,6 +2036,7 @@ void HandleExit()
 /*
  *****************************************************************************
  */
+
 int PASCAL
 WinMain(HINSTANCE instance, 
 		HINSTANCE prevInstance	__RWUNUSED__, 

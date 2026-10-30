@@ -127,7 +127,8 @@ enum
 #define MAX2DCHANNELS              NUM_CHANNELS
 #endif
 
-#define MAX_STREAMS                1
+// 0 = user MP3 track, 1 = police radio / mission audio, 2 = reserved by SetStreamedVolumeAndPan
+#define MAX_STREAMS                3
 
 #define DIGITALRATE                32000
 #define DIGITALBITS                16

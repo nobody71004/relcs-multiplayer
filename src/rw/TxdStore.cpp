@@ -52,7 +52,10 @@ CTxdStore::AddTxdSlot(const char *name)
 	def->texDict = nil;
 	def->refCount = 0;
 	def->refCountGu = 0;
-	strcpy(def->name, name);
+	strncpy(def->name, name, sizeof(def->name) - 1);
+	def->name[sizeof(def->name) - 1] = '\0';
+	if (strlen(name) >= sizeof(def->name))
+		debug("CTxdStore::AddTxdSlot: name '%s' truncated to %u chars\n", name, (uint32)sizeof(def->name) - 1);
 	return ms_pTxdPool->GetJustIndex(def);
 }
 
@@ -80,7 +83,8 @@ CTxdStore::FindTxdSlot(const char *name)
 char*
 CTxdStore::GetTxdName(int slot)
 {
-	return GetSlot(slot)->name;
+	TxdDef *def = GetSlot(slot);
+	return def ? def->name : "";
 }
 
 void

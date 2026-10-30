@@ -1565,7 +1565,8 @@ CRadar::ToggleTargetMarker(float x, float y)
 				break;
 		}
 		
-		if (nextBlip == 0)
+		// nextBlip is -1 when the blip pool is full, so this has to catch 0 *and* -1
+		if (nextBlip <= 0)
 			return;
 			
 		ms_RadarTrace[nextBlip].m_eBlipType = BLIP_COORD;

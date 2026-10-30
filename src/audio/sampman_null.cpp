@@ -12,6 +12,15 @@ uint32     nNumMP3s;
 cSampleManager::cSampleManager(void)
 {
 	;
+
+	memset(m_szCDRomRootPath, 0, sizeof(m_szCDRomRootPath));
+	memset(m_MiscomPath, 0, sizeof(m_MiscomPath));
+	memset(m_WavFilesPath, 0, sizeof(m_WavFilesPath));
+	memset(m_MP3FilesPath, 0, sizeof(m_MP3FilesPath));
+	for (int i = 0; i < MAXPROVIDERS; i++)
+		m_aAudioProviders[i] = nil;
+	for (int i = 0; i < (int)(sizeof(m_aChannels) / sizeof(m_aChannels[0])); i++)
+		m_aChannels[i] = nil;
 }
 
 cSampleManager::~cSampleManager(void)

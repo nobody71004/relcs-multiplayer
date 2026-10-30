@@ -34,7 +34,8 @@ uint32 RadioStaticTimer;
 
 CVector vecRiotPosition(300.7f, -322.0f, 12.0f);
 
-uint32 NewGameRadioTimers[10] =
+// one entry per streamed station before the city-ambient tracks; MP3 player starts at 0
+uint32 NewGameRadioTimers[STREAMED_SOUND_CITY_AMBIENT] =
 {
 	948160,
 	452150,
@@ -45,6 +46,7 @@ uint32 NewGameRadioTimers[10] =
 	1418050,
 	3178240,
 	471210,
+	0,
 	0
 };
 
@@ -1197,6 +1199,8 @@ uint32
 cMusicManager::GetTrackStartPos(uint32 track)
 {
 	if (!IsInitialised()) return 0;
+	// tracks that failed to open have no length; wrapping against 0 is undefined
+	if (m_aTracks[track].m_nLength == 0) return 0;
 
 	uint32 pos = m_aTracks[track].m_nPosition;
 	if (CTimer::GetTimeInMillisecondsPauseMode() > m_aTracks[track].m_nLastPosCheckTimer)

@@ -28,7 +28,11 @@ public:
 	PhoneState m_nState;
 	bool m_visibleToCam;
 
-	CPhone() { }
+	CPhone() : m_repeatedMessagePickupStart(0), m_pEntity(nil), m_nState(PHONE_STATE_FREE), m_visibleToCam(false)
+	{
+		for (int i = 0; i < 6; i++)
+			m_apMessages[i] = nil;
+	}
 	~CPhone() { }
 };
 

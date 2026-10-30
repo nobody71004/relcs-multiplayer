@@ -814,6 +814,7 @@ CMouseControllerState::CMouseControllerState()
 	WHEELDN = 0;
 	MXB1 = 0;
 	MXB2 = 0;
+	_pad0 = 0;
 
 	x = 0.0f;
 	y = 0.0f;

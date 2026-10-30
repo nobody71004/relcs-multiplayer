@@ -916,6 +916,10 @@ int32 CEscalators::NumEscalators;
 
 CEscalator::CEscalator() {
 	m_bIsActive = false;
+	m_bIsMovingDown = false;
+	m_lowerEnd = 0.0f;
+	m_upperEnd = 0.0f;
+	m_radius = 0.0f;
 
 	for (int i = 0; i < 24; i++) {
 		m_pSteps[i] = nil;

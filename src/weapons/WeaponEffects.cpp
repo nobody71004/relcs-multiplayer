@@ -14,7 +14,9 @@ CWeaponEffects gCrossHair;
 
 CWeaponEffects::CWeaponEffects()
 {
-	
+	m_bActive = false;
+	m_fSize = 0.0f;
+	m_fRotation = 0.0f;
 }
 
 CWeaponEffects::~CWeaponEffects()

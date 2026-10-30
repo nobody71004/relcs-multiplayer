@@ -477,7 +477,7 @@ CCarCtrl::GenerateOneRandomCar()
 		pVehicle->AutoPilot.m_nDrivingStyle = DRIVINGSTYLE_STOP_FOR_CARS;
 		break;
 	}
-	if (pVehicle && pVehicle->GetModelIndex() == MI_MRWHOOP)
+	if (pVehicle->GetModelIndex() == MI_MRWHOOP)
 		pVehicle->m_bSirenOrAlarm = true;
 	pVehicle->AutoPilot.m_nNextPathNodeInfo = connectionId;
 	pVehicle->AutoPilot.m_nNextLane = pVehicle->AutoPilot.m_nCurrentLane = CGeneral::GetRandomNumber() % lanesOnCurrentRoad;

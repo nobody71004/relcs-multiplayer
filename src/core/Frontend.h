@@ -438,11 +438,24 @@ struct CCFOSelect : CCFO
 	ChangeFunc changeFunc;
 	bool disableIfGameLoaded;
 
-	CCFOSelect() {};
+	CCFOSelect() {
+		this->value = nil;
+		this->saveCat = nil;
+		this->save = nil;
+		this->rightTexts = nil;
+		this->numRightTexts = 0;
+		this->onlyApplyOnEnter = false;
+		this->displayedValue = 0;
+		this->lastSavedValue = 0;
+		this->changeFunc = nil;
+		this->disableIfGameLoaded = false;
+	};
 	CCFOSelect(int8* value, const char* saveCat, const char* save, const char** rightTexts, int8 numRightTexts, bool onlyApplyOnEnter, ChangeFunc changeFunc = nil, bool disableIfGameLoaded = false){
 		this->value = value;
 		if (value)
 			this->lastSavedValue = this->displayedValue = *value;
+		else
+			this->lastSavedValue = this->displayedValue = 0;
 
 		this->saveCat = saveCat;
 		this->save = save;
@@ -461,7 +474,14 @@ struct CCFOSlider : CCFO
 	float min;
 	float max;
 
-	CCFOSlider() {};
+	CCFOSlider() {
+		this->value = nil;
+		this->saveCat = nil;
+		this->save = nil;
+		this->changeFunc = nil;
+		this->min = 0.0f;
+		this->max = 0.0f;
+	};
 	CCFOSlider(float* value, const char* saveCat, const char* save, float min, float max, ChangeFuncFloat changeFunc = nil){
 		this->value = value;
 		this->saveCat = saveCat;
@@ -477,7 +497,13 @@ struct CCFODynamic : CCFO
 	DrawFunc drawFunc;
 	ButtonPressFunc buttonPressFunc;
 
-	CCFODynamic() {};
+	CCFODynamic() {
+		this->value = nil;
+		this->saveCat = nil;
+		this->save = nil;
+		this->drawFunc = nil;
+		this->buttonPressFunc = nil;
+	};
 	CCFODynamic(int8* value, const char* saveCat, const char* save, DrawFunc drawFunc, ButtonPressFunc buttonPressFunc){
 		this->value = value;
 		this->saveCat = saveCat;
@@ -552,6 +578,23 @@ struct MenuTrapezoid
 		bottomLeft_y = y3;
 		bottomRight_x = x4;
 		bottomRight_y = y4;
+
+		old_topLeft_x = 0.0f;
+		old_topLeft_y = 0.0f;
+		old_topRight_x = 0.0f;
+		old_topRight_y = 0.0f;
+		old_bottomLeft_x = 0.0f;
+		old_bottomLeft_y = 0.0f;
+		old_bottomRight_x = 0.0f;
+		old_bottomRight_y = 0.0f;
+		mult_topLeft_x = 0.0f;
+		mult_topLeft_y = 0.0f;
+		mult_topRight_x = 0.0f;
+		mult_topRight_y = 0.0f;
+		mult_bottomLeft_x = 0.0f;
+		mult_bottomLeft_y = 0.0f;
+		mult_bottomRight_x = 0.0f;
+		mult_bottomRight_y = 0.0f;
 	};
 
 	void SaveCurrentCoors() {

@@ -6,7 +6,9 @@ struct TxdDef {
 	RwTexDictionary *texDict;
 	int16 refCount;
 	int16 refCountGu;
-	char name[20];
+	// an IMG directory name is 24 bytes: a 20-byte buffer here overflowed into
+	// the following pool entry for any dictionary name longer than 19 chars
+	char name[24];
 };
 
 class CTxdStore

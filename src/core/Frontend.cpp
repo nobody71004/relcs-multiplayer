@@ -509,6 +509,80 @@ CMenuManager::SwitchToNewScreen(int8 screen)
 
 CMenuManager::CMenuManager()
 {
+	// Members the original constructor never initialised. Everything here is set
+	// before any code below reads it: m_nMouseTempPosX/Y in particular feed
+	// m_nMousePosX/Y, which used to be assigned from uninitialised values.
+	memset(field_74, 0, sizeof(field_74));
+	memset(field_67C, 0, sizeof(field_67C));
+	memset(m_PrefsSkinFile, 0, sizeof(m_PrefsSkinFile));
+	memset(m_aSkinName, 0, sizeof(m_aSkinName));
+	memset(&m_pSkinListHead, 0, sizeof(m_pSkinListHead));
+	m_nCurrOption = 0;
+	m_bQuitGameNoCD = false;
+	m_bMenuMapActive = false;
+	m_AllowNavigation = false;
+	field_37 = 0;
+	m_bWantToRestart = false;
+	m_bFirstTime = false;
+	m_bLanguageLoaded = 0;
+	m_nPrefsVideoMode = 0;
+	m_nDisplayVideoMode = 0;
+	m_nMouseTempPosX = 0;
+	m_nMouseTempPosY = 0;
+	m_firstStartCounter = 0;
+	m_bSpritesLoaded = false;
+	m_LeftMostRadioX = 0;
+	m_ScrollRadioBy = 0;
+	m_nCurrScreen = 0;
+	m_nPrevScreen = 0;
+	m_nCurrSaveSlot = 0;
+	m_LastScreenSwitch = 0;
+	m_nOptionHighlightTransitionBlend = 0;
+	bMenuChangeOngoing = false;
+	MouseButtonJustClicked = 0;
+	JoyButtonJustClicked = 0;
+	m_NoEmptyBinding = false;
+	m_ShowEmptyBindingError = false;
+	m_nHelperTextAlpha = 0;
+	m_bPressedPgUpOnList = false;
+	m_bPressedPgDnOnList = false;
+	m_bPressedUpOnList = false;
+	m_bPressedDownOnList = false;
+	m_bPressedScrollButton = false;
+	field_129 = 0;
+	field_12A = 0;
+	field_12B = 0;
+	m_nOptionMouseHovering = 0;
+	m_bStartWaitingForKeyBind = false;
+	m_bWaitingForNewKeyBind = false;
+	m_bKeyChangeNotProcessed = false;
+	m_CurrCntrlAction = 0;
+	field_150 = 0;
+	field_151 = 0;
+	field_152 = 0;
+	field_153 = 0;
+	m_nSelectedContSetupColumn = 0;
+	m_bKeyIsOK = false;
+	field_159 = false;
+	m_nCurrExLayer = 0;
+	field_35B = 0;
+	m_nHelperTextMsgId = 0;
+	m_pSelectedSkin = nil;
+	m_nTotalListRow = 0;
+	m_bSkinsEnumerated = false;
+#ifdef IMPROVED_VIDEOMODE
+	m_nPrefsWidth = 0;
+	m_nPrefsHeight = 0;
+	m_nPrefsDepth = 0;
+	m_nPrefsWindowed = 0;
+	m_nPrefsSubsystem = 0;
+	m_nSelectedScreenMode = 0;
+#endif
+#ifdef MULTISAMPLING
+	m_nPrefsMSAALevel = 0;
+	m_nDisplayMSAALevel = 0;
+#endif
+
 	m_StatsScrollSpeed = 150.0f;
 	m_StatsScrollDirection = 1;
 	m_PrefsSfxVolume = 49;
@@ -3818,16 +3892,17 @@ CMenuManager::ExportStats()
 		for (int i = 0; i < statLines; ++i) {
 			CStats::ConstructStatLine(i);
 			char *statKey = UnicodeToAscii(gUString);
-			if (statKey[0] != '\0')
+			if (statKey && statKey[0] != '\0')
 				fprintf(txtFile, "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n%s\n", statKey);
 
 			char *statValue = UnicodeToAscii(gUString2);
-			for (int j = 0; statValue[j] != '\0'; ++j) {
-				if (statValue[j] == '_')
-					statValue[j] = '\xBA'; // This is degree symbol, but my editors keeps messing up with it so I wrote hex representation
-			}
-			if (statValue)
+			if (statValue) {
+				for (int j = 0; statValue[j] != '\0'; ++j) {
+					if (statValue[j] == '_')
+						statValue[j] = '\xBA'; // This is degree symbol, but my editors keeps messing up with it so I wrote hex representation
+				}
 				fprintf(txtFile, "%s\n\n", statValue);
+			}
 		}
 		fprintf(txtFile, "-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-\n\n");
 	}
@@ -3875,7 +3950,7 @@ CMenuManager::ExportStats()
 			fprintf(htmlFile, "<tr align=\"left\" valign=\"top\"><td width=\"500\" height=\"22\" bgcolor=\"#FFCCFF\"><font color=\"#FF00CC"
 				"\" size=\"2\" face=\"Arial, Helvetica, sans-serif\"><strong>\n");
 
-			if (statKey[0] != '\0')
+			if (statKey && statKey[0] != '\0')
 				fprintf(htmlFile, "%s", statKey);
 			else
 				fprintf(htmlFile, " ");
@@ -3884,13 +3959,13 @@ CMenuManager::ExportStats()
 				"right\"><strong><font color=\"#FF00CC\">\n");
 
 			char *statValue = UnicodeToAscii(gUString2);
-			for (int l = 0; statValue[l] != '\0'; ++l) {
-				if (statValue[l] == '_')
-					statValue[l] = '\xBA'; // This is degree symbol, but my editors keeps messing up with it so I wrote hex representation
-			}
-			if (statValue)
+			if (statValue) {
+				for (int l = 0; statValue[l] != '\0'; ++l) {
+					if (statValue[l] == '_')
+						statValue[l] = '\xBA'; // This is degree symbol, but my editors keeps messing up with it so I wrote hex representation
+				}
 				fprintf(htmlFile, "%s", statValue);
-			else
+			} else
 				fprintf(htmlFile, " ");
 		}
 		fprintf(htmlFile, "</font></strong></div></td> </tr> <tr align=\"left\" valign=\"top\" bgcolor=\"#FFFFFF\">  <td height=\"10\" c"

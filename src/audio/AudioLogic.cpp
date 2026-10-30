@@ -244,11 +244,8 @@ void
 cAudioManager::ProcessReverb()
 {
 #ifdef AUDIO_REVERB
-#ifdef FIX_BUGS
+	// the FIX_BUGS-off build iterated one past m_asActiveSamples
 	const uint32 numChannels = NUM_CHANNELS_GENERIC;
-#else
-	const uint32 numChannels = NUM_CHANNELS_GENERIC+1;
-#endif
 
 	if (SampleManager.UpdateReverb() && m_bDynamicAcousticModelingStatus) {
 #ifndef GTA_PS2

@@ -134,7 +134,12 @@ class CFont
 #endif
 	static bool16 NewLine;
 public:
+#ifdef MORE_LANGUAGES
+	// the Japanese language set also loads a fourth sprite (fontjap)
+	static CSprite2d Sprite[MAX_FONTS + 1];
+#else
 	static CSprite2d Sprite[MAX_FONTS];
+#endif
 	static CFontDetails Details;
 	static CFontRenderState RenderState;
 

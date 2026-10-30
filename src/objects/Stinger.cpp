@@ -37,6 +37,11 @@ CStingerSegment::~CStingerSegment()
 CStinger::CStinger()
 {
 	bIsDeployed = false;
+	pOwner = nil;
+	m_fMax_Z = 0.0f;
+	m_fMin_Z = 0.0f;
+	for (int32 i = 0; i < NUM_STINGER_SEGMENTS; i++)
+		pSpikes[i] = nil;
 }
 
 void

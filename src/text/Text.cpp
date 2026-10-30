@@ -18,6 +18,7 @@ CText::CText(void)
 	encoding = 'e';
 	bHasMissionTextOffsets = false;
 	bIsMissionTextLoaded = false;
+	bIsLoaded = false;
 	memset(szMissionTableName, 0, sizeof(szMissionTableName));
 	memset(WideErrorString, 0, sizeof(WideErrorString));
 }
@@ -67,10 +68,24 @@ CText::Load(void)
 	}
 
 	file = CFileMgr::OpenFile(filename, "rb");
+	if (file == 0 && FrontEndMenuManager.m_PrefsLanguage == CMenuManager::LANGUAGE_AMERICAN) {
+		// LCS ships its English table as ENGLISH.GXT, GTA3-era assets as AMERICAN.GXT
+		sprintf(filename, "ENGLISH.GXT");
+		file = CFileMgr::OpenFile(filename, "rb");
+	}
+	if (file == 0) {
+		CFileMgr::SetDir("");
+		printf("CText::Load - couldn't open %s\n", filename);
+		return;
+	}
 
 	offset = 0;
 	while (!tkey_loaded || !tdat_loaded) {
-		ReadChunkHeader(&m_ChunkHeader, file, &offset);
+		// Without this the loop spins forever at EOF: the header keeps its
+		// previous contents, so it never stops looking for a chunk that is
+		// no longer there, and zero-length chunks make fread fast-fail.
+		if (ReadChunkHeader(&m_ChunkHeader, file, &offset) != sizeof(ChunkHeader))
+			break;
 		if (m_ChunkHeader.size != 0) {
 			if (strncmp(m_ChunkHeader.magic, "TABL", 4) == 0) {
 				MissionTextOffsets.Load(m_ChunkHeader.size, file, &offset, 0x58000);
@@ -202,19 +217,24 @@ CText::GetNameOfLoadedMissionText(char *outName)
 	strcpy(outName, szMissionTableName);
 }
 
-void
+size_t
 CText::ReadChunkHeader(ChunkHeader *buf, int32 file, size_t *offset)
 {
 #ifdef THIS_IS_STUPID
+	size_t n = 0;
 	char *_buf = (char*)buf;
 	for (int i = 0; i < sizeof(ChunkHeader); i++) {
-		CFileMgr::Read(file, &_buf[i], 1);
+		if (CFileMgr::Read(file, &_buf[i], 1) != 1)
+			break;
 		(*offset)++;
+		n++;
 	}
+	return n;
 #else
 	// original code loops 8 times to read 1 byte with CFileMgr::Read, that's retarded
-	CFileMgr::Read(file, (char*)buf, sizeof(ChunkHeader));
-	*offset += sizeof(ChunkHeader);
+	size_t n = CFileMgr::Read(file, (char*)buf, sizeof(ChunkHeader));
+	*offset += n;
+	return n;
 #endif
 }
 
@@ -273,6 +293,16 @@ CText::LoadMissionText(char *MissionTableName)
 	}
 	CTimer::Suspend();
 	int file = CFileMgr::OpenFile(filename, "rb");
+	if (file == 0 && FrontEndMenuManager.m_PrefsLanguage == CMenuManager::LANGUAGE_AMERICAN) {
+		sprintf(filename, "ENGLISH.GXT");
+		file = CFileMgr::OpenFile(filename, "rb");
+	}
+	if (file == 0) {
+		CTimer::Resume();
+		CFileMgr::SetDir("");
+		printf("CText::LoadMissionText - couldn't open %s\n", filename);
+		return;
+	}
 	CFileMgr::Seek(file, MissionTextOffsets.data[missionTableId].offset, SEEK_SET);
 
 	char TableCheck[8];
@@ -284,7 +314,8 @@ CText::LoadMissionText(char *MissionTableName)
 	ChunkHeader m_ChunkHeader;
 	while (!tkey_loaded || !tdat_loaded) {
 		size_t bytes_read = 0;
-		ReadChunkHeader(&m_ChunkHeader, file, &bytes_read);
+		if (ReadChunkHeader(&m_ChunkHeader, file, &bytes_read) != sizeof(ChunkHeader))
+			break;
 		if (m_ChunkHeader.size != 0) {
 			if (strncmp(m_ChunkHeader.magic, "TKEY", 4) == 0) {
 				size_t bytes_read = 0;

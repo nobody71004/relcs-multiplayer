@@ -19,6 +19,11 @@ cAudioManager AudioManager;
 
 cAudioManager::cAudioManager()
 {
+	memset(&m_sQueueSample, 0, sizeof(m_sQueueSample));
+	memset(m_aRequestedQueue, 0, sizeof(m_aRequestedQueue));
+#ifdef AUDIO_REFLECTIONS
+	memset(m_afReflectionsDistances, 0, sizeof(m_afReflectionsDistances));
+#endif
 	m_bIsInitialised = FALSE;
 	m_bIsSurround = TRUE;
 	m_nChannelOffset = 0;

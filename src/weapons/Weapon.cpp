@@ -446,6 +446,8 @@ bool
 CWeapon::FireFromCar(CVehicle *shooter, bool left, bool right)
 {
 	ASSERT(shooter!=nil);
+	if ( shooter == nil )
+		return false;
 
 	if ( m_eWeaponState != WEAPONSTATE_READY && m_eWeaponState != WEAPONSTATE_FIRING )
 		return false;
@@ -2484,6 +2486,9 @@ CWeapon::FireM16_1stPerson(CEntity *shooter)
 bool
 CWeapon::FireInstantHitFromCar(CVehicle *shooter, bool left, bool right)
 {
+	if ( shooter == nil )
+		return false;
+
 	CWeaponInfo *info = GetInfo();
 
 	CVehicleModelInfo *modelInfo = shooter->GetModelInfo();

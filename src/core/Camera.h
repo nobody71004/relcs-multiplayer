@@ -186,7 +186,61 @@ public:
 	CPed         *m_pLastPedLookedAt;// So interpolation works 
 	bool        m_bFirstPersonRunAboutActive;
 
-	CCam(void) { Init(); }
+	CCam(void)
+	{
+		Init();
+		// Init() leaves the following members untouched; without these they are read
+		// as whatever happened to be on the stack / BSS at construction time
+		bBelowMinDist = false;
+		bBehindPlayerDesired = false;
+		m_bCamLookingAtVector = false;
+		m_bTheHeightFixerVehicleIsATrain = false;
+		m_uiFinishTime = 0;
+		m_iRunningVectorArrayPos = 0;
+		m_iRunningVectorCounter = 0;
+		m_fAmountFractionObscured = 0.0f;
+		m_fAlphaSpeedOverOneFrame = 0.0f;
+		m_fBetaSpeedOverOneFrame = 0.0f;
+		m_fCamBufferedHeight = 0.0f;
+		m_fCamBufferedHeightSpeed = 0.0f;
+		m_fDistanceBeforeChanges = 0.0f;
+		m_fFovSpeedOverOneFrame = 0.0f;
+		m_fMinDistAwayFromCamWhenInterPolating = 0.0f;
+		m_fTimeElapsedFloat = 0.0f;
+		m_fTransitionBeta = 0.0f;
+		m_fTrueBeta = 0.0f;
+		m_fTrueAlpha = 0.0f;
+		m_fInitialPlayerOrientation = 0.0f;
+		Alpha = 0.0f;
+		FOV = 0.0f;
+		FOVSpeed = 0.0f;
+		SpeedVar = 0.0f;
+		m_fTargetZoomGroundOne = 0.0f;
+		m_fTargetZoomGroundTwo = 0.0f;
+		m_fTargetZoomGroundThree = 0.0f;
+		m_fTargetZoomOneZExtra = 0.0f;
+		m_fTargetZoomTwoZExtra = 0.0f;
+		m_fTargetZoomThreeZExtra = 0.0f;
+		m_fTargetZoomZCloseIn = 0.0f;
+		m_fMinRealGroundDist = 0.0f;
+		m_fTargetCloseInDist = 0.0f;
+		m_cvecSourceSpeedOverOneFrame = CVector(0.0f, 0.0f, 0.0f);
+		m_cvecTargetSpeedOverOneFrame = CVector(0.0f, 0.0f, 0.0f);
+		m_cvecUpOverOneFrame = CVector(0.0f, 0.0f, 0.0f);
+		m_cvecTargetCoorsForFudgeInter = CVector(0.0f, 0.0f, 0.0f);
+		m_cvecCamFixedModeVector = CVector(0.0f, 0.0f, 0.0f);
+		m_cvecCamFixedModeSource = CVector(0.0f, 0.0f, 0.0f);
+		m_cvecCamFixedModeUpOffSet = CVector(0.0f, 0.0f, 0.0f);
+		m_vecLastAboveWaterCamPosition = CVector(0.0f, 0.0f, 0.0f);
+		m_vecBufferedPlayerBodyOffset = CVector(0.0f, 0.0f, 0.0f);
+		Source = CVector(0.0f, 0.0f, 0.0f);
+		SourceBeforeLookBehind = CVector(0.0f, 0.0f, 0.0f);
+		CamTargetEntity = nil;
+		m_fCameraDistance = 0.0f;
+		m_fIdealAlpha = 0.0f;
+		m_fPlayerVelocity = 0.0f;
+		m_bFirstPersonRunAboutActive = false;
+	}
 	void Init(void);
 	void Process(void);
 	void ProcessSpecialHeightRoutines(void);

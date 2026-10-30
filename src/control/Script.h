@@ -68,7 +68,7 @@ struct intro_script_rectangle
 	CRect m_sRect;
 	CRGBA m_sColor;
 	
-	intro_script_rectangle() { }
+	intro_script_rectangle() : m_bIsUsed(false), m_bBeforeFade(false) { }
 	~intro_script_rectangle() { }
 };
 
@@ -98,7 +98,10 @@ struct intro_text_line
 	float m_fAtY;
 	wchar m_Text[SCRIPT_TEXT_MAX_LENGTH];
 
-	intro_text_line() { }
+	intro_text_line() : m_fScaleX(0.0f), m_fScaleY(0.0f), m_bJustify(false), m_bCentered(false),
+		m_bBackground(false), m_bBackgroundOnly(false), m_fWrapX(0.0f), m_fCenterSize(0.0f),
+		m_bTextProportional(false), m_bTextBeforeFade(false), m_bRightJustify(false),
+		m_fAtX(0.0f), m_fAtY(0.0f) { }
 	~intro_text_line() { }
 	
 	void Reset()
@@ -133,7 +136,7 @@ struct script_sphere_struct
 	CVector m_vecCenter;
 	float m_fRadius;
 	
-	script_sphere_struct() { }
+	script_sphere_struct() : m_bInUse(false), m_fRadius(0.0f) { }
 };
 
 struct CStoredLine
@@ -209,7 +212,7 @@ struct stuck_car_data
 	uint32 m_nStuckTime;
 	bool m_bStuck;
 
-	stuck_car_data() { }
+	stuck_car_data() : m_fRadius(0.0f), m_bStuck(false) { }
 	void Reset();
 };
 

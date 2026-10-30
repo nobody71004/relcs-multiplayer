@@ -283,6 +283,20 @@ CMenuManager::CMenuManager(void)
 		PANEL_TEXT_X_SCALES[i] = 1.0f;
 	}
 
+	m_bWantToRestart = false;
+#ifdef GTA_PC
+	m_bQuitGameNoCD = false;
+	m_nMouseTempPosX = 0;
+	m_nMouseTempPosY = 0;
+	m_nPrefsVideoMode = 0;
+	m_nDisplayVideoMode = 0;
+	m_nPrefsAudio3DProviderIndex = 0;
+#endif
+#ifdef IMPROVED_VIDEOMODE
+	m_nPrefsSubsystem = 0;
+	m_nSelectedScreenMode = 0;
+#endif
+
 #ifdef GTA_PC
 	TheCamera.m_bUseMouse3rdPerson = m_ControlMethod == CONTROL_STANDARD;
 	CMBlur::BlurOn = m_PrefsShowTrails;

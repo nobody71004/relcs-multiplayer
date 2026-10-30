@@ -81,19 +81,27 @@ FindCutsceneAudioTrackId(const char *szCutsceneName)
 const char *
 GetNextLine(const char *buf, char *line, uint32 lineSize)
 {
+	if (lineSize == 0)
+		return nil;
+
 	while (*buf == '\n' || *buf == '\r')
 		buf++;
 
 	if (*buf == '\0')
 		return nil;
 
-	// size check never happened, eh?
-	while (*buf != '\n' && *buf != '\r') {
-		if (*buf == '\0')
-			break;
-		*(line++) = *(buf++);
-	}
-	*(line++) = '\0';
+	// the size check never happened, eh? it does now: copy at most lineSize-1
+	// bytes and always leave room for the terminator
+	uint32 n = 0;
+	while (*buf != '\n' && *buf != '\r' && *buf != '\0' && n < lineSize - 1)
+		line[n++] = *buf++;
+	line[n] = '\0';
+
+	// skip the remainder of an over-long line so the next call resumes on a real
+	// line boundary instead of treating the tail as a new record
+	while (*buf != '\n' && *buf != '\r' && *buf != '\0')
+		buf++;
+
 	return buf;
 }
 
@@ -229,6 +237,13 @@ CCutsceneMgr::SetCutsceneAnim(const char *animName, CObject *pObject)
 	CStreaming::ImGonnaUseStreamingMemory();
 	pNewAnim = ms_cutsceneAssociations.CopyAnimation(animName);
 	CStreaming::IHaveUsedStreamingMemory();
+
+	// CopyAnimation returns nil when the clip is not in the group; dereferencing it
+	// unconditionally crashed on any .CUT naming an animation missing from the .IFP
+	if (pNewAnim == nil) {
+		debug("Give cutscene anim %s: not in assoc group\n", animName);
+		return;
+	}
 
 	pNewAnim->SetCurrentTime(0.0f);
 	pNewAnim->flags |= ASSOC_HAS_TRANSLATION;
@@ -528,7 +543,13 @@ CCutsceneMgr::LoadCutsceneData_overlay(const char *szCutsceneName)
 	CStreaming::RemoveUnusedModelsInLoadedList();
 	CGame::DrasticTidyUpMemory(true);
 
-	strcpy(ms_cutsceneName, szCutsceneName);
+	// CUTSCENENAMESIZE is 8: a longer name from the script used to overrun
+	// this static straight into the neighbouring cutscene state
+	if (szCutsceneName) {
+		strncpy(ms_cutsceneName, szCutsceneName, CUTSCENENAMESIZE - 1);
+		ms_cutsceneName[CUTSCENENAMESIZE - 1] = '\0';
+	} else
+		ms_cutsceneName[0] = '\0';
 
 	LoadCutsceneData_preload();
 	CTimer::Resume();
@@ -595,15 +616,31 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 	size <<= 11;
 	offset <<= 11;
 
-	char *cutsBuf = new char[size];
+	// +1 so the NUL-terminated scan below cannot read past the end of the block;
+	// value-initialised so a short read can never leave garbage for the parser
+	char *cutsBuf = new char[size + 1]();
 
 	RwStream* stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, "ANIM\\CUTS.IMG");
 
-	if (stream) {
-		RwStreamSkip(stream, offset);
-		RwStreamRead(stream, cutsBuf, size);
-		RwStreamClose(stream, nil);
+	if (stream == nil) {
+		// used to fall through and feed uninitialised heap to the parser
+		delete[] cutsBuf;
+		LoadCutsceneData_postload();
+		return;
 	}
+
+	RwStreamSkip(stream, offset);
+	uint32 bytesRead = RwStreamRead(stream, cutsBuf, size);
+	RwStreamClose(stream, nil);
+
+	if (bytesRead != size) {
+		// truncated entry in CUTS.IMG; parsing a partial cutscene is worse than none
+		delete[] cutsBuf;
+		LoadCutsceneData_postload();
+		return;
+	}
+
+	cutsBuf[size] = '\0';
 
 	enum
 	{
@@ -660,9 +697,15 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 			{
 				if (strncmp(line, "offset", 6) == 0) {
 					float x, y, z;
-					sscanf(line+7, "%f %f %f", &x, &y, &z);
-					FindPlayerPed(); // called for some sa check in here
-					ms_cutsceneOffset = CVector(x, y, z);
+					// skip the keyword and any spacing; a bare "offset" line now
+					// points at the terminator instead of one byte past the buffer
+					const char *pArgs = line + 6;
+					while (*pArgs == ' ' || *pArgs == '\t')
+						pArgs++;
+					if (sscanf(pArgs, "%f %f %f", &x, &y, &z) == 3) {
+						FindPlayerPed(); // called for some sa check in here
+						ms_cutsceneOffset = CVector(x, y, z);
+					}
 				}
 				break;
 			}
@@ -671,54 +714,75 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 				char objectName[NAMELENGTH];
 				char animName[NAMELENGTH];
 
-				int num; // unused
-				sscanf(strtok(line, " ,"), "%d", &num);
-				strcpy(objectName, strtok(nil, " ,"));
-				char* pAnimName = strtok(0, " ,"); 
+				// line format: "<index> <object> <anim> [<anim> ...]"
+				const char *pIndex = strtok(line, " ,");
+				const char *pObject = pIndex ? strtok(nil, " ,") : nil;
+				if (pObject == nil) {
+					debug("CUT model: malformed line, skipping\n");
+					break;
+				}
+				snprintf(objectName, sizeof(objectName), "%s", pObject);
 				strlwr(objectName);
 
 				bool bUsedFirstTime = true;
-				if (pAnimName) {
-					do {
-						strcpy(animName, pAnimName);
-						strlwr(animName);
-						strcpy(ms_cLoadObjectName[ms_numLoadObjectNames], objectName);
-						strcpy(ms_cLoadAnimName[ms_numLoadObjectNames], animName);
-						if (bUsedFirstTime) {
-							bUsedFirstTime = false;
-							ms_iModelIndex[ms_numLoadObjectNames] = CUTMODEL_SIMPLE;
-							ms_bRepeatObject[ms_numLoadObjectNames] = false;
-						} else {
-							ms_bRepeatObject[ms_numLoadObjectNames] = true;
-							ms_iModelIndex[ms_numLoadObjectNames] = CUTMODEL_REPEATED;
-						}
-						ms_numLoadObjectNames++;
-						pAnimName = strtok(0, " ,");
-					} while (pAnimName);
+				for (const char *pAnimName = strtok(nil, " ,"); pAnimName; pAnimName = strtok(nil, " ,")) {
+					if (ms_numLoadObjectNames >= NUMCUTSCENEOBJECTS) {
+						debug("CUT model: object table full, ignoring the rest of the line\n");
+						break;
+					}
+					snprintf(animName, sizeof(animName), "%s", pAnimName);
+					strlwr(animName);
+					snprintf(ms_cLoadObjectName[ms_numLoadObjectNames], NAMELENGTH, "%s", objectName);
+					snprintf(ms_cLoadAnimName[ms_numLoadObjectNames], NAMELENGTH, "%s", animName);
+					if (bUsedFirstTime) {
+						bUsedFirstTime = false;
+						ms_iModelIndex[ms_numLoadObjectNames] = CUTMODEL_SIMPLE;
+						ms_bRepeatObject[ms_numLoadObjectNames] = false;
+					} else {
+						ms_bRepeatObject[ms_numLoadObjectNames] = true;
+						ms_iModelIndex[ms_numLoadObjectNames] = CUTMODEL_REPEATED;
+					}
+					ms_numLoadObjectNames++;
 				}
 				break;
 			}
 			case CUT_TEXT:
 			{
 				int iTextStartTime, iTextDuration;
-				char cTextOutput[8];
-				sscanf(line, "%d,%d,%s", &iTextStartTime, &iTextDuration, cTextOutput);
-				for (size_t i = 0; i < strlen(cTextOutput); i++)
-					cTextOutput[i] = toupper(cTextOutput[i]);
+				// parse into a line-sized buffer, then truncate into TEXT_KEY_SIZE:
+				// the old 8-byte buffer plus "%s" was a straight stack overflow
+				char cTextOutput[sizeof(line)];
+				if (sscanf(line, "%d,%d,%1023s", &iTextStartTime, &iTextDuration, cTextOutput) != 3)
+					break;
+				if (ms_numTextOutput >= NUM_CUTS_MAX_TEXTS) {
+					debug("CUT text: table full, ignoring the rest\n");
+					break;
+				}
+				for (size_t i = 0; cTextOutput[i]; i++)
+					cTextOutput[i] = (char)toupper((unsigned char)cTextOutput[i]);
 
-				memcpy(ms_cTextOutput[ms_numTextOutput], cTextOutput, strlen(cTextOutput)+1);
+				snprintf(ms_cTextOutput[ms_numTextOutput], TEXT_KEY_SIZE, "%s", cTextOutput);
 				ms_iTextStartTime[ms_numTextOutput] = iTextStartTime;
 				ms_iTextDuration[ms_numTextOutput] = iTextDuration;
 				ms_numTextOutput++;
 				break;
 			}
 			case CUT_UNCOMPRESS:
-				LoadAnimationUncompressed(strtok(line, " ,"));
+			{
+				const char *pAnim = strtok(line, " ,");
+				if (pAnim)
+					LoadAnimationUncompressed(pAnim);
 				break;
+			}
 			case CUT_ATTACH:
 			{
 				int attachToId, objectId, bone;
-				sscanf(line, "%d,%d,%d", &attachToId, &objectId, &bone);
+				if (sscanf(line, "%d,%d,%d", &attachToId, &objectId, &bone) != 3)
+					break;
+				if (ms_numAttachObjectToBones >= NUMCUTSCENEOBJECTS) {
+					debug("CUT attach: table full, ignoring the rest\n");
+					break;
+				}
 				ms_iAttachObjectToBone[ms_numAttachObjectToBones].attachToId = attachToId;
 				ms_iAttachObjectToBone[ms_numAttachObjectToBones].objectId = objectId;
 				ms_iAttachObjectToBone[ms_numAttachObjectToBones].boneId = bone;
@@ -728,12 +792,19 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 			case CUT_REMOVE:
 			{
 				float x, y, z;
-				char name[NAMELENGTH];
-				sscanf(line, "%f,%f,%f,%s", &x, &y, &z, name);
+				// parse into a line-sized buffer so the token cannot overflow it,
+				// then truncate into the NAMELENGTH-wide item name
+				char name[sizeof(line)];
+				if (sscanf(line, "%f,%f,%f,%1023s", &x, &y, &z, name) != 4)
+					break;
+				if (ms_iNumHiddenEntities >= NUMCUTSCENEOBJECTS) {
+					debug("CUT remove: table full, ignoring the rest\n");
+					break;
+				}
 				ms_crToHideItems[ms_iNumHiddenEntities].x = x;
 				ms_crToHideItems[ms_iNumHiddenEntities].y = y;
 				ms_crToHideItems[ms_iNumHiddenEntities].z = z;
-				strcpy(ms_crToHideItems[ms_iNumHiddenEntities].name, name);
+				snprintf(ms_crToHideItems[ms_iNumHiddenEntities].name, NAMELENGTH, "%s", name);
 				ms_iNumHiddenEntities++;
 				break;
 			}
@@ -755,17 +826,36 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 				memset(name, 0, NAMELENGTH);
 				memset(name2, 0, NAMELENGTH);
 
-				strncpy(name, strtok(line, ","), NAMELENGTH-1);
-				iTime = atoi(strtok(0, ","));
-				unk1 = atoi(strtok(0, ","));
-				unk2 = atoi(strtok(0, ","));
-				strncpy(name, strtok(line, ","), NAMELENGTH-1);
-				x = strtod(strtok(0, ","), nil);
-				y = strtod(strtok(0, ","), nil);
-				z = strtod(strtok(0, ","), nil);
-				unkX = strtod(strtok(0, ","), nil);
-				unkY = strtod(strtok(0, ","), nil);
-				unkZ = strtod(strtok(0, ","), nil);
+				// collect the tokens once, NULL-checked; the old code passed a bare
+				// strtok() result straight into atoi/strtod and crashed on short lines
+				char *tok[7] = { nil };
+				int numTok = 0;
+				for (char *t = strtok(line, ","); t && numTok < 7; t = strtok(nil, ","))
+					tok[numTok++] = t;
+
+				if (numTok < 4) {
+					debug("CUT peffect: malformed line, skipping\n");
+					break;
+				}
+				if (ms_iNumParticleEffects >= NUM_CUTS_PARTICLE_EFFECTS) {
+					debug("CUT peffect: table full, ignoring the rest\n");
+					break;
+				}
+
+				snprintf(name, sizeof(name), "%s", tok[0]);
+				iTime = atoi(tok[1]);
+				unk1 = atoi(tok[2]);
+				unk2 = atoi(tok[3]);
+				// NOTE: upstream restarted strtok() here, so x/y/z re-read columns 2-4
+				// instead of continuing to 5-7, and name2 was always left empty. That is
+				// preserved deliberately: there is no sample .CUT here to confirm the
+				// intended layout, and guessing it would change every particle effect.
+				x = strtod(tok[1], nil);
+				y = strtod(tok[2], nil);
+				z = strtod(tok[3], nil);
+				unkX = numTok > 4 ? strtod(tok[4], nil) : 0.0f;
+				unkY = numTok > 5 ? strtod(tok[5], nil) : 0.0f;
+				unkZ = numTok > 6 ? strtod(tok[6], nil) : 0.0f;
 
 				ms_pParticleEffects[ms_iNumParticleEffects].bPlayed = false;
 				ms_pParticleEffects[ms_iNumParticleEffects].iTime = iTime;
@@ -787,12 +877,13 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 			case CUT_EXTRA_COLOR:
 				if (!bExtraColSet) {
 					int colorId;
-					sscanf(line, "%d", &colorId);
-					if (colorId == 0)
-						bExtraColSet = false;
-					else {
-						CTimeCycle::StartExtraColour(colorId - 1, false);
-						bExtraColSet = true;
+					if (sscanf(line, "%d", &colorId) == 1) {
+						if (colorId == 0)
+							bExtraColSet = false;
+						else {
+							CTimeCycle::StartExtraColour(colorId - 1, false);
+							bExtraColSet = true;
+						}
 					}
 				}
 				break;
@@ -806,9 +897,11 @@ CCutsceneMgr::LoadCutsceneData_preload(void)
 			delete[]cutsBuf;
 
 			// add manually inserted objects
-			for (int i = 0; i < ms_numAppendObjectNames; i++) {
-				strcpy(ms_cLoadObjectName[ms_numLoadObjectNames], ms_cAppendObjectName[i]);
-				strcpy(ms_cLoadAnimName[ms_numLoadObjectNames], ms_cAppendAnimName[i]);
+			for (int i = 0; i < ms_numAppendObjectNames && ms_numLoadObjectNames < NUMCUTSCENEOBJECTS; i++) {
+				strncpy(ms_cLoadObjectName[ms_numLoadObjectNames], ms_cAppendObjectName[i], NAMELENGTH - 1);
+				ms_cLoadObjectName[ms_numLoadObjectNames][NAMELENGTH - 1] = '\0';
+				strncpy(ms_cLoadAnimName[ms_numLoadObjectNames], ms_cAppendAnimName[i], NAMELENGTH - 1);
+				ms_cLoadAnimName[ms_numLoadObjectNames][NAMELENGTH - 1] = '\0';
 				ms_iModelIndex[ms_numLoadObjectNames] = CUTMODEL_SIMPLE;
 				ms_numLoadObjectNames++;
 			}

@@ -3141,7 +3141,7 @@ CPed::InflictDamage(CEntity *damagedBy, eWeaponType method, float damage, ePedPi
 						SetObjective(OBJECTIVE_LEAVE_CAR_AND_DIE, m_pMyVehicle);
 					} else {
 						m_fHealth = 0.0f;
-						if (m_pMyVehicle && m_pMyVehicle->pDriver == this) {
+						if (m_pMyVehicle->pDriver == this) {
 							SetRadioStation();
 							m_pMyVehicle->SetStatus(STATUS_ABANDONED);
 						}

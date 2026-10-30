@@ -170,7 +170,36 @@ public:
 #ifdef DETECT_PAD_INPUT_SWITCH
 	static bool IsAffectedByController;
 #endif
-	CPad() { }
+	CPad()
+	{
+		// every member below was previously left as garbage until Clear() ran;
+		// Clear() is not called on the globals before the first frame is read
+		NewState = CControllerState();
+		OldState = CControllerState();
+		PCTempKeyState = CControllerState();
+		PCTempJoyState = CControllerState();
+		PCTempMouseState = CControllerState();
+		for (int i = 0; i < DRUNK_STEERING_BUFFER_SIZE; i++)
+			SteeringLeftRightBuffer[i] = 0;
+		DrunkDrivingBufferUsed = 0;
+		Phase = 0;
+		Mode = 0;
+		ShakeDur = 0;
+		DisablePlayerControls = 0;
+		ShakeFreq = 0;
+		for (int i = 0; i < HORNHISTORY_SIZE; i++)
+			bHornHistory[i] = false;
+		iCurrHornHistory = 0;
+		JustOutOfFrontend = 0;
+		bApplyBrakes = 0;
+		for (int i = 0; i < (int)sizeof(CheatString); i++)
+			CheatString[i] = '\0';
+		LastTimeTouched = 0;
+		AverageWeapon = 0;
+		AverageEntries = 0;
+		unk_B4 = 0.0f;
+		unk_B8 = 0.0f;
+	}
 	~CPad() { }
 
 	static bool bDisplayNoControllerMessage;

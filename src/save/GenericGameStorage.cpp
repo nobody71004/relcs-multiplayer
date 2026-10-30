@@ -705,6 +705,13 @@ GetSaveType(char *savename)
 	uint32 size;
 	CFileMgr::Read(file, (const char *)&size, sizeof(size));
 
+	// size comes straight from the save file: bound it before using it as a
+	// read length into the 100 KB work_buff, or a corrupt save is an overflow
+	if (size == 0 || size > sizeof(work_buff)) {
+		CFileMgr::CloseFile(file);
+		return SAVE_TYPE_NONE;
+	}
+
 	uint8 *buf = work_buff;
 	CFileMgr::Read(file, (const char *)work_buff, size); // simple vars + scripts
 
@@ -1077,6 +1084,11 @@ FixSave(int32 slot, uint8 save_type)
 
 	CFileMgr::Read(file_in, (const char *)&size, sizeof(size));
 	size = align4bytes(size);
+
+	// same file-supplied length as GetSaveType: reject anything that would
+	// not fit the working buffer instead of reading it in
+	if (size == 0 || size > sizeof(work_buff))
+		goto fail;
 
 	buf = work_buff;
 	CFileMgr::Read(file_in, (const char *)work_buff, size); // simple vars + scripts

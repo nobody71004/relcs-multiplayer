@@ -37,6 +37,13 @@ CPhysical::CPhysical(void)
 #endif
 
 	m_fForceMultiplier = 1.0f;
+	// mass is a divisor in the physics maths, so 1.0f is the safe neutral value
+	// here rather than 0.0f; real values are assigned by the derived ctors
+	m_fMass = 1.0f;
+	m_fTurnMass = 1.0f;
+	m_fAirResistance = 0.0f;
+	m_fElasticity = 0.0f;
+	m_fBuoyancy = 0.0f;
 	m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
 	m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
 	m_vecMoveFriction = CVector(0.0f, 0.0f, 0.0f);

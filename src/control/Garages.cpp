@@ -2076,10 +2076,12 @@ void CGarage::FindDoorsEntitiesSectorList(CPtrList& list, bool dummy)
 	CPtrNode* node;
 	for (node = list.first; node; node = node->next) {
 		CEntity* pEntity = (CEntity*)node->item;
+		if (!pEntity)
+			continue;
 		if (pEntity->m_scanCode == CWorld::GetCurrentScanCode())
 			continue;
 		pEntity->m_scanCode = CWorld::GetCurrentScanCode();
-		if (!pEntity || !CGarages::IsModelIndexADoor(pEntity->GetModelIndex()))
+		if (!CGarages::IsModelIndexADoor(pEntity->GetModelIndex()))
 			continue;
 		if (Abs(pEntity->GetPosition().x - GetGarageCenterX()) >= 20.0f ||
 			Abs(pEntity->GetPosition().y - GetGarageCenterY()) >= 20.0f)

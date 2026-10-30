@@ -70,7 +70,11 @@ CParticleObject::CParticleObject() :
 	m_nState(POBJECTSTATE_INITIALISED),
 	m_pNext(nil),
 	m_pPrev(nil),
-	m_nRemoveTimer(0)
+	m_nRemoveTimer(0),
+	m_pParticle(nil),
+	m_Type(POBJECT_PAVEMENT_STEAM),
+	m_fRandVal(0.0f),
+	m_fSize(0.0f)
 	
 {
 	;

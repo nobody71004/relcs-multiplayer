@@ -220,11 +220,9 @@ COnscreenCounterEntry::ProcessForDisplayCounter()
 	char prefix[2] = { '\0' };
 	if (m_bAddDollarPrefix)
 		sprintf(prefix, "$");
-#ifdef FIX_BUGS
+	// "/99" needs 4 bytes including the terminator; the FIX_BUGS-off build
+	// declared 2 and overflowed the stack for every counter with a total
 	char suffix[4] = { '\0' };
-#else
-	char suffix[2] = { '\0' };
-#endif
 	if (m_nTotal != -1) {
 		m_nTotal = Min(99, m_nTotal);
 		sprintf(suffix, "/%d", m_nTotal);

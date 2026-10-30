@@ -25,6 +25,8 @@ public:
 	static bool bPhotographHasBeenTaken;
 	
 	CWeapon() {
+		m_eWeaponType = WEAPONTYPE_UNARMED;
+		m_eWeaponState = WEAPONSTATE_READY;
 		m_bAddRotOffset = false;
 	}
 	CWeapon(eWeaponType type, int32 ammo);

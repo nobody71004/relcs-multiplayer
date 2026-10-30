@@ -614,8 +614,7 @@ void CSceneEdit::ProcessCommand(void)
 			if (!m_bDrawGotoArrow) {
 				if (pActors[m_nActor]->bInVehicle && pActors[m_nActor]->m_pMyVehicle->AutoPilot.m_nCarMission == MISSION_NONE ||
 					!pActors[m_nActor]->bInVehicle && pActors[m_nActor]->m_objective == OBJECTIVE_NONE) {
-					if (pActors[m_nActor]) // if there is something that requires this check the least, it's this one
-						m_vecCamHeading = TheCamera.Cams[TheCamera.ActiveCam].CamTargetEntity->GetPosition() - TheCamera.Cams[TheCamera.ActiveCam].Source;
+					m_vecCamHeading = TheCamera.Cams[TheCamera.ActiveCam].CamTargetEntity->GetPosition() - TheCamera.Cams[TheCamera.ActiveCam].Source;
 					m_bCommandActive = false;
 					TheCamera.Cams[TheCamera.ActiveCam].Mode = CCam::MODE_FIGHT_CAM_RUNABOUT;
 					m_vecCurrentPosition = pActors[m_nActor]->GetPosition();

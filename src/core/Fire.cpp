@@ -29,6 +29,7 @@ CFire::CFire()
 	m_vecPos = CVector(0.0f, 0.0f, 0.0f);
 	m_nExtinguishTime = 0;
 	m_nStartTime = 0;
+	m_nNextTimeToAddFlames = 0;
 	m_pEntity = nil;
 	m_pSource = nil;
 	m_fStrength = 0.8f;
@@ -225,6 +226,9 @@ CFireManager::StartFire(CVector pos, float size, uint8 propagation)
 CFire *
 CFireManager::StartFire(CEntity *entityOnFire, CEntity *fleeFrom, float strength, uint8 propagation)
 {
+	if (entityOnFire == nil)
+		return nil;
+
 	CPed *ped = (CPed *)entityOnFire;
 	CVehicle *veh = (CVehicle *)entityOnFire;
 
@@ -285,7 +289,7 @@ CFireManager::StartFire(CEntity *entityOnFire, CEntity *fleeFrom, float strength
 		fire->m_bIsScriptFire = false;
 		fire->m_vecPos = entityOnFire->GetPosition();
 
-		if (entityOnFire && entityOnFire->IsPed() && ped->IsPlayer()) {
+		if (entityOnFire->IsPed() && ped->IsPlayer()) {
 			fire->m_nExtinguishTime = CTimer::GetTimeInMilliseconds() + 3333;
 		} else if (entityOnFire->IsVehicle()) {
 			fire->m_nExtinguishTime = CTimer::GetTimeInMilliseconds() + CGeneral::GetRandomNumberInRange(4000, 5000);
