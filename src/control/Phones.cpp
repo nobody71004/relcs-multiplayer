@@ -270,6 +270,10 @@ CPhoneInfo::GrabPhone(float xPos, float yPos)
 	// whoever called the 024A opcode first with the position parameters closest to phone.
 	// Same phone won't be available on next run of this function.
 
+	// every phone is already handed out; the loop below would leave nearestPhoneId at -1
+	if (m_nScriptPhonesMax >= m_nMax)
+		return -1;
+
 	int nearestPhoneId = -1;
 	CVector pos(xPos, yPos, 0.0f);
 	float nearestPhoneDist = 100.0f;
@@ -281,6 +285,10 @@ CPhoneInfo::GrabPhone(float xPos, float yPos)
 			nearestPhoneId = phoneId;
 		}
 	}
+	// no booth within range: report failure instead of indexing m_aPhones[-1]
+	if (nearestPhoneId == -1)
+		return -1;
+
 	m_aPhones[nearestPhoneId].m_nState = PHONE_STATE_MESSAGE_REMOVED;
 
 	CPhone oldFirstPhone = m_aPhones[m_nScriptPhonesMax];
@@ -394,11 +402,13 @@ PhonePickUpCB(CAnimBlendAssociation *assoc, void *arg)
 	}
 
 	CPed *ped = CPhoneInfo::pCallBackPed;
-	ped->m_nMoveState = PEDMOVE_STILL;
-	CAnimManager::BlendAnimation(ped->GetClump(), ASSOCGRP_STD, ANIM_STD_IDLE, 8.0f);
+	if (ped) {
+		ped->m_nMoveState = PEDMOVE_STILL;
+		CAnimManager::BlendAnimation(ped->GetClump(), ASSOCGRP_STD, ANIM_STD_IDLE, 8.0f);
 
-	if (assoc->blendAmount > 0.5f && ped)
-		CAnimManager::BlendAnimation(ped->GetClump(), ASSOCGRP_STD, ANIM_STD_PHONE_TALK, 8.0f);
+		if (assoc->blendAmount > 0.5f)
+			CAnimManager::BlendAnimation(ped->GetClump(), ASSOCGRP_STD, ANIM_STD_PHONE_TALK, 8.0f);
+	}
 
 	CPhoneInfo::pCallBackPed = nil;
 }

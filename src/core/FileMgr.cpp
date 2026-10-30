@@ -141,6 +141,12 @@ myfgets(char *buf, int len, int fd)
 static size_t
 myfread(void *buf, size_t elt, size_t n, int fd)
 {
+	/* fread with a zero element size or count is an invalid argument
+	 * (the CRT fast-fails on it), and there is nothing to read anyway. */
+	if(elt == 0 || n == 0)
+		return 0;
+	if(fd <= 0 || fd >= NUMFILES || myfiles[fd].file == nil)
+		return 0;
 	if(myfiles[fd].isText){
 		unsigned char *p;
 		size_t i;
@@ -162,6 +168,10 @@ myfread(void *buf, size_t elt, size_t n, int fd)
 static size_t
 myfwrite(void *buf, size_t elt, size_t n, int fd)
 {
+	if(elt == 0 || n == 0)
+		return 0;
+	if(fd <= 0 || fd >= NUMFILES || myfiles[fd].file == nil)
+		return 0;
 	if(myfiles[fd].isText){
 		unsigned char *p;
 		size_t i;

@@ -63,7 +63,7 @@ public:
 	Entry data[MAX_MISSION_TEXTS];
 	uint16 size; // You can make this size_t if you want to exceed 32-bit boundaries, everything else should be ready.
 
-	CMissionTextOffsets(void) : size(0) {}
+	CMissionTextOffsets(void) : size(0) { memset(data, 0, sizeof(data)); }
 	void Load(size_t table_size, int file, size_t* bytes_read, int);
 };
 
@@ -95,7 +95,7 @@ public:
 	wchar GetUpperCase(wchar c);
 	void UpperCase(wchar *s);
 	void GetNameOfLoadedMissionText(char *outName);
-	void ReadChunkHeader(ChunkHeader *buf, int32 file, size_t *bytes_read);
+	size_t ReadChunkHeader(ChunkHeader *buf, int32 file, size_t *bytes_read);
 	void LoadMissionText(char *MissionTableName);
 	bool IsLoaded();
 	void GetUTF8(const char*, char*, int); // TODO but unused

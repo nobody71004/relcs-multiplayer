@@ -159,7 +159,11 @@ public:
 	uint32 *m_blocksUsed;
 	uint32 m_unkMemId;
 
-	CMemoryHeap(void) : m_start(nil) {}
+	CMemoryHeap(void) : m_start(nil), m_end(nil), m_freeList(), m_memUsed(nil), m_blocksUsed(nil)
+	{
+		for (int i = 0; i < NUM_FIXED_MEMBLOCKS; i++)
+			m_fixedSize[i] = CommonSize();
+	}
 	void Init(uint32 total);
 	void RegisterMalloc(HeapBlockDesc *block);
 	void RegisterFree(HeapBlockDesc *block);

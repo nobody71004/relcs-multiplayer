@@ -16,7 +16,7 @@ class CTriggerCaller
 	int field_C;
 public:
 	
-	CTriggerCaller() : bHasTrigger(false), pFunc(nil)
+	CTriggerCaller() : bHasTrigger(false), pTrigger(nil), pFunc(nil), field_C(0)
 	{}
 	
 	void SetTrigger(void *func, void *trigger)
@@ -98,7 +98,7 @@ public:
 	bool m_bSelected;
 	CRGBA m_selectedColor;
 
-	CSelectable(void) : m_bSelected(false) {}
+	CSelectable(void) : m_bSelected(false), m_selectedColor(255, 255, 255, 255) {}
 	CRGBA GetSelectedColor(void) { return m_selectedColor; }
 };
 
@@ -223,6 +223,8 @@ class CMenuDummy : public CMenuBase
 public:
 	bool m_bActive;
 
+	CMenuDummy(void) : m_bActive(false) {}
+
 	virtual void Draw(const CRGBA &, const CRGBA &, float x, float y) {}
 	virtual void DrawNormal(float x, float y) {}
 	virtual void DrawHighlighted(const CRGBA &, float x, float y) {}
@@ -268,7 +270,9 @@ public:
 
 	CMenuPictureAndText(void)
 	 : m_numSprites(0), m_numTexts(0),
-	   m_bSetTextScale(false), m_bWrap(false) {}
+	   m_oldTextScale(0.0f, 0.0f), m_textScale(0.0f, 0.0f),
+	   m_bSetTextScale(false), m_wrapX(0.0f), m_oldWrapx(0.0f),
+	   m_bWrap(false) {}
 
 	void SetNewOldShadowWrapX(bool bWrapX, float newWrapX, float oldWrapX);
 	void SetNewOldTextScale(bool bTextScale, const CVector2D &newScale, const CVector2D &oldScale);
@@ -316,6 +320,7 @@ public:
 
 	CMenuMultiChoice(void)
 	 : m_numOptions(0), m_cursor(-1),
+	   m_oldTextScale(0.0f, 0.0f), m_textScale(0.0f, 0.0f),
 	   m_bSetTextScale(false), m_bSetTitleTextScale(false) {}
 
 	void AddTitle(wchar *text, float positionX, float positionY, bool bRightJustify);
@@ -356,7 +361,7 @@ public:
 	Trigger m_triggers[NUM_MULTICHOICE_OPTIONS];
 	Trigger m_defaultCancel;
 
-	CMenuMultiChoiceTriggered(void) { Initialise(); }
+	CMenuMultiChoiceTriggered(void) : m_defaultCancel(nil) { Initialise(); }
 
 	void Initialise(void);
 	CPlaceableShOption *AddOption(wchar *text, float positionX, float positionY, Trigger trigger, bool bSelected, bool bRightJustify);
@@ -407,7 +412,7 @@ public:
 	Trigger m_triggers[NUM_MULTICHOICE_OPTIONS];
 	Trigger m_defaultCancel;
 
-	CMenuMultiChoicePicturedTriggered(void) { Initialise(); }
+	CMenuMultiChoicePicturedTriggered(void) : m_defaultCancel(nil) { Initialise(); }
 
 	void Initialise(void);
 	using CMenuMultiChoicePictured::AddOption;
@@ -499,7 +504,7 @@ public:
 	Trigger m_triggers[NUM_MULTICHOICE_OPTIONS];
 	Trigger m_defaultCancel;
 
-	CMenuMultiChoiceTwoLinesTriggered(void) { Initialise(); }
+	CMenuMultiChoiceTwoLinesTriggered(void) : m_defaultCancel(nil) { Initialise(); }
 
 	void Initialise(void);
 	CPlaceableShOptionTwoLines *AddOption(wchar *text, float positionX, float positionY, Trigger trigger, bool bSelected, bool bRightJustify);
@@ -521,6 +526,10 @@ public:
 	CVector2D m_textScale;
 	CVector2D m_oldTextScale;
 	int m_type;	// 0: on/off 1: yes/no
+
+	CMenuOnOff(void)
+	 : m_bActive(false), m_bSetTextScale(false), m_bSetTitleTextScale(false),
+	   m_textScale(0.0f, 0.0f), m_oldTextScale(0.0f, 0.0f), m_type(0) {}
 
 	void SetColors(const CRGBA &title, const CRGBA &options);
 	void SetNewOldTextScale(bool bTextScale, const CVector2D &newScale, const CVector2D &oldScale, bool bTitleTextScale);
@@ -559,6 +568,8 @@ public:
 
 	Trigger m_trigger;
 
+	CMenuOnOffTriggered(void) : m_trigger(nil) {}
+
 	void SetOptionPosition(float x, float y, Trigger trigger, bool bRightJustify);
 
 	virtual void SelectCurrentOptionUnderCursor(void);
@@ -588,7 +599,7 @@ public:
 	static wchar Buf16[8];
 
 	CMenuSlider(void)
-	 : m_value(0), m_bDrawPercentage(false), m_bActive(false), m_style(0)
+	 : m_value(0), m_bDrawPercentage(false), m_someAlpha(0), m_bActive(false), m_style(0)
 	{
 		AddTickBox(0.0f, 0.0f, 100.0f, 10.0f, 10.0f); //todo
 	}
@@ -702,7 +713,7 @@ public:
 	CMenuBase *m_pCurrentControl;
 	int m_cursor;
 
-	CMenuPage(void) { Initialise(); }
+	CMenuPage(void) : m_numControls(0), m_pCurrentControl(nil), m_cursor(-1) { Initialise(); }
 	void Initialise(void);
 	bool AddMenu(CMenuBase *widget);
 

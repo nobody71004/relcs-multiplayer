@@ -3583,7 +3583,7 @@ void
 CCamera::LoadPathSplines(int file)
 {
 	bool reading = true;
-	char c, token[32] = { 0 };
+	char c = '\0', token[32] = { 0 };
 	int i, j, n;
 
 	n = 0;

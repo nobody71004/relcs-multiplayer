@@ -207,7 +207,7 @@ private:
 	bool AcEnforced() const;
 	void DropAcDeadlines();
 	void OnAcMessageToClient(void* handle, const void* data, uint32_t len);
-	void OnAcActionRequired(void* handle, int action, const char* reason);
+	void OnAcActionRequired(void* handle, int action, int reasonCode, const char* reason);
 	void OnAcRegisterResult(void* handle, int status, const std::string& detail);
 	ServerPlayer* PlayerForHandle(void* handle);
 	void SendAcStatus(ServerPlayer* p, uint8_t status, const std::string& detail);

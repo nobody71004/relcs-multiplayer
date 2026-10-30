@@ -56,6 +56,9 @@ CObject::CObject(void)
 {
 	m_type = ENTITY_TYPE_OBJECT;
 	m_fUprootLimit = 0.0f;
+	// neutral multiplier: ObjectData defaults every entry to 1.0f, and 0 here would
+	// silently disable collision damage for any object whose info was not applied
+	m_fCollisionDamageMultiplier = 1.0f;
 	m_nCollisionDamageEffect = 0;
 	m_nSpecialCollisionResponseCases = COLLRESPONSE_NONE;
 	m_bCameraToAvoidThisObject = false;

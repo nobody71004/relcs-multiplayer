@@ -62,7 +62,6 @@
 extern "C" int vsprintf(char* const _Buffer, char const* const _Format, va_list  _ArgList);
 #endif
 
-
 #ifdef USE_PS2_RAND
 unsigned long long myrand_seed = 1;
 #else
@@ -91,8 +90,6 @@ mysrand(unsigned int seed)
 
 #ifdef CUSTOM_FRONTEND_OPTIONS
 #include "frontendoption.h"
-
-
 
 #ifdef MORE_LANGUAGES
 void LangPolSelect(int8 action)
@@ -396,7 +393,7 @@ void LoadINIControllerSettings()
 				if (contType == -1)
 					continue;
 
-				int contKey;
+				int contKey = 0;
 				if (contType == JOYSTICK) {
 					char *temp;
 					contKey = strtol(binding, &temp, 0);
@@ -850,8 +847,14 @@ void CTweakVars::Add(CTweakVar *var)
 		TweakVarsList = (CTweakVar**)malloc(64 * sizeof(CTweakVar*));
 		TweakVarsListSize = 0;
 	}
-	if(TweakVarsListSize > 63)
-		TweakVarsList = (CTweakVar**) realloc(TweakVarsList, (TweakVarsListSize + 1) * sizeof(CTweakVar*));
+	if(TweakVarsListSize > 63){
+		// realloc leaves the old block untouched on failure; assigning the result
+		// straight back would leak it and then dereference nil below
+		CTweakVar **newList = (CTweakVar**) realloc(TweakVarsList, (TweakVarsListSize + 1) * sizeof(CTweakVar*));
+		if(newList == nil)
+			return;
+		TweakVarsList = newList;
+	}
 
 	TweakVarsList[TweakVarsListSize++] = var;
 //	TweakVarsList.push_back(var);
@@ -1129,7 +1132,6 @@ extern bool gbRenderDebugEnvMap;
 		DebugMenuAddCmd("Game", "Switch car collision", SwitchCarCollision);
 		DebugMenuAddCmd("Game", "Toggle Comedy Controls", ToggleComedy);
 
-
 #ifdef MISSION_SWITCHER
 		DebugMenuEntry *missionEntry;
 		static const char* missions[] = {
@@ -1293,14 +1295,15 @@ void re3_usererror(const char *format, ...)
 #ifdef _WIN32
 	vsprintf_s(re3_buff, re3_buffsize, format, va);
 	va_end(va);
-	
+
 	::MessageBoxA(nil, re3_buff, "RELCS Error!",
 		MB_OK|MB_ICONHAND|MB_SETFOREGROUND|MB_TASKMODAL);
 
 	raise(SIGABRT);
 	_exit(3);
 #else
-	vsprintf(re3_buff, format, va);
+	vsnprintf(re3_buff, re3_buffsize, format, va);
+	va_end(va);
 	printf("\nRELCS Error!\n\t%s\n",re3_buff);
 	assert(false);
 #endif

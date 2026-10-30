@@ -11,6 +11,8 @@ CAnimBlendHierarchy::CAnimBlendHierarchy(void)
 	compressed = 0;
 	totalLength = 0.0f;
 	linkPtr = nil;
+	memset(name, 0, sizeof(name));
+	keepCompressed = false;
 }
 
 void

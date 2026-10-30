@@ -62,7 +62,12 @@ CFileLoader::LoadLevel(const char *filename)
 		RwTexDictionarySetCurrent(savedTxd);
 	}
 	fd = CFileMgr::OpenFile(filename, "r");
-	assert(fd > 0);
+	if(fd <= 0){
+		// a missing level description used to assert and take the game down;
+		// report it and leave the level list empty instead
+		debug("Cannot open level description %s\n", filename);
+		return;
+	}
 
 	for(line = LoadLine(fd); line; line = LoadLine(fd)){
 		if(*line == '#')

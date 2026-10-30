@@ -23,6 +23,7 @@
 CCopPed::CCopPed(eCopType copType, int32 modifier) : CPed(PEDTYPE_COP)
 {
 	m_nCopType = copType;
+	m_fDistanceToTarget = 0.0f;
 	switch (copType) {
 	case COP_STREET:
 		SetModelIndex(MI_COP);
@@ -703,7 +704,7 @@ CCopPed::ProcessControl(void)
 			SetArrestPlayer(player);
 		}
 	} else {
-		if (m_nPedState == PED_SEEK_POS) {
+		if (m_nPedState == PED_SEEK_POS && player) {
 			if (player->m_nPedState == PED_ARRESTED) {
 				SetIdle();
 				SetLookFlag(player, false);

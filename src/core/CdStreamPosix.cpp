@@ -61,7 +61,8 @@ re3_sem_open(const char* format, ...)
 	char semName[21];
 	va_list va;
 	va_start(va, format);
-	vsprintf(semName, format, va);
+	vsnprintf(semName, sizeof(semName), format, va);
+	va_end(va);
 
 	return sem_open(semName, O_CREAT, 0644, 1);
 }
@@ -75,7 +76,8 @@ re3_sem_close(sem_t* sem, const char* format, ...)
 	char semName[21];
 	va_list va;
 	va_start(va, format);
-	vsprintf(semName, format, va);
+	vsnprintf(semName, sizeof(semName), format, va);
+	va_end(va);
 
 	sem_unlink(semName);
 }

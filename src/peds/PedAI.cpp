@@ -3203,6 +3203,8 @@ void
 CPed::PedAnimStepOutCarCB(CAnimBlendAssociation* animAssoc, void* arg)
 {
 	CPed* ped = (CPed*)arg;
+	if (ped == nil)
+		return;
 
 	CVehicle* veh = ped->m_pMyVehicle;
 	if (animAssoc) {
@@ -3572,7 +3574,7 @@ CPed::LineUpPedWithCar(PedLineUpPhase phase)
 		}
 	}
 
-	if (autoZPos.z > neededPos.z) {
+	if (autoZPos.z > neededPos.z && m_pVehicleAnim) {
 		vehAnim = m_pVehicleAnim->animId;
 		if (veh->IsBike() && (m_pVehicleAnim && vehAnim != ANIM_BIKE_KICK)) {
 			float zBlend;
@@ -6514,8 +6516,8 @@ CPed::KillCharOnFootArmed(CVector &ourPos, CVector &targetPos, CVector &distWith
 	float wepRangeAdjusted = wepRange / 3.f;
 
 	float distWithTargetSc = distWithTarget.Magnitude();
-	if (m_pedInObjective->bInVehicle && m_pedInObjective->m_nPedState != PED_DRAG_FROM_CAR) {
-		CVehicle *vehOfTarget = m_pedInObjective->m_pMyVehicle;
+	CVehicle *vehOfTarget = m_pedInObjective->m_pMyVehicle;
+	if (m_pedInObjective->bInVehicle && vehOfTarget && m_pedInObjective->m_nPedState != PED_DRAG_FROM_CAR) {
 		if (vehOfTarget->bIsInWater || vehOfTarget->GetStatus() == STATUS_PLAYER_DISABLED
 			|| m_pedInObjective->IsPlayer() && CPad::GetPad(0)->ArePlayerControlsDisabled()) {
 			SetIdle();

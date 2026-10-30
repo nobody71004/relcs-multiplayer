@@ -19,6 +19,9 @@ CAnimBlendAssociation::CAnimBlendAssociation(void)
 	animId = -1;
 	flags = 0;
 	callbackType = CB_NONE;
+	hierarchy = nil;
+	callback = nil;
+	callbackArg = nil;
 	link.Init();
 }
 
@@ -31,6 +34,8 @@ CAnimBlendAssociation::CAnimBlendAssociation(CAnimBlendAssociation &other)
 	speed = 1.0f;
 	timeStep = 0.0f;
 	callbackType = CB_NONE;
+	callback = nil;
+	callbackArg = nil;
 	link.Init();
 	Init(other);
 }

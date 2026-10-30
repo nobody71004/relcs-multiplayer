@@ -2090,8 +2090,8 @@ void CHud::SetBigMessage(wchar *message, uint16 style)
 			m_BigMessage[style][i] = message[i];
 		}
 	}
-	LastBigMessage[style][i] = 0;
-	m_BigMessage[style][i] = 0;
+	LastBigMessage[style][i < 128 ? i : 127] = 0;
+	m_BigMessage[style][i < 128 ? i : 127] = 0;
 }
 
 void CHud::SetHelpMessage(wchar *message, bool quick, bool displayForever)

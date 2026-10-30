@@ -82,8 +82,13 @@ public:
 		}
 		else if (BufSize < size)
 		{
+			// realloc frees nothing on failure; assigning the result straight back
+			// would leak the old buffer and permanently nil the pointer
+			uint16* newBuf = (uint16*)realloc(PcmBuf, size);
+			if (!newBuf)
+				return nil;
+			PcmBuf = newBuf;
 			BufSize = size;
-			PcmBuf = (uint16*)realloc(PcmBuf, size);
 		}
 		return PcmBuf;
 	}
@@ -517,7 +522,8 @@ protected:
 		m_bOpened(false),
 		m_nRate(0),
 		m_bFileNotOpenedYet(false),
-		m_nChannels(0) {}
+		m_nChannels(0),
+		m_pPath(nil) {}
 public:
 	CMP3File(const char *path) :
 		m_pMH(nil),
@@ -1233,6 +1239,7 @@ CStream::CStream(ALuint *sources, ALuint (&buffers)[NUM_STREAMBUFFERS]) :
 	m_nLoopCount(1)
 	
 {
+	memset(m_aFilename, 0, sizeof(m_aFilename));
 }
 
 bool CStream::Open(const char* filename, uint32 overrideSampleRate)

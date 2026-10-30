@@ -292,7 +292,17 @@ public:
 	static void operator delete(void*, size_t) throw();
 	static void operator delete(void*, int) throw();
 
-	CVehicle(void) {}	// FAKE
+	CVehicle(void) : pHandling(nil), pFlyingHandling(nil), pDriver(nil),
+		m_pCurGroundEntity(nil), m_pCarFire(nil),
+		m_fSteerAngle(0.0f), m_fGasPedal(0.0f), m_fBrakePedal(0.0f),
+		m_fWheelSpin(0.0f), m_fHealth(0.0f), m_fEngineEnergy(0.0f), m_fChangeGearTime(0.0f),
+		m_pBlowUpEntity(nil), m_fMapObjectHeightAhead(0.0f), m_fMapObjectHeightBehind(0.0f),
+		m_nDoorLock(CARLOCK_NOT_USED), m_pLastDamageEntity(nil),
+		m_bSirenOrAlarm(false), m_fSteerInput(0.0f), m_bSuperBrake(false)	// FAKE
+	{
+		for (int i = 0; i < 8; i++)
+			pPassengers[i] = nil;
+	}
 	CVehicle(uint8 CreatedBy);
 	~CVehicle(void);
 	// from CEntity

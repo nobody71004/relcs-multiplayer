@@ -9,7 +9,7 @@ public:
 	int firstInstance;
 	int lastInstance;
 public:
-	CMloModelInfo(void) : CClumpModelInfo(MITYPE_MLO) {}
+	CMloModelInfo(void) : CClumpModelInfo(MITYPE_MLO), drawDist(0.0f), firstInstance(0), lastInstance(0) {}
 	void ConstructClump();
 
 	virtual void RcWriteThis(base::cRelocatableChunkWriter &writer);

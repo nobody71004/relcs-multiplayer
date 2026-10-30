@@ -173,9 +173,15 @@ int8 CRunningScript::ProcessCommands500To599(int32 command)
 		CollectParameters(&m_nIp, 2);
 		CPed* pSourcePed = CPools::GetPedPool()->GetAt(GET_INTEGER_PARAM(0));
 		CPed* pTargetPed = CPools::GetPedPool()->GetAt(GET_INTEGER_PARAM(1));
+		if (pSourcePed == nil || pTargetPed == nil)
+			return 0;
 		CVehicle* pVehicle = pSourcePed->bInVehicle ? pSourcePed->m_pMyVehicle : nil;
-		CVector2D sourcePos = pSourcePed->bInVehicle ? pVehicle->GetPosition() : pSourcePed->GetPosition();
-		CVector2D targetPos = pTargetPed->bInVehicle ? pTargetPed->m_pMyVehicle->GetPosition() : pTargetPed->GetPosition();
+		CVector2D sourcePos = pVehicle ? pVehicle->GetPosition() : pSourcePed->GetPosition();
+		CVector2D targetPos;
+		if (pTargetPed->bInVehicle && pTargetPed->m_pMyVehicle)
+			targetPos = pTargetPed->m_pMyVehicle->GetPosition();
+		else
+			targetPos = pTargetPed->GetPosition();
 		float angle = CGeneral::GetATanOfXY(sourcePos.x - targetPos.x, sourcePos.y - targetPos.y) + HALFPI;
 		if (angle > TWOPI)
 			angle -= TWOPI;
@@ -191,9 +197,15 @@ int8 CRunningScript::ProcessCommands500To599(int32 command)
 		CollectParameters(&m_nIp, 2);
 		CPed* pSourcePed = CPools::GetPedPool()->GetAt(GET_INTEGER_PARAM(0));
 		CPed* pTargetPed = CWorld::Players[GET_INTEGER_PARAM(1)].m_pPed;
+		if (pSourcePed == nil || pTargetPed == nil)
+			return 0;
 		CVehicle* pVehicle = pSourcePed->bInVehicle ? pSourcePed->m_pMyVehicle : nil;
-		CVector2D sourcePos = pSourcePed->bInVehicle ? pVehicle->GetPosition() : pSourcePed->GetPosition();
-		CVector2D targetPos = pTargetPed->bInVehicle ? pTargetPed->m_pMyVehicle->GetPosition() : pTargetPed->GetPosition();
+		CVector2D sourcePos = pVehicle ? pVehicle->GetPosition() : pSourcePed->GetPosition();
+		CVector2D targetPos;
+		if (pTargetPed->bInVehicle && pTargetPed->m_pMyVehicle)
+			targetPos = pTargetPed->m_pMyVehicle->GetPosition();
+		else
+			targetPos = pTargetPed->GetPosition();
 		float angle = CGeneral::GetATanOfXY(sourcePos.x - targetPos.x, sourcePos.y - targetPos.y) + HALFPI;
 		if (angle > TWOPI)
 			angle -= TWOPI;
@@ -209,9 +221,15 @@ int8 CRunningScript::ProcessCommands500To599(int32 command)
 		CollectParameters(&m_nIp, 2);
 		CPed* pSourcePed = CWorld::Players[GET_INTEGER_PARAM(0)].m_pPed;
 		CPed* pTargetPed = CPools::GetPedPool()->GetAt(GET_INTEGER_PARAM(1));
+		if (pSourcePed == nil || pTargetPed == nil)
+			return 0;
 		CVehicle* pVehicle = pSourcePed->bInVehicle ? pSourcePed->m_pMyVehicle : nil;
-		CVector2D sourcePos = pSourcePed->bInVehicle ? pVehicle->GetPosition() : pSourcePed->GetPosition();
-		CVector2D targetPos = pTargetPed->bInVehicle ? pTargetPed->m_pMyVehicle->GetPosition() : pTargetPed->GetPosition();
+		CVector2D sourcePos = pVehicle ? pVehicle->GetPosition() : pSourcePed->GetPosition();
+		CVector2D targetPos;
+		if (pTargetPed->bInVehicle && pTargetPed->m_pMyVehicle)
+			targetPos = pTargetPed->m_pMyVehicle->GetPosition();
+		else
+			targetPos = pTargetPed->GetPosition();
 		float angle = CGeneral::GetATanOfXY(sourcePos.x - targetPos.x, sourcePos.y - targetPos.y) + HALFPI;
 		if (angle > TWOPI)
 			angle -= TWOPI;

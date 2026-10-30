@@ -314,6 +314,15 @@ IsThisTrackAt16KHz(uint32 track)
 cSampleManager::cSampleManager(void)
 {
 	;
+
+	memset(m_szCDRomRootPath, 0, sizeof(m_szCDRomRootPath));
+	memset(m_MiscomPath, 0, sizeof(m_MiscomPath));
+	memset(m_WavFilesPath, 0, sizeof(m_WavFilesPath));
+	memset(m_MP3FilesPath, 0, sizeof(m_MP3FilesPath));
+	for (int i = 0; i < MAXPROVIDERS; i++)
+		m_aAudioProviders[i] = nil;
+	for (int i = 0; i < (int)(sizeof(m_aChannels) / sizeof(m_aChannels[0])); i++)
+		m_aChannels[i] = nil;
 }
 
 cSampleManager::~cSampleManager(void)
@@ -1134,18 +1143,24 @@ cSampleManager::Initialise(void)
 			for ( int32 i = randval % nNumMP3s; i > 0; --i)
 				randmp3 = randmp3->pNext;
 			
-			if ( bUseRandomTable )
-				_CurMP3Pos = AudioManager.m_anRandomTable[0]     % randmp3->nTrackLength;
-			else
+			// an MP3 that could not be opened has length 0, and x modulo 0 is undefined
+			if ( randmp3->nTrackLength > 0 )
 			{
-				if ( localtm->tm_sec > 0 )
-				{
-					int32 s = localtm->tm_sec;
-					_CurMP3Pos = s*s*s*s*s*s*s*s                 % randmp3->nTrackLength;
-				}
+				if ( bUseRandomTable )
+					_CurMP3Pos = AudioManager.m_anRandomTable[0]     % randmp3->nTrackLength;
 				else
-					_CurMP3Pos = AudioManager.m_anRandomTable[0] % randmp3->nTrackLength;
+				{
+					if ( localtm->tm_sec > 0 )
+					{
+						int32 s = localtm->tm_sec;
+						_CurMP3Pos = s*s*s*s*s*s*s*s                 % randmp3->nTrackLength;
+					}
+					else
+						_CurMP3Pos = AudioManager.m_anRandomTable[0] % randmp3->nTrackLength;
+				}
 			}
+			else
+				_CurMP3Pos = 0;
 		}
 		else
 			_CurMP3Pos = 0;
@@ -1765,7 +1780,8 @@ cSampleManager::SetChannelPan(uint32 nChannel, uint32 nPan)
 	ASSERT( nChannel >= MAXCHANNELS );
 	ASSERT( nChannel < NUM_CHANNELS );
 	
-	if ( nChannel >= CHANNEL_POLICE_RADIO )
+	// ASSERT compiles out in release; keep the array access provably in bounds
+	if ( nChannel >= CHANNEL_POLICE_RADIO && nChannel < NUM_CHANNELS )
 	{
 		aChannel[nChannel].SetPan(nPan);
 	}

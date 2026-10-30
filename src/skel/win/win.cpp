@@ -317,6 +317,27 @@ psMouseSetPos(RwV2d *pos)
 /*
  *****************************************************************************
  */
+void
+_InputSetCursorFree(bool free)
+{
+	if ( free )
+	{
+		// the engine's WM_SETCURSOR shows the arrow, but a DirectInput capture
+		// or a clip rect would still pin the pointer
+		while ( ShowCursor(TRUE) < 0 ) {}
+		if ( GetCapture() == PSGLOBAL(window) )
+			ReleaseCapture();
+		ClipCursor(nil);
+	}
+	else
+	{
+		while ( ShowCursor(FALSE) >= 0 ) {}
+	}
+}
+
+/*
+ *****************************************************************************
+ */
 RwMemoryFunctions*
 psGetMemoryFunctions(void)
 {
@@ -1586,13 +1607,101 @@ psSelectDevice()
 	RwEngineGetVideoModeInfo(&vm, GcurSelVM);
 
 #ifdef IMPROVED_VIDEOMODE
-	if (FrontEndMenuManager.m_nPrefsWindowed)
-		GcurSelVM = bestWndMode;
+	// The video mode list mixes the desktop entry (not rwVIDEOMODEEXCLUSIVE)
+	// with the exclusive fullscreen modes. Screen Mode used to pass the current
+	// index straight through, so switching to Fullscreen while the desktop entry
+	// was selected recreated another window and the game never left windowed
+	// mode. Resolve the index against the requested state instead.
+	{
+		RwInt32 n = RwEngineGetNumVideoModes();
+		RwVideoMode m;
+		bool wantWindowed = FrontEndMenuManager.m_nPrefsWindowed != 0;
 
-	// Now GcurSelVM is 0 but vm has sizes(and fullscreen flag) of the video mode we want, that's why we changed the rwVIDEOMODEEXCLUSIVE conditions below
-	FrontEndMenuManager.m_nPrefsWidth = vm.width;
-	FrontEndMenuManager.m_nPrefsHeight = vm.height;
-	FrontEndMenuManager.m_nPrefsDepth = vm.depth;
+		RwEngineGetVideoModeInfo(&m, GcurSelVM);
+		bool isWindowedMode = !(m.flags & rwVIDEOMODEEXCLUSIVE);
+
+		if (wantWindowed != isWindowedMode && n > 0)
+		{
+			RwInt32 pick = -1;
+			RwInt32 bestArea = 0;
+			RwInt32 smallestArea = 0, smallest = -1;
+
+			for (RwInt32 i = 0; i < n; i++)
+			{
+				RwEngineGetVideoModeInfo(&m, i);
+
+				if (wantWindowed)
+				{
+					if (!(m.flags & rwVIDEOMODEEXCLUSIVE)) { pick = i; break; }
+					continue;
+				}
+
+				if (!(m.flags & rwVIDEOMODEEXCLUSIVE))
+					continue;
+
+				RwInt32 area = (RwInt32)m.width * (RwInt32)m.height;
+				if (smallest < 0 || area < smallestArea)
+				{
+					smallest = i;
+					smallestArea = area;
+				}
+				if (m.width <= FrontEndMenuManager.m_nPrefsWidth &&
+				    m.height <= FrontEndMenuManager.m_nPrefsHeight && area >= bestArea)
+				{
+					bestArea = area;
+					pick = i;
+				}
+			}
+
+			// no exclusive mode fits the requested size: take the smallest one
+			if (pick < 0) pick = smallest;
+			if (pick >= 0) GcurSelVM = pick;
+		}
+
+		if (wantWindowed)
+			bestWndMode = GcurSelVM;
+
+		RwEngineGetVideoModeInfo(&vm, GcurSelVM);
+		printf("[video] %s -> mode %d (%dx%d, %s)\n",
+		       wantWindowed ? "windowed" : "fullscreen", GcurSelVM, vm.width, vm.height,
+		       (vm.flags & rwVIDEOMODEEXCLUSIVE) ? "exclusive" : "desktop");
+
+		// _psGetVideoModeList() has no label for the desktop entry, and the
+		// graphics menu dereferences that label: keep the saved resolution on a
+		// real fullscreen entry while the renderer uses the windowed mode.
+		if (vm.flags & rwVIDEOMODEEXCLUSIVE)
+		{
+			FrontEndMenuManager.m_nPrefsVideoMode = GcurSelVM;
+			FrontEndMenuManager.m_nDisplayVideoMode = GcurSelVM;
+			FrontEndMenuManager.m_nPrefsWidth = vm.width;
+			FrontEndMenuManager.m_nPrefsHeight = vm.height;
+			FrontEndMenuManager.m_nPrefsDepth = vm.depth;
+		}
+		else
+		{
+			RwVideoMode saved;
+			RwEngineGetVideoModeInfo(&saved, FrontEndMenuManager.m_nPrefsVideoMode);
+			if (!(saved.flags & rwVIDEOMODEEXCLUSIVE))
+			{
+				RwInt32 fallback = -1;
+				RwInt32 bestArea = -1;
+				for (RwInt32 i = 0; i < n; i++)
+				{
+					RwEngineGetVideoModeInfo(&saved, i);
+					if (!(saved.flags & rwVIDEOMODEEXCLUSIVE)) continue;
+					RwInt32 area = (RwInt32)saved.width * (RwInt32)saved.height;
+					if (saved.width <= FrontEndMenuManager.m_nPrefsWidth &&
+					    saved.height <= FrontEndMenuManager.m_nPrefsHeight && area > bestArea)
+					{
+						bestArea = area;
+						fallback = i;
+					}
+				}
+				if (fallback >= 0)
+					FrontEndMenuManager.m_nPrefsVideoMode = FrontEndMenuManager.m_nDisplayVideoMode = fallback;
+			}
+		}
+	}
 #endif
 
 #ifndef PS2_MENU
@@ -2036,6 +2145,7 @@ void HandleExit()
 /*
  *****************************************************************************
  */
+
 int PASCAL
 WinMain(HINSTANCE instance, 
 		HINSTANCE prevInstance	__RWUNUSED__, 

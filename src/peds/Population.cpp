@@ -1387,7 +1387,7 @@ CPopulation::ChooseCivilianCoupleOccupations(int32 group, int32& man, int32& wom
 			model = ms_pPedGroups[group].models[i];
 			if (IsFemale(model)) {
 				CPedModelInfo* womanModelInfo = (CPedModelInfo*)CModelInfo::GetModelInfo(model);
-				if (womanModelInfo->m_pedType == PEDTYPE_CIVFEMALE) {
+				if (womanModelInfo && womanModelInfo->m_pedType == PEDTYPE_CIVFEMALE) {
 					CPedModelInfo* manModelInfo = (CPedModelInfo*)CModelInfo::GetModelInfo(man);
 
 					// If both are skater or not, finalize the decision

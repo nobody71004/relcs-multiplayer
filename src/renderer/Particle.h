@@ -34,7 +34,10 @@ public:
 
 	CParticle()
 	{
-		;
+		m_fZGround = 0.0f;
+		m_fSize = 0.0f;
+		m_fExpansionRate = 0.0f;
+		m_pNext = nil;
 	}
 		
 	~CParticle()

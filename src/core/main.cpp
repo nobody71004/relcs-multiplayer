@@ -575,7 +575,14 @@ LoadSplash(const char *name)
 	char filename[140];
 	RwTexture *tex = nil;
 
+	static char failedSplash[64];
+
 	if(name == nil)
+		return &splash;
+	// a splash dictionary that is not on disk must not be re-opened every frame:
+	// try each name once, remember the failure, and draw nothing until another
+	// name is asked for. Without this a missing TXD folder stalls startup forever.
+	if(strcmp(name, failedSplash) == 0)
 		return &splash;
 	if(splashTxdId == -1)
 		splashTxdId = CTxdStore::AddTxdSlot("splash");
@@ -587,12 +594,17 @@ LoadSplash(const char *name)
 
 	if(tex == nil){
 		CFileMgr::SetDir("TXD\\");
-		sprintf(filename, "%s.txd", name);
+		snprintf(filename, sizeof(filename), "%s.txd", name);
 		if(splash.m_pTexture)
 			splash.Delete();
 		if(txd)
 			CTxdStore::RemoveTxd(splashTxdId);
-		CTxdStore::LoadTxd(splashTxdId, filename);
+		if(!CTxdStore::LoadTxd(splashTxdId, filename)){
+			snprintf(failedSplash, sizeof(failedSplash), "%s", name);
+			CFileMgr::SetDir("");
+			return &splash;
+		}
+		failedSplash[0] = '\0';
 		CTxdStore::AddRef(splashTxdId);
 		CTxdStore::PushCurrentTxd();
 		CTxdStore::SetCurrentTxd(splashTxdId);
@@ -1732,7 +1744,33 @@ void
 InitialiseGame(void)
 {
 	LoadingScreen(nil, nil, "loadsc0");
-	CGame::Initialise("DATA\\GTA_VC.DAT");
+
+	// The level description ships under different names in different data sets,
+	// so pick the first one that is actually there rather than aborting on a
+	// hard-coded name.
+	static const char *aDatNames[] = {
+		"DATA\\GTA_VC.DAT",
+		"DATA\\GTA_LCS.DAT",
+		"DATA\\GTA3.DAT",
+		nil
+	};
+	const char *datFile = nil;
+	for (int n = 0; aDatNames[n]; n++) {
+		int fd = CFileMgr::OpenFile(aDatNames[n], "r");
+		if (fd > 0) {
+			CFileMgr::CloseFile(fd);
+			datFile = aDatNames[n];
+			break;
+		}
+	}
+
+	if (datFile == nil) {
+		re3_usererror("Cannot find the level description.\n"
+			"Expected DATA\\GTA_VC.DAT, DATA\\GTA_LCS.DAT or DATA\\GTA3.DAT.");
+		return;
+	}
+
+	CGame::Initialise(datFile);
 }
 
 RsEventStatus

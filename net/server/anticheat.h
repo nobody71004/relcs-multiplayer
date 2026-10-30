@@ -37,8 +37,10 @@ public:
 	using LogFn = std::function<void(const std::string& line)>;
 	// EOS wants to send AC traffic to a client (handle = what we registered).
 	using MessageToClientFn = std::function<void(void* handle, const void* data, uint32_t len)>;
-	// EOS says the client must be removed from the session.
-	using ActionRequiredFn = std::function<void(void* handle, int action, const char* reason)>;
+	// EOS says the client must be removed from the session. reasonCode is the
+	// EOS_EAntiCheatCommonClientActionReason value (2 = InvalidMessage,
+	// 3 = AuthenticationFailed, 6/7 = client/backend violation ...).
+	using ActionRequiredFn = std::function<void(void* handle, int action, int reasonCode, const char* reason)>;
 	// Is that handle still connected? (a registration may complete after the
 	// peer already left — registering a dead peer would leak a session slot)
 	using StillConnectedFn = std::function<bool(void* handle)>;

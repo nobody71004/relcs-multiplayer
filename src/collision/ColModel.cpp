@@ -23,7 +23,9 @@ CColModel::CColModel(void)
 	triangles = nil;
 	trianglePlanes = nil;
 	level = LEVEL_GENERIC;	// generic col slot
-//	ownsCollisionVolumes = true;
+	// a default-constructed model owns the arrays it allocates; RemoveCollisionVolumes
+	// gates every delete[] on this flag, so leaving it uninitialised was a coin flip
+	ownsCollisionVolumes = true;
 }
 
 CColModel::~CColModel(void)
@@ -129,6 +131,13 @@ CColModel::operator=(const CColModel &other)
 	int i;
 	int numVerts;
 
+	// without this, `a = a` deletes the very buffers it is about to copy from
+	if (this == &other)
+		return *this;
+
+	level = other.level;
+	ownsCollisionVolumes = other.ownsCollisionVolumes;
+
 	boundingSphere = other.boundingSphere;
 	boundingBox = other.boundingBox;
 
@@ -227,6 +236,9 @@ CColModel::operator=(const CColModel &other)
 		delete[] vertices;
 		vertices = nil;
 	}
+	// trianglePlanes is a cache built from `triangles`; it is stale as soon as we
+	// replace them, and must be rebuilt lazily rather than left pointing at freed data
+	RemoveTrianglePlanes();
 	return *this;
 }
 

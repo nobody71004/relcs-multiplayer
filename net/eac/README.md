@@ -105,14 +105,38 @@ them the client logs `[ac] sdk-missing` in `eos-ac.log` and plays unprotected.
 
 ### Protected clients only
 
-`ac_require = 1` (default) removes a peer that has not registered inside
-`ac_grace` seconds; `ac_failopen = 1` (default) keeps the server playable when
-its own session cannot start. Set `ac_failopen = 0` for the strict deployment:
-with no live session the server then refuses joins up front.
+`ac_require = 0` is the default. A protected peer still registers with the
+session, but enforcement is opt-in because of the identity requirement below.
+`ac_require = 1` removes a peer that has not registered inside `ac_grace`
+seconds; `ac_failopen = 1` (default) keeps the server playable when its own
+session cannot start. Set `ac_failopen = 0` for the strict deployment: with no
+live session the server then refuses joins up front.
 
 ```
-ac status                 # require=1 enforced=1 grace=30s failOpen=1 registered=2 rejected=0
+ac status                 # require=0 enforced=0 grace=30s failOpen=1 registered=1 rejected=0
 ```
+
+### Stable identity (why enforcement defaults off)
+
+Epic refuses EOS **device-ID** users for anti-cheat:
+
+```
+errors.com.epicgames.eos.eac.deviceid_not_supported
+    DeviceID is not supported for anti-cheat since it requires a stable account identity
+```
+
+The shipped game logs in with a device ID, so its AC client registers, the
+backend then asks the server to remove it (`action=1 reason=2`, InvalidMessage).
+That is an identity limitation, not a cheat verdict: the server logs
+`could not be authenticated by EOS — keeping the player`, unregisters the AC
+slot and keeps the connection in the game. A real anti-cheat verdict
+(`reason` 6/7, ClientViolation / BackendViolation) still kicks when
+`eac_kick=1`.
+
+To enable `ac_require=1`, clients must authenticate with an Epic Account Portal
+(or Steam and similar) identity before `EOS_Connect_Login`, and pass that ID
+token to the AC client. Until then, keep enforcement off so players are not
+removed 6 seconds after joining.
 
 `enforced=0` with `SUSPENDED(server-side config)` means EOS refused every
 registration (the 403 below) and the policy turned itself off instead of

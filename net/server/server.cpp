@@ -1437,7 +1437,7 @@ void Server::InitAntiCheat()
 	m_ac.SetLog([this](const std::string& line){ Log("%s", line.c_str()); });
 	m_ac.SetCallbacks(
 	    [this](void* handle, const void* data, uint32_t len){ OnAcMessageToClient(handle, data, len); },
-	    [this](void* handle, int action, const char* reason){ OnAcActionRequired(handle, action, reason); },
+	    [this](void* handle, int action, int reasonCode, const char* reason){ OnAcActionRequired(handle, action, reasonCode, reason); },
 	    [this](void* handle){ return PlayerForHandle(handle) != nullptr; },
 	    [this](void* handle, int status, const std::string& detail){ OnAcRegisterResult(handle, status, detail); });
 
@@ -1489,11 +1489,25 @@ void Server::OnAcMessageToClient(void* handle, const void* data, uint32_t len)
 	SendTo(p->peer, w, CHAN_RELIABLE, true);
 }
 
-void Server::OnAcActionRequired(void* handle, int action, const char* reason)
+void Server::OnAcActionRequired(void* handle, int action, int reasonCode, const char* reason)
 {
 	ServerPlayer* p = PlayerForHandle(handle);
 	if(!p) return;
 	const char* why = (reason && *reason) ? reason : "EOS anti-cheat removed this client";
+
+	// reasons 1-5 are session/protocol failures (invalid message, auth failed,
+	// heartbeat timeout ...), not a cheat verdict. Epic refuses device-ID
+	// identities this way ("DeviceID is not supported for anti-cheat"), so
+	// kicking here would remove every legitimate player of the shipped client.
+	// Only the violation/banned codes (6-10) count as a verdict.
+	const bool verdict = (reasonCode >= 6 && reasonCode <= 10);
+	if(!verdict){
+		Log("[EAC] %s could not be authenticated by EOS (action=%d reason=%d): %s — keeping the player",
+		    p->name.c_str(), action, reasonCode, why);
+		SendChatTo(p->id, "[EAC] this client could not be verified by EOS anti-cheat");
+		m_ac.UnregisterClient(handle);
+		return;
+	}
 
 	if(!m_cfg.ac.kickOnViolation){
 		Log("[EAC] %s flagged (action=%d): %s [kicks disabled]", p->name.c_str(), action, why);

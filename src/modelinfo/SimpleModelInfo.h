@@ -43,8 +43,14 @@ public:
 	static base::cRelocatableChunkClassInfo msClassInfo;
 	static CSimpleModelInfo msClassInstance;
 
-	CSimpleModelInfo(void) : CBaseModelInfo(MITYPE_SIMPLE) {}
-	CSimpleModelInfo(ModelInfoType id) : CBaseModelInfo(id) {}
+	CSimpleModelInfo(void) : CBaseModelInfo(MITYPE_SIMPLE), m_atomics(nil), m_relatedModel(nil)
+	{
+		m_lodDistances[0] = m_lodDistances[1] = m_lodDistances[2] = 0.0f;
+	}
+	CSimpleModelInfo(ModelInfoType id) : CBaseModelInfo(id), m_atomics(nil), m_relatedModel(nil)
+	{
+		m_lodDistances[0] = m_lodDistances[1] = m_lodDistances[2] = 0.0f;
+	}
 	~CSimpleModelInfo() {}
 	void DeleteRwObject(void);
 	RwObject *CreateInstance(void);

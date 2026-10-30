@@ -68,7 +68,12 @@ public:
 	
 
     CStoredShadow()
-	{  }
+	{
+		m_fZDistance = 0.0f;
+		m_fScale = 0.0f;
+		m_pTexture = nil;
+		m_pCutsceneShadow = nil;
+	}
 };
 
 VALIDATE_SIZE(CStoredShadow, 0x30);
@@ -83,7 +88,9 @@ public:
 	uint8 m_aV[7];
 
     CPolyBunch()
-	{  }
+	{
+		m_pNext = nil;
+	}
 };
 
 VALIDATE_SIZE(CPolyBunch, 0x6C);
@@ -111,7 +118,15 @@ public:
 	
 
 	CStaticShadow()
-	{  }
+	{
+		m_pPolyBunch = nil;
+		m_fZDistance = 0.0f;
+		m_fScale = 0.0f;
+		m_pTexture = nil;
+		m_bJustCreated = false;
+		m_bRendered = false;
+		m_bTemp = false;
+	}
 
 	void Free();
 };
@@ -136,7 +151,11 @@ public:
 	uint8 m_nBlue;
 
 	CPermanentShadow()
-	{  }
+	{
+		m_fZDistance = 0.0f;
+		m_fScale = 0.0f;
+		m_pTexture = nil;
+	}
 };
 
 VALIDATE_SIZE(CPermanentShadow, 0x38);

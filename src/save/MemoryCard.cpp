@@ -177,6 +177,11 @@ CMemoryCardInfo::CMemoryCardInfo(void)
 	type = 0;
 	free = 0;
 	format = 0;
+
+	// the card file table was read during enumeration before anything wrote it
+	port = 0;
+	slot = 0;
+	memset(&table, 0, sizeof(table));
 	
 	for ( int32 i = 0; i < sizeof(dir); i++ )
 		dir[i] = '\0';
@@ -221,6 +226,26 @@ CMemoryCard::CMemoryCard(void)
 	TimeStartedCountingForFade = 0;
 	TimeToStayFadedBeforeFadeOut = 1750;
 	b_FoundRecentSavedGameWantToLoad = false;
+
+	// these were previously left as garbage until a card was enumerated;
+	// the name buffers and slot table were read by the menu before that
+	_unk1 = 0;
+	pErrorMsg = nil;
+	_bunk5 = false;
+	_bunk6 = false;
+	_bunk8 = false;
+	nError = NO_ERR_SUCCESS;
+	m_LanguageToLoad = 0;
+	m_LevelToLoad = 0;
+	memset(ValidSaveName, 0, sizeof(ValidSaveName));
+	memset(MostRecentFile, 0, sizeof(MostRecentFile));
+	memset(SaveFileNameJustSaved, 0, sizeof(SaveFileNameJustSaved));
+	memset(LoadFileName, 0, sizeof(LoadFileName));
+	memset(_unk4, 0, sizeof(_unk4));
+	memset(_unk10, 0, sizeof(_unk10));
+	memset(_pad0, 0, sizeof(_pad0));
+	memset(_pad1, 0, sizeof(_pad1));
+	memset(Slots, 0, sizeof(Slots)); // SLOT_EMPTY == 0
 	
 	char date[64];
 	char time[64];

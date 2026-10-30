@@ -87,10 +87,10 @@ void
 cprintf(char* format, ...)
 {
 	char s[256];
-	va_list vl1, vl2;
+	va_list vl1;
 
 	va_start(vl1, format);
-	va_copy(vl2, vl1);
-	vsprintf(s, format, vl1);
+	vsnprintf(s, sizeof(s), format, vl1);
+	va_end(vl1);
 	TheConsole.AddLine(s, 255, 255, 128);
 }

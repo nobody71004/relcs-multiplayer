@@ -10,6 +10,7 @@ CAnimBlendSequence::CAnimBlendSequence(void)
 	keyFrames = nil;
 	keyFramesCompressed = nil;
 	boneTag = -1;
+	memset(name, 0, sizeof(name));
 }
 
 CAnimBlendSequence::~CAnimBlendSequence(void)

@@ -12,9 +12,8 @@ const char *ParticleFilename = "PARTICLE.CFG";
 
 cParticleSystemMgr::cParticleSystemMgr()
 {
-#ifdef FIX_BUGS
+	// always initialise: the FIX_BUGS destructor deletes this pointer
 	m_aParticles = nil;
-#endif
 }
 
 #ifdef FIX_BUGS

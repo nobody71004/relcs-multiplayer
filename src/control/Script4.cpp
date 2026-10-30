@@ -2244,10 +2244,10 @@ int32 CTheScripts::AddScriptSphere(int32 id, CVector pos, float radius)
 		if (!ScriptSphereArray[i].m_bInUse)
 			break;
 	}
-#ifdef FIX_BUGS
+	// the FIX_BUGS-off build fell through here and wrote
+	// ScriptSphereArray[MAX_NUM_SCRIPT_SPHERES], one past the array
 	if (i == MAX_NUM_SCRIPT_SPHERES)
 		return -1;
-#endif
 	ScriptSphereArray[i].m_bInUse = true;
 	ScriptSphereArray[i].m_Id = id;
 	ScriptSphereArray[i].m_vecCenter = pos;

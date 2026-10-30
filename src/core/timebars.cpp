@@ -52,6 +52,8 @@ void tbInit()
 
 void tbStartTimer(int32 unk, Const char *name)
 {
+	if (TimerBar.count >= MAX_TIMERS)
+		return;
 	strcpy(TimerBar.Timers[TimerBar.count].name, name);
 	TimerBar.Timers[TimerBar.count].unk = unk;
 	TimerBar.Timers[TimerBar.count].startTime = (float)CTimer::GetCurrentTimeInCycles() / (float)CTimer::GetCyclesPerFrame();
@@ -65,7 +67,10 @@ void tbEndTimer(Const char* name)
 		if (strcmp(name, TimerBar.Timers[i].name) == 0)
 			n = i;
 	}
-	assert(n != 1500);
+	// assert() is compiled out in release, where this used to end a timer at
+	// Timers[1500] for any name that was never started
+	if (n == 1500)
+		return;
 	TimerBar.Timers[n].endTime = (float)CTimer::GetCurrentTimeInCycles() / (float)CTimer::GetCyclesPerFrame();
 }
 

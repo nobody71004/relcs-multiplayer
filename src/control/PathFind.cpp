@@ -128,11 +128,11 @@ CPedPath::CalcPedRoute(int8 pathType, CVector position, CVector destination, CVe
 		const uint8 nodeIdY = pPathNode->nodeIdY;
 		if (nodeIdX > 0 && pathNodes[nodeIdX - 1][nodeIdY].id + 5 == pPathNode->id) 
 			pPathNode = &pathNodes[nodeIdX - 1][nodeIdY];
-		else if (nodeIdX > 39 && pathNodes[nodeIdX + 1][nodeIdY].id + 5 == pPathNode->id)
+		else if (nodeIdX < 39 && pathNodes[nodeIdX + 1][nodeIdY].id + 5 == pPathNode->id)
 			pPathNode = &pathNodes[nodeIdX + 1][nodeIdY];
 		else if (nodeIdY > 0 && pathNodes[nodeIdX][nodeIdY - 1].id + 5 == pPathNode->id) 
 			pPathNode = &pathNodes[nodeIdX][nodeIdY - 1];
-		else if (nodeIdY > 39 && pathNodes[nodeIdX][nodeIdY + 1].id + 5 == pPathNode->id) 
+		else if (nodeIdY < 39 && pathNodes[nodeIdX][nodeIdY + 1].id + 5 == pPathNode->id) 
 			pPathNode = &pathNodes[nodeIdX][nodeIdY + 1];
 		else if (nodeIdX > 0 && nodeIdY > 0 && pathNodes[nodeIdX - 1][nodeIdY - 1].id + 7 == pPathNode->id)
 			pPathNode = &pathNodes[nodeIdX - 1][nodeIdY - 1];

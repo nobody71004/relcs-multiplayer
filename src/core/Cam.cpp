@@ -1803,8 +1803,17 @@ CCam::Process_Cam_On_A_String(const CVector &CameraTarget, float TargetOrientati
 
 	// mouse orbit state: held until the player looks behind / looks sideways or re-enters the car
 	static bool s_camOrbitHeld = false;
-	if(ResetStatics)
+	// The orbit is kept as absolute state (angle + radius) captured when the
+	// drag starts. Rotating the frame's already-adjusted Source instead fed the
+	// height/obstruction corrections back into the next frame's angle and
+	// distance, which the player sees as the camera bobbing while they orbit.
+	static float s_camOrbitBeta = 0.0f;
+	static float s_camOrbitDist = 0.0f;
+	if(ResetStatics){
 		s_camOrbitHeld = false;
+		s_camOrbitBeta = 0.0f;
+		s_camOrbitDist = 0.0f;
+	}
 	CPad *orbitPad = CPad::GetPad(0);
 	bool orbitLookingAway = orbitPad->GetLookBehindForCar() || orbitPad->GetLookBehindForPed() || orbitPad->GetLookLeft() || orbitPad->GetLookRight();
 	if(orbitLookingAway)
@@ -1858,18 +1867,26 @@ CCam::Process_Cam_On_A_String(const CVector &CameraTarget, float TargetOrientati
 	if (orbitAllowed) {
 		float orbitMouseX = orbitPad->GetMouseX() * -2.0f;
 		if (orbitMouseX != 0.0f) {
-			float orbitDist = (Source - TargetCoors).Magnitude2D();
-			float orbitBeta = CGeneral::GetATanOfXY(Source.x - TargetCoors.x, Source.y - TargetCoors.y);
-			orbitBeta += orbitMouseX * FOV / 80.0f * TheCamera.m_fMouseAccelHorzntl;
-			Source.x = TargetCoors.x + Cos(orbitBeta) * orbitDist;
-			Source.y = TargetCoors.y + Sin(orbitBeta) * orbitDist;
+			if (!s_camOrbitHeld) {
+				// freeze the radius for the whole drag: recomputing it from the
+				// camera each frame makes the view pulse in and out
+				s_camOrbitBeta = CGeneral::GetATanOfXY(Source.x - TargetCoors.x, Source.y - TargetCoors.y);
+				s_camOrbitDist = (Source - TargetCoors).Magnitude2D();
+				if (s_camOrbitDist < 1.0f) s_camOrbitDist = BaseDist;
+			}
+			s_camOrbitBeta += orbitMouseX * FOV / 80.0f * TheCamera.m_fMouseAccelHorzntl;
 			s_camOrbitHeld = true;
 		}
+		if (s_camOrbitHeld) {
+			// horizontal only: z stays exactly where the height pass put it, so
+			// the mouse cannot make the camera climb or dip
+			Source.x = TargetCoors.x + Cos(s_camOrbitBeta) * s_camOrbitDist;
+			Source.y = TargetCoors.y + Sin(s_camOrbitBeta) * s_camOrbitDist;
+			TheCamera.m_bCamDirectlyBehind = false;
+			TheCamera.m_bCamDirectlyInFront = false;
+		}
 	}
-	if (orbitAllowed && s_camOrbitHeld) {
-		TheCamera.m_bCamDirectlyBehind = false;
-		TheCamera.m_bCamDirectlyInFront = false;
-	} else {
+	if (!(orbitAllowed && s_camOrbitHeld)) {
 		RotCamIfInFrontCar(TargetCoors, TargetOrientation);
 	}
 	FixCamWhenObscuredByVehicle(TargetCoors);

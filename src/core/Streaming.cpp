@@ -496,6 +496,28 @@ CStreaming::LoadCdDirectory(const char *dirname, int n)
 	CFileMgr::CloseFile(fd);
 }
 
+// A stream whose data is not actually in the IMG can never load, and re-requesting
+// it every frame stalls whoever is waiting for it. Give up after a few attempts.
+static uint8 ms_aLoadFailures[NUMSTREAMINFO];
+
+void
+CStreaming::ReRequestModel(int32 model)
+{
+	if(model < 0 || model >= NUMSTREAMINFO)
+		return;
+
+	if(ms_aLoadFailures[model] >= 5)
+		return;
+
+	if(ms_aLoadFailures[model]++ == 0)
+		debug("Streamed asset %d failed to load, retrying\n", model);
+
+	if(ms_aLoadFailures[model] < 5)
+		RequestModel(model, ms_aInfoForModel[model].m_flags);
+	else
+		debug("Giving up on streamed asset %d after %d failed attempts\n", model, ms_aLoadFailures[model]);
+}
+
 static char*
 GetObjectName(int streamId)
 {
@@ -530,7 +552,7 @@ CStreaming::ConvertBufferToObject(int8 *buf, int32 streamId)
 	int cdsize;
 	uint32 startTime, endTime, timeDiff;
 	CBaseModelInfo *mi;
-	bool success;
+	bool success = false;
 
 	startTime = CTimer::GetCurrentTimeInCycles() / CTimer::GetCyclesPerMillisecond();
 
@@ -640,7 +662,12 @@ CStreaming::ConvertBufferToObject(int8 *buf, int32 streamId)
 			return false;
 		}
 	}else if(streamId >= STREAM_OFFSET_ANIM){
-		assert(streamId < NUMSTREAMINFO);
+		// assert() vanishes in release, which left this indexing ms_aInfoForModel unbounded
+		if(streamId >= NUMSTREAMINFO){
+			assert(0);
+			RwStreamClose(stream, &mem);
+			return false;
+		}
 		if((ms_aInfoForModel[streamId].m_flags & STREAMFLAGS_KEEP_IN_MEMORY) == 0 &&
 		   !AreAnimsUsedByRequestedModels(streamId - STREAM_OFFSET_ANIM)){
 			RemoveModel(streamId);
@@ -681,6 +708,8 @@ CStreaming::ConvertBufferToObject(int8 *buf, int32 streamId)
 	}
 
 	// Mark objects as loaded
+	if(streamId >= 0 && streamId < NUMSTREAMINFO)
+		ms_aLoadFailures[streamId] = 0;
 	if(ms_aInfoForModel[streamId].m_loadState != STREAMSTATE_STARTED){
 		ms_aInfoForModel[streamId].m_loadState = STREAMSTATE_LOADED;
 #ifndef USE_CUSTOM_ALLOCATOR
@@ -703,7 +732,7 @@ CStreaming::FinishLoadingLargeFile(int8 *buf, int32 streamId)
 	RwStream *stream;
 	uint32 startTime, endTime, timeDiff;
 	CBaseModelInfo *mi;
-	bool success;
+	bool success = false;
 
 	startTime = CTimer::GetCurrentTimeInCycles() / CTimer::GetCyclesPerMillisecond();
 

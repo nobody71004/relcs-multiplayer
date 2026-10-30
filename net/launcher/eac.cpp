@@ -2,7 +2,9 @@
 #include "eac.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -37,6 +39,85 @@ bool DirExists(const std::string& p)
 {
 	DWORD a = GetFileAttributesA(p.c_str());
 	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool WriteTime(const std::string& p, FILETIME& out)
+{
+	HANDLE h = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                       nullptr, OPEN_EXISTING, 0, nullptr);
+	if(h == INVALID_HANDLE_VALUE) return false;
+	bool ok = GetFileTime(h, nullptr, nullptr, &out) != 0;
+	CloseHandle(h);
+	return ok;
+}
+
+// The integrity catalogue hashes every file under the game folder except the
+// paths/extensions listed in net/eac/integrity.cfg. It is only valid while it
+// is newer than the newest of those files: replacing cefui.dll (or any game
+// file) after signing makes EAC treat the module as tampered, and the game then
+// cannot load it — the CEF HUD silently falls back to native and EOSSDK fails.
+// Windows paths and the integrity tool are case-insensitive; the game writes
+// e.g. userfiles/SCRDBG.LOG, which must match the "log" exclusion in
+// integrity.cfg or every launch would look stale and re-sign the catalogue.
+static std::string Lower(std::string s)
+{
+	for(char& c : s) c = (char)tolower((unsigned char)c);
+	return s;
+}
+
+static bool ExcludedDir(const std::string& name)
+{
+	std::string n = Lower(name);
+	return n == "logs" || n == "screenshots" || n == "eos-cache" ||
+	       n == "licenses" || n == "localization" || n == "certificates";
+}
+
+static bool ExcludedExt(const std::string& name)
+{
+	static const char* kExt[] = {
+		".bak", ".bat", ".bmp", ".cfg", ".db", ".eac", ".ico", ".inf", ".ini",
+		".jpg", ".last", ".log", ".manifest", ".mdb", ".pdb", ".png", ".pubkey",
+		".tmp", ".txt", ".vdf", ".xml", ".zip"
+	};
+	size_t dot = name.find_last_of('.');
+	if(dot == std::string::npos) return false;   // no extension: catalogued
+	std::string ext = Lower(name.substr(dot));
+	for(const char* e : kExt) if(ext == e) return true;
+	return false;
+}
+
+static bool NewestCataloguedFile(const std::string& dir, FILETIME& newest, int depth,
+                                 std::string* newestPath = nullptr, int* scanned = nullptr)
+{
+	if(depth > 8) return false;
+	bool any = false;
+	WIN32_FIND_DATAA fd;
+	std::string pattern = dir + "\\*";
+	HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+	if(h == INVALID_HANDLE_VALUE) return false;
+	do{
+		std::string name = fd.cFileName;
+		if(name == "." || name == "..") continue;
+		std::string full = dir + "\\" + name;
+		if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY){
+			if(ExcludedDir(name)) continue;
+			if(NewestCataloguedFile(full, newest, depth + 1, newestPath, scanned)) any = true;
+			continue;
+		}
+		if(ExcludedExt(name)) continue;
+		if(scanned) (*scanned)++;
+		// Compare against the running maximum, never against this directory's
+		// own "first file": recursion means newest is shared with the parent,
+		// and resetting it per directory let an old backup folder hide a file
+		// the launcher had just refreshed.
+		if(CompareFileTime(&fd.ftLastWriteTime, &newest) > 0){
+			newest = fd.ftLastWriteTime;
+			if(newestPath) *newestPath = full;
+		}
+		any = true;
+	}while(FindNextFileA(h, &fd));
+	FindClose(h);
+	return any;
 }
 
 bool CopyTree(const std::string& from, const std::string& to)
@@ -217,6 +298,18 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 		anyCopied = anyCopied || copied;
 	}
 
+	// A signed catalogue is what lets the bootstrapper start the game at all.
+	// The package carries one signed on the build host; install it into a game
+	// folder that has none, but never replace a catalogue signed locally for a
+	// different build.
+	std::string certSrc = runtimeSrc + "\\EasyAntiCheat\\Certificates";
+	std::string certDst = acDir + "\\Certificates";
+	if(DirExists(certSrc) && !FileExists(certDst + "\\base.bin")){
+		if(!DirExists(certDst)) CreateDirectoryA(certDst.c_str(), nullptr);
+		CopyTree(certSrc, certDst);
+		anyCopied = true;
+	}
+
 	out.runtimeInstalled = runtimeOk && protOk &&
 	                       FileExists(acDir + "\\EasyAntiCheat_EOS_Setup.exe") &&
 	                       FileExists(gameDir + "\\start_protected_game.exe");
@@ -290,6 +383,28 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	out.configWritten = settingsOk && cfgOk;
 	out.integrityBuilt = FileExists(acDir + "\\Certificates\\base.bin");
 
+	// A catalogue signed before a game file changed is the most common
+	// protected-launch failure: EAC hashes the game files, the hash no longer
+	// matches what base.bin recorded, and it refuses the launch (210: Unrecognized
+	// game client) or silently refuses to load the changed module. Comparing only
+	// the executable missed exactly that case: the launcher refreshed cefui.dll
+	// after the last signing, so the protected game could not load its HUD.
+	// Compare against every file the catalogue covers, not just the exe.
+	if(out.integrityBuilt){
+		FILETIME binT{}, newest{};
+		std::string newestPath;
+		if(WriteTime(acDir + "\\Certificates\\base.bin", binT) &&
+		   NewestCataloguedFile(gameDir, newest, 0, &newestPath) &&
+		   CompareFileTime(&newest, &binT) > 0){
+			out.staleIntegrity = true;
+			out.lastError = "integrity catalogue is stale: " + newestPath +
+			                " is newer than EasyAntiCheat/Certificates/base.bin, so Easy "
+			                "Anti-Cheat refuses to load it (cefui.dll then falls back to the "
+			                "native HUD) — re-sign it with: reLCS-launcher.exe -game " +
+			                gameDir + "\\" + gameExeName + " -eacintegrity";
+		}
+	}
+
 	{
 		std::string ver = ReadFile(acDir + "\\EasyAntiCheat_EOS_Setup.exe");
 		(void)ver;
@@ -309,7 +424,7 @@ bool Prepare(const std::string& gameDir, const std::string& gameExeName, Status&
 	         "runtime=%s config=%s integrity=%s eos-sdk=%s eos-ini=%s%s%s",
 	         out.runtimeInstalled ? "ok" : "missing",
 	         out.configWritten ? "ok" : "failed",
-	         out.integrityBuilt ? "signed" : "not-built",
+	         out.integrityBuilt ? (out.staleIntegrity ? "stale" : "signed") : "not-built",
 	         out.eosSdk ? "ok" : "missing",
 	         out.eosConfig ? "ok" : "missing",
 	         anyCopied ? " (files refreshed)" : "",
@@ -346,8 +461,18 @@ bool BuildIntegrity(const std::string& gameDir, const std::string& gameExeName, 
 	std::string cfg = payload + "\\integrity.cfg";
 	std::string key = payload + "\\keys\\base_private.key";
 	std::string cert = payload + "\\keys\\base_public.cer";
-	if(!FileExists(tool) || !FileExists(key) || !FileExists(cert) || !FileExists(cfg)){
-		out.lastError = "integrity tooling missing under " + payload;
+	if(!FileExists(tool) || !FileExists(cfg)){
+		out.lastError = "integrity tool missing under " + payload +
+		                " (the release package must ship eac/devtools)";
+		return false;
+	}
+	if(!FileExists(key) || !FileExists(cert)){
+		// By design: package-release.ps1 strips the private key so a shipped
+		// launcher can never re-sign. Say that, instead of reporting the whole
+		// toolchain as missing.
+		out.lastError = "signing key not shipped (eac/keys/base_private.key is build-machine "
+		                "only) — sign the catalogue on the build host with -eacintegrity, "
+		                "then ship EasyAntiCheat/Certificates";
 		return false;
 	}
 	if(!FileExists(gameDir + "\\" + gameExeName)){
@@ -374,41 +499,121 @@ bool BuildIntegrity(const std::string& gameDir, const std::string& gameExeName, 
 		out.lastError = "integrity catalogue was not signed (see integrity.log)";
 		return false;
 	}
+	// freshly signed: Prepare() may have flagged the previous catalogue as
+	// stale, and that warning no longer applies.
+	out.lastError.clear();
+	out.staleIntegrity = false;
 	return true;
 }
 
+// True when the bootstrapper has actually spawned the game. EAC keeps its
+// splash/error UI alive for a while after a refusal, so the bootstrapper's exit
+// code alone cannot be trusted: look for a game process created after the
+// launch. The parent check covers the normal case; the creation time covers
+// EAC starting the game through its service.
+static bool GameStarted(const std::string& exeName, DWORD parentPid, const FILETIME& launchedAt)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if(snap == INVALID_HANDLE_VALUE) return false;
+	// the current SDK only exposes the wide toolhelp API
+	wchar_t want[MAX_PATH] = {};
+	MultiByteToWideChar(CP_ACP, 0, exeName.c_str(), -1, want, MAX_PATH);
+	PROCESSENTRY32W pe;
+	pe.dwSize = sizeof pe;
+	bool found = false;
+	if(Process32FirstW(snap, &pe)){
+		do{
+			if(_wcsicmp(pe.szExeFile, want) != 0) continue;
+			if(pe.th32ParentProcessID == parentPid){ found = true; break; }
+			HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+			if(h){
+				FILETIME created{}, exited{}, kernel{}, user{};
+				if(GetProcessTimes(h, &created, &exited, &kernel, &user) &&
+				   CompareFileTime(&created, &launchedAt) >= 0)
+					found = true;
+				CloseHandle(h);
+			}
+			if(found) break;
+		}while(Process32NextW(snap, &pe));
+	}
+	CloseHandle(snap);
+	return found;
+}
+
 bool Launch(const std::string& gameDir, const std::string& gameExeName,
-            const std::string& args, std::string& error, bool& protectedLaunch)
+            const std::string& args, std::string& error, bool& protectedLaunch,
+            bool allowProtected)
 {
 	std::string protectedExe = gameDir + "\\start_protected_game.exe";
 	std::string plainExe = gameDir + "\\" + gameExeName;
-	bool useProtected = FileExists(protectedExe);
-	std::string exe = useProtected ? protectedExe : plainExe;
-	if(!FileExists(exe)){
-		error = "game executable not found: " + exe;
+	bool useProtected = allowProtected && FileExists(protectedExe);
+	if(!FileExists(useProtected ? protectedExe : plainExe)){
+		error = "game executable not found: " + (useProtected ? protectedExe : plainExe);
 		return false;
 	}
 
-	std::string cmd = Quote(exe);
-	if(!args.empty()) cmd += " " + args;
+	// Always try the protected bootstrapper first. A stale catalogue or a
+	// missing EasyAntiCheat service makes it refuse (and show its own error
+	// dialog) instead of starting the game; only then start the game directly so
+	// the player still gets in — with the EAC state reported by the caller.
+	for(int attempt = 0; attempt < 2; attempt++){
+		bool asProtected = useProtected && attempt == 0;
+		std::string exe = asProtected ? protectedExe : plainExe;
+		std::string cmd = Quote(exe);
+		if(!args.empty()) cmd += " " + args;
 
-	STARTUPINFOA si;
-	PROCESS_INFORMATION pi;
-	memset(&si, 0, sizeof si);
-	memset(&pi, 0, sizeof pi);
-	si.cb = sizeof si;
-	BOOL ok = CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE, 0,
-	                         nullptr, gameDir.c_str(), &si, &pi);
-	if(!ok){
-		char buf[128];
-		snprintf(buf, sizeof buf, "CreateProcess failed (error %lu)", GetLastError());
-		error = buf;
-		return false;
+		STARTUPINFOA si;
+		PROCESS_INFORMATION pi;
+		memset(&si, 0, sizeof si);
+		memset(&pi, 0, sizeof pi);
+		si.cb = sizeof si;
+		FILETIME launchedAt;
+		GetSystemTimeAsFileTime(&launchedAt);
+		BOOL ok = CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE, 0,
+		                         nullptr, gameDir.c_str(), &si, &pi);
+		if(!ok){
+			char buf[128];
+			snprintf(buf, sizeof buf, "CreateProcess failed (error %lu)", GetLastError());
+			error = buf;
+			return false;
+		}
+
+		if(!asProtected){
+			CloseHandle(pi.hProcess);
+			CloseHandle(pi.hThread);
+			protectedLaunch = false;
+			return true;
+		}
+
+		// EAC's splash + service start can take a while on a cold start: the
+		// EasyAntiCheat_EOS service is demand-start and the driver has to load
+		// before the game is spawned. Give it a full minute; the wait ends as
+		// soon as the bootstrapper exits.
+		bool started = false;
+		DWORD exitCode = STILL_ACTIVE;
+		ULONGLONG t0 = GetTickCount64();
+		while(GetTickCount64() - t0 < 60000){
+			if(GameStarted(gameExeName, pi.dwProcessId, launchedAt)){ started = true; break; }
+			if(GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) break;
+			Sleep(150);
+		}
+
+		if(started){
+			CloseHandle(pi.hProcess);
+			CloseHandle(pi.hThread);
+			protectedLaunch = true;
+			return true;
+		}
+
+		// refused: stop the bootstrapper so its error dialog does not linger
+		TerminateProcess(pi.hProcess, 1);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+		error = "the Easy Anti-Cheat bootstrapper did not start the game";
+		protectedLaunch = false;
 	}
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
-	protectedLaunch = useProtected;
-	return true;
+
+	return false;
 }
 
 } // namespace eac

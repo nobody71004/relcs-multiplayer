@@ -1780,6 +1780,8 @@ int8 CRunningScript::ProcessCommands0To99(int32 command)
 		if (pos.z <= MAP_Z_LOW_LIMIT)
 			pos.z = CWorld::FindGroundZForCoord(pos.x, pos.y);
 		CPlayerPed* ped = CWorld::Players[index].m_pPed;
+		if (ped == nil)
+			return 0;
 		if (ped->bInVehicle && ped->m_pMyVehicle) {
 			pos.z += ped->m_pMyVehicle->GetDistanceFromCentreOfMassToBaseOfModel();
 			ped->m_pMyVehicle->Teleport(pos); // removed dumb stuff that was present here

@@ -12,7 +12,7 @@ public:
 	IDirect3DTexture8 **pTextures;
 
 public:
-	CTexturePool() {}
+	CTexturePool() : size(0), pTextures(nil) {}
 	void Create(D3DFORMAT _Format, int size, uint32 mipmapLevels, int32 numTextures);
 	void Release();
 	IDirect3DTexture8 *FindTexture();

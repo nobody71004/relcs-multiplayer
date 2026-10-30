@@ -474,7 +474,7 @@ struct MsgGamemodeEvent {
 //
 // Payloads are opaque to reLCS: never parsed, only bounded.
 constexpr int AC_PUID_LEN    = 40;   // EOS ProductUserId string (32 hex chars) + slack
-constexpr int AC_TOKEN_LEN   = 512;  // Connect ID token JWT
+constexpr int AC_TOKEN_LEN   = 4096; // Connect ID token JWT (EOS tokens are ~1.5 KB; 512 truncated them)
 constexpr int MAX_AC_PAYLOAD = 1200; // one EOS AC message; larger ones are dropped
 
 // EOS_EAntiCheatCommonClientPlatform, narrowed to what a reLCS client can be.

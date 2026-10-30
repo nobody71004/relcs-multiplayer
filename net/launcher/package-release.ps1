@@ -161,12 +161,33 @@ $eacFiles = @(
   "runtime\start_protected_game.exe",
   "runtime\EasyAntiCheat\EasyAntiCheat_EOS_Setup.exe",
   "runtime\EasyAntiCheat\Settings.json",
-  "runtime\EasyAntiCheat\SplashScreen.png"
+  "runtime\EasyAntiCheat\SplashScreen.png",
+  # Signed integrity catalogue. Without it start_protected_game.exe refuses a
+  # fresh game install (210 / Unrecognized game client) and the launcher has to
+  # fall back to the bare exe. Signed on the build host by -eacintegrity.
+  "runtime\EasyAntiCheat\Certificates\base.bin",
+  "runtime\EasyAntiCheat\Certificates\base.cer",
+  "runtime\EasyAntiCheat\Certificates\runtime.conf",
+  # The signing *tool* is public; only base_private.key is build-machine only.
+  # Shipping the tool lets a package report "signing key not shipped" instead
+  # of claiming the whole toolchain is absent.
+  "devtools\anticheat_integritytool.exe",
+  "devtools\anticheat_integritytool.cfg"
 )
 foreach ($rel in $eacFiles) {
   $src = Join-Path $EacDir $rel
   if (-not (Test-Path -LiteralPath $src)) { Write-Host "WARN: EAC payload missing: $rel" -ForegroundColor Yellow; continue }
   Copy-Into $src ("eac\" + $rel)
+}
+
+# A package without the signed catalogue can only ever start unprotected builds:
+# refuse to ship one instead of silently regressing the protected launch.
+$catalogue = Join-Path $EacDir "runtime\EasyAntiCheat\Certificates\base.bin"
+if (-not (Test-Path -LiteralPath $catalogue)) {
+  Write-Host "ERROR: no signed EAC catalogue in the payload." -ForegroundColor Red
+  Write-Host "       Run: reLCS-launcher.exe -game <game>\reLCS.exe -eacintegrity" -ForegroundColor Red
+  Write-Host "       then copy <game>\EasyAntiCheat\Certificates into net\eac\runtime\EasyAntiCheat\Certificates." -ForegroundColor Red
+  exit 1
 }
 $licDir = Join-Path $EacDir "runtime\EasyAntiCheat\Licenses"
 if (Test-Path -LiteralPath $licDir) {
@@ -233,9 +254,16 @@ Still provided by the game install
   eos.ini (optional)           EOS product client id/secret for Connect login
 
 Easy Anti-Cheat
-  The signing key is never shipped. If you replace reLCS.exe or game data, re-sign the
-  integrity catalogue so the protected launch accepts the folder:
+  The signing key (eac\keys\base_private.key) is never shipped: signing happens on the
+  build machine. A launcher installed from this package can install the service and read
+  the status, but it cannot re-sign the catalogue:
     reLCS-launcher.exe -game "C:\path\reLCS\reLCS.exe" -eacintegrity
+  fails with "signing key not shipped" instead of silently producing a stale catalogue.
+
+  The catalogue records a hash of the game files, so it goes stale whenever reLCS.exe or
+  the game data changes. A stale catalogue makes start_protected_game.exe abort with
+  "210, Unrecognized game client": re-sign on the build machine and ship the resulting
+  EasyAntiCheat\Certificates folder with the build.
 
 Staging size: $totalMb MB in $($files.Count) files
 "@

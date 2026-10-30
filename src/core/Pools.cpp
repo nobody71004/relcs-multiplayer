@@ -153,7 +153,7 @@ INITSAVEBUF
 		CStreaming::RequestModel(model, STREAMFLAGS_DEPENDENCY);
 		CStreaming::LoadAllRequestedModels(false);
 		ReadSaveBuf(&slot, buf);
-		CVehicle* pVehicle;
+		CVehicle* pVehicle = nil;
 #ifdef COMPATIBLE_SAVES
 		if (type == VEHICLE_TYPE_BOAT)
 			pVehicle = new(slot) CBoat(model, RANDOM_VEHICLE);
@@ -161,8 +161,12 @@ INITSAVEBUF
 			pVehicle = new(slot) CAutomobile(model, RANDOM_VEHICLE);
 		else if (type == VEHICLE_TYPE_BIKE)
 			pVehicle = new(slot) CBike(model, RANDOM_VEHICLE);
-		else
+		else {
+			// corrupt type byte in the save: assert() is compiled out in release, and
+			// falling through used to dereference this uninitialised pointer
 			assert(0);
+			continue;
+		}
 		--CCarCtrl::NumRandomCars;
 		pVehicle->Load(buf);
 		CWorld::Add(pVehicle);
@@ -197,8 +201,11 @@ INITSAVEBUF
 			pVehicle = pBike;
 			--CCarCtrl::NumRandomCars;
 		}
-		else
+		else {
 			assert(0);
+			delete[] vbuf;
+			continue;
+		}
 		CVehicle* pBufferVehicle = (CVehicle*)vbuf;
 		pVehicle->GetMatrix() = pBufferVehicle->GetMatrix();
 		pVehicle->VehicleCreatedBy = pBufferVehicle->VehicleCreatedBy;
@@ -563,7 +570,7 @@ INITSAVEBUF
 		CopyFromBuf(buf, model);
 		CopyFromBuf(buf, ref);
 #ifdef COMPATIBLE_SAVES
-		CPed* pPed;
+		CPed* pPed = nil;
 
 		char name[MAX_MODEL_NAME];
 		// Unfortunate hack: player model is stored after ped structure.
@@ -574,8 +581,12 @@ INITSAVEBUF
 
 		if (pedtype == PEDTYPE_PLAYER1)
 			pPed = new(ref) CPlayerPed();
-		else
+		else {
+			// only the player ped is saved, so this means a corrupt save file;
+			// assert() is compiled out in release and pPed would be nil here
 			assert(0);
+			continue;
+		}
 
 		pPed->Load(buf);
 		if (pedtype == PEDTYPE_PLAYER1) {
@@ -592,7 +603,7 @@ INITSAVEBUF
 #else
 		char* pbuf = new char[sizeof(CPlayerPed)];
 		CPlayerPed* pBufferPlayer = (CPlayerPed*)pbuf;
-		CPed* pPed;
+		CPed* pPed = nil;
 		char name[MAX_MODEL_NAME];
 		// the code implies that there was idea to load non-player ped
 		if (pedtype == PEDTYPE_PLAYER1) { // always true

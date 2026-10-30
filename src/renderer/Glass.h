@@ -17,7 +17,14 @@ public:
 	bool m_bShattered;
 	bool m_bCarGlass;
 
-	CFallingGlassPane()  { }
+	CFallingGlassPane()
+	{
+		m_fGroundZ = 0.0f;
+		m_fStep = 0.0f;
+		m_bActive = false;
+		m_bShattered = false;
+		m_bCarGlass = false;
+	}
 	~CFallingGlassPane() { }
 
 	void Update(void);

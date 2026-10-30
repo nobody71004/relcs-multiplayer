@@ -39,6 +39,11 @@ extern RwBool psNativeTextureSupport(void);
 
 extern void _InputTranslateShiftKeyUpDown(RsKeyCodes* rs);
 extern long _InputInitialiseMouse(bool exclusive); // returns HRESULT on Windows actually
+/* Hand the OS cursor to an overlay (CEF panel) or take it back for gameplay.
+ * GLFW's GLFW_CURSOR_DISABLED locks and centres the pointer, so ShowCursor
+ * alone cannot make a panel clickable; each backend has to switch its own
+ * cursor mode here. */
+extern void _InputSetCursorFree(bool free);
 extern void _InputShutdownMouse();
 extern bool _InputMouseNeedsExclusive();
 extern void _InputInitialiseJoys();

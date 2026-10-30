@@ -26,6 +26,7 @@ CEmergencyPed::CEmergencyPed(uint32 type) : CPed(type)
 	}
 	m_nEmergencyPedState = EMERGENCY_PED_READY;
 	m_pAttendedAccident = nil;
+	m_pAttendedFire = nil;
 	m_bStartedToCPR = false;
 }
 

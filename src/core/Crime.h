@@ -34,6 +34,8 @@ public:
 	bool m_bReported;
 	bool m_bPoliceDoesntCare;
 
-	CCrimeBeingQd() { };
+	CCrimeBeingQd()
+	 : m_nType(CRIME_NONE), m_nId(0), m_nTime(0), m_vecPosn(0.0f, 0.0f, 0.0f),
+	   m_bReported(false), m_bPoliceDoesntCare(false) { };
 	~CCrimeBeingQd() { };
 };

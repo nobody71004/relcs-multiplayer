@@ -45,6 +45,17 @@ static bool bTrainArrivalAnnounced[3] = {false, false, false};
 CTrain::CTrain(int32 id, uint8 CreatedBy)
  : CVehicle(CreatedBy)
 {
+	// these were only assigned inside the GTA_TRAIN branch below, so a build
+	// without trains left them holding garbage
+	m_fWagonPosition = 0.0f;
+	m_fSpeed = 0.0f;
+	m_bProcessDoor = false;
+	m_bTrainStopping = false;
+	m_bIsFirstWagon = false;
+	m_bIsLastWagon = false;
+	for (int i = 0; i < NUM_TRAIN_NODES; i++)
+		m_aTrainNodes[i] = nil;
+
 #ifdef GTA_TRAIN
 	CVehicleModelInfo *mi = (CVehicleModelInfo*)CModelInfo::GetModelInfo(id);
 	m_vehType = VEHICLE_TYPE_TRAIN;

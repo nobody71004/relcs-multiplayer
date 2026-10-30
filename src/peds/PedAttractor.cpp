@@ -113,11 +113,9 @@ const C2dEffect* CPedAttractorManager::GetEffectForIceCreamVan(CVehicle* pVehicl
 	CVehicleToEffect effect(pVehicle);
 	vVehicleToEffect.push_back(effect);
 	POP_MEMID();
-#ifdef FIX_BUGS
+	// effect is a local copy; returning into it handed callers a dangling
+	// pointer as soon as this frame went away
 	return vVehicleToEffect.back().ChooseEffect(pos);
-#else
-	return effect.ChooseEffect(pos);
-#endif
 }
 
 CVehicle* CPedAttractorManager::GetIceCreamVanForEffect(C2dEffect* pEffect)

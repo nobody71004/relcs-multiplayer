@@ -54,7 +54,11 @@ UnicodeMakeUpperCase(wchar *dst, const wchar *src) //idk what to do with it, see
 
 CFontDetails CFont::Details;
 bool16 CFont::NewLine;
+#ifdef MORE_LANGUAGES
+CSprite2d CFont::Sprite[MAX_FONTS + 1];
+#else
 CSprite2d CFont::Sprite[MAX_FONTS];
+#endif
 CFontRenderState CFont::RenderState;
 
 int16 CFont::Size[MAX_FONTS][419] = {

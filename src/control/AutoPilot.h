@@ -114,6 +114,8 @@ public:
 		m_fMaxTrafficSpeed = 10.0f;
 		m_bSlowedDownBecauseOfPeds = false;
 		m_bSlowedDownBecauseOfCars = false;
+		for (int32 i = 0; i < NUM_PATH_NODES_IN_AUTOPILOT; i++)
+			m_aPathFindNodesInfo[i] = 0;
 		m_nPathFindNodesCount = 0;
 		m_pTargetCar = 0;
 		m_nTimeToStartMission = CTimer::GetTimeInMilliseconds();
