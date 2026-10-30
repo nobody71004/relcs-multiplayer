@@ -10,7 +10,13 @@
 #   4. re-sign the EAC integrity catalogue for that client and copy it into
 #      net/eac/runtime/EasyAntiCheat/Certificates (the payload that gets zipped)
 #   5. package out/reLCS-launcher-v<Version>-win64.zip
-#   6. copy out/reLCS-client-v<Version>-win64.exe
+#   6. run the packaged launcher's -selftest (CEF, LAN, master, favorites,
+#      game detection) and refuse to report success unless it says PASS
+#   7. copy out/reLCS-client-v<Version>-win64.exe
+#
+# The selftest needs the master and a LAN server to answer, so -SkipSelftest
+# exists for an offline build host; a release cut with it has not been smoke
+# tested and should be run once by hand before publishing.
 #
 # The catalogue hashes reLCS.exe. Signing before the client copy signs the old
 # binary, and packaging before signing ships a stale catalogue - either way
@@ -29,7 +35,8 @@ param(
   [string]$GameDir = "",
 
   [switch]$SkipClientBuild,
-  [switch]$SkipLauncherBuild
+  [switch]$SkipLauncherBuild,
+  [switch]$SkipSelftest
 )
 
 $ErrorActionPreference = "Stop"
@@ -157,6 +164,34 @@ if ($LASTEXITCODE -ne 0) { Fail "launcher packaging failed (exit $LASTEXITCODE)"
 
 $zip = Join-Path $repo "out\reLCS-launcher-v$Version-win64.zip"
 if (-not (Test-Path -LiteralPath $zip)) { Fail "packaging produced no $zip" }
+
+# --- 5. packaged selftest ------------------------------------------------------
+# The zip can be structurally complete and still not start (the v0.3.x CEF bugs).
+# Run the copy that will ship, from its own folder, and read its log rather than
+# trusting the archive listing. GUI subsystem: Start-Process -Wait again.
+if ($SkipSelftest) {
+  Write-Host ""
+  Write-Host "== packaged selftest (skipped)" -ForegroundColor Yellow
+} else {
+  $staging = Join-Path $repo "out\package\reLCS-launcher"
+  $stagedLauncher = Join-Path $staging "reLCS-launcher.exe"
+  if (-not (Test-Path -LiteralPath $stagedLauncher)) { Fail "staged launcher missing: $stagedLauncher" }
+
+  Write-Host ""
+  Write-Host "== packaged selftest"
+  $selftestLog = Join-Path $staging "launcher.log"
+  Remove-Item -LiteralPath $selftestLog -Force -ErrorAction SilentlyContinue
+  $test = Start-Process -FilePath $stagedLauncher -ArgumentList "-selftest" `
+                       -WorkingDirectory $staging -NoNewWindow -Wait -PassThru
+  $logText = ""
+  if (Test-Path -LiteralPath $selftestLog) { $logText = Get-Content -LiteralPath $selftestLog -Raw }
+
+  if ($test.ExitCode -ne 0 -or $logText -notmatch '\[SELFTEST\] RESULT: PASS') {
+    if ($logText) { ($logText -split "`n") | Select-Object -Last 12 | ForEach-Object { Write-Host "   $($_.TrimEnd())" } }
+    Fail "packaged launcher selftest failed (exit $($test.ExitCode)); see $selftestLog"
+  }
+  Write-Host "   RESULT: PASS"
+}
 
 $clientAsset = Join-Path $repo "out\reLCS-client-v$Version-win64.exe"
 Copy-Item -LiteralPath $clientExe -Destination $clientAsset -Force
