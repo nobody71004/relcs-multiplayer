@@ -585,11 +585,14 @@ bool Launch(const std::string& gameDir, const std::string& gameExeName,
 			return true;
 		}
 
-		// EAC's splash + service start can take a few seconds
+		// EAC's splash + service start can take a while on a cold start: the
+		// EasyAntiCheat_EOS service is demand-start and the driver has to load
+		// before the game is spawned. Give it a full minute; the wait ends as
+		// soon as the bootstrapper exits.
 		bool started = false;
 		DWORD exitCode = STILL_ACTIVE;
 		ULONGLONG t0 = GetTickCount64();
-		while(GetTickCount64() - t0 < 20000){
+		while(GetTickCount64() - t0 < 60000){
 			if(GameStarted(gameExeName, pi.dwProcessId, launchedAt)){ started = true; break; }
 			if(GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) break;
 			Sleep(150);
