@@ -76,7 +76,60 @@ if ($Publish) {
 }
 if (-not $Title) { $Title = "reLCS launcher v$Version" }
 
-# --- 1. toolchain ---------------------------------------------------------------
+# --- 1. game folder and build-machine prerequisites ---------------------------
+$game = $GameDir
+if (-not $game) {
+  $ini = Join-Path $repo "launcher.ini"
+  if (Test-Path -LiteralPath $ini) {
+    $hit = Select-String -LiteralPath $ini -Pattern '^\s*game\s*=\s*(.+?)\s*$' | Select-Object -First 1
+    if ($hit) { $game = $hit.Matches[0].Groups[1].Value.Trim('"', ' ') }
+  }
+}
+if (-not $game) { Fail "no game folder: pass -GameDir or set 'game =' in launcher.ini" }
+if ($game -like "*.exe") { $game = Split-Path -Parent $game }
+if (-not (Test-Path -LiteralPath $game)) { Fail "game folder does not exist: $game" }
+$game = (Resolve-Path -LiteralPath $game).Path
+Write-Host "   game : $game"
+
+if (Get-Process -Name "reLCS" -ErrorAction SilentlyContinue) {
+  Fail "reLCS.exe is running; close the game before releasing (the client copy would fail)"
+}
+
+# A fresh clone is missing everything here: the solutions are generated, GLFW and
+# the CEF distribution are downloaded build-machine assets, the EAC signing key is
+# deliberately gitignored, and the game folder lives outside the repo. Report all
+# of them at once before spending minutes in MSBuild or touching the game folder.
+$missing = @()
+if (-not (Test-Path -LiteralPath (Join-Path $repo "net\eac\keys\base_private.key"))) {
+  $missing += "EAC signing key: net/eac/keys/base_private.key (build-machine only; never shipped)"
+}
+$cefSource = Join-Path $repo "net\cef\Release\libcef.dll"
+$cefBuilt = (Test-Path -LiteralPath (Join-Path $repo "net\bin\Release\cefui.dll")) -and
+            (Test-Path -LiteralPath (Join-Path $repo "net\bin\Release\libcef.dll"))
+if (-not (Test-Path -LiteralPath $cefSource) -and -not $cefBuilt) {
+  $missing += "CEF runtime: net/cef/Release/libcef.dll (unpack a CEF binary distribution into net/cef before generating the solutions)"
+}
+$clientSln = Join-Path $repo "build\reLCS.sln"
+$netSln = Join-Path $repo "net\build\reLCS-net.sln"
+if (-not (Test-Path -LiteralPath $clientSln) -or -not (Test-Path -LiteralPath $netSln)) {
+  $msg = "premake solutions: build/reLCS.sln and net/build/reLCS-net.sln"
+  if (-not (Test-Path -LiteralPath (Join-Path $repo "vendor\glfw-3.3.2.bin.WIN64"))) {
+    $msg += "; GLFW is also missing (vendor/glfw-3.3.2.bin.WIN64)"
+  }
+  $missing += $msg
+}
+if ($missing.Count -gt 0) {
+  Write-Host ""
+  Write-Host "ERROR: this machine cannot cut a release yet." -ForegroundColor Red
+  foreach ($m in $missing) { Write-Host "  - $m" -ForegroundColor Red }
+  Write-Host ""
+  Write-Host "Generate the solutions once the assets are in place:"
+  Write-Host "  premake-vs2019.cmd --glfwdir64=<glfw dir>   (repo root)"
+  Write-Host "  cd net && ..\premake5.exe vs2019"
+  exit 1
+}
+
+# --- 2. toolchain ---------------------------------------------------------------
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = ""
 if (Test-Path -LiteralPath $vswhere) {
@@ -128,25 +181,6 @@ if ($SkipLauncherBuild) {
   Invoke-Build (Join-Path $repo "net\build\reLCS-net.sln") "net-launcher" "x64"
 }
 if (-not (Test-Path -LiteralPath $launcherExe)) { Fail "launcher build produced no $launcherExe" }
-
-# --- 2. game folder -------------------------------------------------------------
-$game = $GameDir
-if (-not $game) {
-  $ini = Join-Path $repo "launcher.ini"
-  if (Test-Path -LiteralPath $ini) {
-    $hit = Select-String -LiteralPath $ini -Pattern '^\s*game\s*=\s*(.+?)\s*$' | Select-Object -First 1
-    if ($hit) { $game = $hit.Matches[0].Groups[1].Value.Trim('"', ' ') }
-  }
-}
-if (-not $game) { Fail "no game folder: pass -GameDir or set 'game =' in launcher.ini" }
-if ($game -like "*.exe") { $game = Split-Path -Parent $game }
-if (-not (Test-Path -LiteralPath $game)) { Fail "game folder does not exist: $game" }
-$game = (Resolve-Path -LiteralPath $game).Path
-Write-Host "   game : $game"
-
-if (Get-Process -Name "reLCS" -ErrorAction SilentlyContinue) {
-  Fail "reLCS.exe is running; close the game before releasing (the client copy would fail)"
-}
 
 $gameExe = Join-Path $game "reLCS.exe"
 Write-Host ""
