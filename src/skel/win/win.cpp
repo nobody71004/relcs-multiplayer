@@ -317,6 +317,27 @@ psMouseSetPos(RwV2d *pos)
 /*
  *****************************************************************************
  */
+void
+_InputSetCursorFree(bool free)
+{
+	if ( free )
+	{
+		// the engine's WM_SETCURSOR shows the arrow, but a DirectInput capture
+		// or a clip rect would still pin the pointer
+		while ( ShowCursor(TRUE) < 0 ) {}
+		if ( GetCapture() == PSGLOBAL(window) )
+			ReleaseCapture();
+		ClipCursor(nil);
+	}
+	else
+	{
+		while ( ShowCursor(FALSE) >= 0 ) {}
+	}
+}
+
+/*
+ *****************************************************************************
+ */
 RwMemoryFunctions*
 psGetMemoryFunctions(void)
 {

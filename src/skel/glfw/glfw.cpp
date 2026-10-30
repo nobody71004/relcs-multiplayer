@@ -1039,6 +1039,23 @@ void _InputShutdownMouse()
 	// Not needed
 }
 
+// The mode gameplay had before an overlay borrowed the cursor, so closing the
+// panel restores exactly what the player was using.
+static int s_gameplayCursorMode = GLFW_CURSOR_HIDDEN;
+
+void _InputSetCursorFree(bool free)
+{
+	if(free){
+		if(lastCursorMode != GLFW_CURSOR_NORMAL)
+			s_gameplayCursorMode = lastCursorMode;
+		lastCursorMode = GLFW_CURSOR_NORMAL;
+		glfwSetInputMode(PSGLOBAL(window), GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+	}else{
+		lastCursorMode = s_gameplayCursorMode;
+		glfwSetInputMode(PSGLOBAL(window), GLFW_CURSOR, lastCursorMode);
+	}
+}
+
 // Not "needs exclusive" on GLFW, but more like "needs to change mode"
 bool _InputMouseNeedsExclusive()
 {

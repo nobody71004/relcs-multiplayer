@@ -954,6 +954,21 @@ void CPad::UpdateMouse()
 		}
 	}
 #else
+	if ( NetGame_WantMouse() )
+	{
+		// A CEF panel owns the pointer: do not feed the camera/mouse steering
+		// (the overlay reads the real cursor itself). GLFW keeps re-centring a
+		// disabled cursor, so this also stops the deltas from spinning the view.
+		PCTempMouseControllerState.Clear();
+		OldMouseControllerState = NewMouseControllerState;
+		NewMouseControllerState = PCTempMouseControllerState;
+		double cx, cy;
+		glfwGetCursorPos(PSGLOBAL(window), &cx, &cy);
+		PSGLOBAL(lastMousePos.x) = cx;
+		PSGLOBAL(lastMousePos.y) = cy;
+		return;
+	}
+
 	if ( IsForegroundApp() && PSGLOBAL(cursorIsInWindow) )
 	{
 		double xpos = 1.0f, ypos;

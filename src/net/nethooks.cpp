@@ -11,6 +11,7 @@
 #include "cefhud.h"
 
 #include "common.h"
+#include "platform.h"
 #include "Lists.h"
 #include "PlayerInfo.h"
 #include "Pad.h"
@@ -119,6 +120,9 @@ struct NetVehicle {
 	int32 handle = -1;         // pool handle of veh (slot + reuse counter)
 	uint16_t modelId = 0;
 	bool puppet = false;       // created by the netcode (vs a local game object)
+	bool localAuthority = false; // we drove it, then stepped out: keep the engine's
+	                           // own simulation (solid, enterable) instead of
+	                           // turning it into a frozen, walk-through puppet
 	bool rejected = false;     // invalid model — drop instead of retrying forever
 	bool hasTarget = false;
 	rnet::VehicleState target; // latest relayed driver state
@@ -569,10 +573,12 @@ static void UpdateNetVehicles(float dt)
 #ifdef VIS_DISTANCE_ALPHA
 			if(v->m_rwObject) alpha = CVisibilityPlugins::GetObjectDistanceAlpha(v->m_rwObject);
 #endif
-			fprintf(stderr, "[VEHDIAG] veh=%d model=%d puppet=%d pos=(%.1f,%.1f,%.1f) camDist=%.1f rw=%d visible=%d alpha=%d fade=%d static=%d driver=%p drvState=%d\n",
-			        (int)kv.first, (int)kv.second.modelId, (int)kv.second.puppet, p.x, p.y, p.z, cd,
+			fprintf(stderr, "[VEHDIAG] veh=%d model=%d puppet=%d local=%d pos=(%.1f,%.1f,%.1f) camDist=%.1f rw=%d visible=%d alpha=%d fade=%d static=%d coll=%d frozen=%d driver=%p drvState=%d\n",
+			        (int)kv.first, (int)kv.second.modelId, (int)kv.second.puppet, (int)kv.second.localAuthority,
+			        p.x, p.y, p.z, cd,
 			        (int)(v->m_rwObject != nil), (int)v->bIsVisible, alpha, (int)v->bDistanceFade,
-			        (int)v->GetIsStatic(), (void*)v->pDriver, v->pDriver ? (int)v->pDriver->m_nPedState : -1);
+			        (int)v->GetIsStatic(), (int)v->bUsesCollision, (int)v->bIsFrozen,
+			        (void*)v->pDriver, v->pDriver ? (int)v->pDriver->m_nPedState : -1);
 		}
 	}
 	for(auto& kv : s_vehicles){
@@ -598,6 +604,22 @@ static void UpdateNetVehicles(float dt)
 			// keep the kinematic latch on the live car: the moment we step out
 			// it is glued to smooth*/target, which otherwise still hold where
 			// we got in (the car snapped back there on exit)
+			CVector p = veh->GetPosition();
+			nv.smoothX = p.x; nv.smoothY = p.y; nv.smoothZ = p.z;
+			nv.smoothH = std::atan2(-veh->GetForward().x, veh->GetForward().y);
+			nv.target.xMm = rnet::QuantPos(p.x);
+			nv.target.yMm = rnet::QuantPos(p.y);
+			nv.target.zMm = rnet::QuantPos(p.z);
+			nv.target.heading = rnet::QuantAngle(nv.smoothH);
+			continue;
+		}
+		if(nv.localAuthority){
+			// A car we got out of is still *ours*: the engine keeps simulating
+			// it, so it stays solid (walk into it, not through it) and the door
+			// still opens. Freezing it here is what made an exited car
+			// walk-through and impossible to drive again.
+			veh->bIsFrozen = false;
+			veh->bUsesCollision = true;
 			CVector p = veh->GetPosition();
 			nv.smoothX = p.x; nv.smoothY = p.y; nv.smoothZ = p.z;
 			nv.smoothH = std::atan2(-veh->GetForward().x, veh->GetForward().y);
@@ -815,6 +837,12 @@ static void ApplyRemote(rnet::PlayerId id, const rnet::PlayerState& st, float dt
 	// disagreement that outlives any in-flight event is repaired from the state.
 	{
 		bool wantSeat = st.vehicleId != rnet::VEHICLE_NONE && st.vehicleId != rnet::VEHICLE_UNSYNCED;
+		// someone else got into a car we had left: it is theirs to drive now, and
+		// our local simulation must yield to the relayed state
+		if(wantSeat){
+			auto taken = s_vehicles.find(st.vehicleId);
+			if(taken != s_vehicles.end()) taken->second.localAuthority = false;
+		}
 		bool seated = ped->bInVehicle && ped->m_pMyVehicle;
 		bool agree = wantSeat ? (seated && NetIdOfVehicle(ped->m_pMyVehicle) == st.vehicleId)
 		                      : !seated;
@@ -1763,10 +1791,19 @@ static void NetGame_PollUi(void)
 			}else{
 				while(ShowCursor(FALSE) >= 0){}
 			}
+			// GLFW shows/hides the pointer through its own cursor mode: a
+			// GLFW_CURSOR_DISABLED window keeps the OS cursor pinned to the
+			// centre and hidden no matter what ShowCursor says. Switching the
+			// backend mode is what actually frees the arrow for the panel.
+			_InputSetCursorFree(want);
 			SetCursor(LoadCursor(nullptr, want ? IDC_ARROW : IDC_CROSS));
 		}
-		// re-assert every frame: WM_SETCURSOR from the engine can clear it
-		if(want) SetCursor(LoadCursor(nullptr, IDC_ARROW));
+		// re-assert every frame: WM_SETCURSOR from the engine can clear it, and
+		// a menu/frontend transition can put GLFW back into a locked mode
+		if(want){
+			SetCursor(LoadCursor(nullptr, IDC_ARROW));
+			_InputSetCursorFree(true);
+		}
 	}
 
 	// The engine reads its own pad state, so swallowing keys in this handler is
@@ -1856,7 +1893,12 @@ static void NetGame_PollUi(void)
 		if(kRet){  CefHud_Key(1, VK_RETURN, 0, 0); CefHud_Key(1, 0, '\r', 0); }
 		POINT pt;
 		GetCursorPos(&pt);
-		ScreenToClient(GetActiveWindow(), &pt);
+		// GetActiveWindow() is per-thread and can be null while the window is
+		// being (re)activated; falling back keeps the overlay's coordinates in
+		// client space instead of leaving them as screen pixels.
+		HWND uiWnd = GetActiveWindow();
+		if(!uiWnd) uiWnd = GetForegroundWindow();
+		if(uiWnd) ScreenToClient(uiWnd, &pt);
 		static bool s_lmbPrev = false;
 		bool lmb = KeyDown(VK_LBUTTON);
 		CefHud_Mouse(0, pt.x, pt.y, 0, 0);
@@ -3230,6 +3272,13 @@ void NetGame_Frame(void)
 			if(s_lastMyVeh){
 				// left the old vehicle (id 0: the server resolves by occupancy)
 				uint16_t id = NetIdOfVehicle(s_lastMyVeh);
+				// remember it as locally simulated: the server may keep relaying
+				// it as an unoccupied vehicle, but that must not turn it into a
+				// frozen, non-solid puppet (walk-through, no re-entry)
+				if(id != rnet::VEHICLE_NONE){
+					auto own = s_vehicles.find(id);
+					if(own != s_vehicles.end()) own->second.localAuthority = true;
+				}
 				s_net.SendVehExit(id != rnet::VEHICLE_NONE ? id : 0);
 				s_myVehNet = rnet::VEHICLE_NONE;
 				s_mySeat = 0xFF;
@@ -3248,6 +3297,9 @@ void NetGame_Frame(void)
 				if(existing != rnet::VEHICLE_NONE){
 					// entering a vehicle that is already a net entity (someone's car)
 					s_myVehNet = existing;
+					// we drive it now, so the local-authority latch is no longer needed
+					auto drove = s_vehicles.find(existing);
+					if(drove != s_vehicles.end()) drove->second.localAuthority = false;
 					s_net.SendVehEnter(existing, seat, (uint16_t)cur->GetModelIndex());
 				}else{
 					// new net vehicle: the server allocates the id

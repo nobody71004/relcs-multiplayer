@@ -135,8 +135,12 @@ static void UploadFrame(void)
 	uint8* dst = RwRasterLock(s_raster, 0, rwRASTERLOCKWRITE | rwRASTERLOCKRAW);
 	if(!dst) return;
 	const uint8* src = (const uint8*)pixels;
+	// CEF hands over the frame top-down (row 0 is the top of the page), but a
+	// RenderWare raster stores row 0 at the bottom of the image. Copying the
+	// rows in order painted the whole overlay upside down; reverse them here so
+	// the texture matches every other RW texture the 2D sprite path draws.
 	for(int y = 0; y < h; y++){
-		std::memcpy(dst + (size_t)y * s_raster->stride,
+		std::memcpy(dst + (size_t)(h - 1 - y) * s_raster->stride,
 		            src + (size_t)y * w * 4, (size_t)w * 4);
 	}
 	RwRasterUnlock(s_raster);
