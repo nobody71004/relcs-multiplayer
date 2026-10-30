@@ -1749,9 +1749,9 @@ InitialiseGame(void)
 	// so pick the first one that is actually there rather than aborting on a
 	// hard-coded name.
 	static const char *aDatNames[] = {
-		"DATA\GTA_VC.DAT",
-		"DATA\GTA_LCS.DAT",
-		"DATA\GTA3.DAT",
+		"DATA\\GTA_VC.DAT",
+		"DATA\\GTA_LCS.DAT",
+		"DATA\\GTA3.DAT",
 		nil
 	};
 	const char *datFile = nil;
@@ -1766,7 +1766,7 @@ InitialiseGame(void)
 
 	if (datFile == nil) {
 		re3_usererror("Cannot find the level description.\n"
-			"Expected DATA\GTA_VC.DAT, DATA\GTA_LCS.DAT or DATA\GTA3.DAT.");
+			"Expected DATA\\GTA_VC.DAT, DATA\\GTA_LCS.DAT or DATA\\GTA3.DAT.");
 		return;
 	}
 
